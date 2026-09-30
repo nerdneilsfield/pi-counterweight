@@ -3,7 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.19.0" },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
@@ -11,7 +13,9 @@
     "probe-cache": "node --experimental-strip-types src/cli/probe-cache.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.99.1"
+    "@earendil-works/pi-coding-agent": "0.99.1",
+    "smol-toml": "1.8.0",
+    "typebox": "1.3.27"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

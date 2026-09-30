@@ -1,6 +1,6 @@
 # pi-counterweight
 
-Counterweight 的 Pi 扩展工程。当前仅实现 M0：版本命令与网关缓存探针，尚无任务契约或验收门禁。
+Counterweight 的 Pi 扩展工程。当前实现 M0 与 M1：版本命令、网关缓存探针、`project.toml` / `contract.toml` 校验、任务目录与 Git 树快照。尚无验证器运行或验收门禁。
 
 需要 Node.js `>=22.19.0`。Pi 固定为 `0.99.1`。
 
