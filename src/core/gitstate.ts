@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { lstat, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { isNotFound, relativeParts } from "./paths.js";
 import type { GitValue } from "./types.js";
 
 export async function isGitRepo(repo: string): Promise<boolean> {
@@ -38,6 +39,8 @@ export async function treeHash(repo: string): Promise<GitValue<string>> {
     const head = await headCommit(repo);
     const read = await git(repo, head.supported && head.value !== null ? ["read-tree", "HEAD"] : ["read-tree", "--empty"], index);
     if (read.code !== 0) throw new Error(read.stderr || "git read-tree failed");
+    const removed = await git(repo, ["rm", "-r", "--cached", "--ignore-unmatch", "--", ".cw"], index);
+    if (removed.code !== 0) throw new Error(removed.stderr || "git rm --cached .cw failed");
     const add = await git(repo, ["add", "-A", "--", ".", ":(exclude).cw"], index);
     if (add.code !== 0) throw new Error(add.stderr || "git add failed");
     const written = await git(repo, ["write-tree"], index);
@@ -50,12 +53,15 @@ export async function treeHash(repo: string): Promise<GitValue<string>> {
 
 export async function blobHash(repo: string, file: string): Promise<GitValue<string | null>> {
   if (!await isGitRepo(repo)) return { supported: false };
-  if (path.isAbsolute(file)) throw new Error(`blob: path must be repo-relative ${file}`);
-  const result = await git(repo, ["hash-object", "--", file]);
-  if (result.code !== 0) {
-    if (/fatal: (could not open|unable to hash)/.test(result.stderr)) return { supported: true, value: null };
-    throw new Error(result.stderr || "git hash-object failed");
+  relativeParts(file);
+  try {
+    await lstat(path.resolve(repo, file));
+  } catch (error) {
+    if (isNotFound(error)) return { supported: true, value: null };
+    throw error;
   }
+  const result = await git(repo, ["hash-object", "--", file]);
+  if (result.code !== 0) throw new Error(result.stderr || "git hash-object failed");
   return { supported: true, value: result.stdout.trim() };
 }
 

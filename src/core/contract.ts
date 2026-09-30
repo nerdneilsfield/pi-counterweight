@@ -67,9 +67,6 @@ export async function validateContract(contract: Contract, repo: string): Promis
   unique("acceptance", contract.acceptance);
   unique("red", contract.red);
   unique("regression", contract.regression);
-  unique("frozen", contract.frozen);
-  unique("interface", contract.interface);
-  unique("baseline_inputs", contract.baseline_inputs);
   unique("approved_failures", contract.approved_failures.map((item) => item.id));
   const approved = new Set(contract.approved_failures.map((item) => item.id));
   const overlap = contract.acceptance.find((id) => approved.has(id));
@@ -80,8 +77,18 @@ export async function validateContract(contract: Contract, repo: string): Promis
   if (contract.deliverable === "code" && (contract.acceptance.length === 0 || contract.red.length === 0)) {
     throw new Error("contract: code deliverable requires non-empty acceptance and red");
   }
-  for (const item of [...contract.frozen, ...contract.interface]) await repoPath(repo, item, false);
-  for (const item of contract.baseline_inputs) await repoPath(repo, item, true);
+  contract.frozen = await canonicalize(repo, contract.frozen, false);
+  contract.interface = await canonicalize(repo, contract.interface, false);
+  contract.baseline_inputs = await canonicalize(repo, contract.baseline_inputs, true);
+  unique("frozen", contract.frozen);
+  unique("interface", contract.interface);
+  unique("baseline_inputs", contract.baseline_inputs);
+}
+
+async function canonicalize(repo: string, values: string[], allowCwScript: boolean): Promise<string[]> {
+  const resolved: string[] = [];
+  for (const value of values) resolved.push(await repoPath(repo, value, allowCwScript));
+  return resolved;
 }
 
 export function contractSha256(contract: Contract): string {

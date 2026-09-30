@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -73,7 +73,7 @@ test("契约规则各自失败并通过", async () => {
     [contract({ body: `acceptance = ["tests/a.py::keep"]\nred = ["tests/a.py::other"]` }), /not a subset/],
     [contract({ body: `acceptance = ["tests/a.py::keep"]\nred = ["tests/a.py::keep"]\n[[approved_failures]]\nid = "tests/a.py::keep"\nreason = "known"` }), /overlaps/],
     [contract({ body: `acceptance = []\nred = []` }), /non-empty acceptance and red/],
-    [contract({ rest: `frozen = ["../outside.py"]` }), /escapes repository/],
+    [contract({ rest: `frozen = ["../outside.py"]` }), /refuses \. or \.\./],
     [contract({ rest: `frozen = [".cw/state.json"]` }), /\.cw is not allowed/],
     [contract({ rest: `interface = ["/tmp/abs.py"]` }), /repo-relative/],
   ];
@@ -83,7 +83,7 @@ test("契约规则各自失败并通过", async () => {
   }
   await writeFile(file, contract({ rest: `frozen = ["tests/a.py"]\ninterface = ["tests/a.py"]\nbaseline_inputs = [".cw/validate.sh"]` }));
   await mkdir(path.join(root, ".cw"));
-  await symlink(path.join(root, "tests", "a.py"), path.join(root, ".cw", "validate.sh"));
+  await writeFile(path.join(root, ".cw", "validate.sh"), "#!/bin/sh\n");
   const ok = await readContract(file, root);
   expect(ok.red).toEqual(["tests/a.py::keep"]);
   const outside = await mkdtemp(path.join(tmpdir(), "cw-m1-out-"));
@@ -97,7 +97,6 @@ test("契约规则各自失败并通过", async () => {
   await mkdir(path.join(root, ".cw", "tasks", "20260928-lifetime-fix"), { recursive: true });
   await writeFile(file, contract({ rest: `baseline_inputs = [".cw/tasks/20260928-lifetime-fix/state.json"]` }));
   await expect(readContract(file, root)).rejects.toThrow(/task state/);
-  await writeFile(path.join(root, ".cw", "validate.sh"), "#!/bin/sh\n");
   await writeFile(file, contract({ rest: `baseline_inputs = [".cw/validate.sh", "tests/a.py"]` }));
   expect((await readContract(file, root)).baseline_inputs).toEqual([".cw/validate.sh", "tests/a.py"]);
 });
@@ -223,6 +222,50 @@ test("并发接管只有一方持锁，计数不回滚", async () => {
   const updated = await updateState(root, "20260928-lifetime-fix", "session-a", (state) => ({ ...state, repairs_used: state.repairs_used + 1 }));
   expect(updated.repairs_used).toBe(1);
   expect((await readState(root, "20260928-lifetime-fix")).repairs_used).toBe(1);
+  await expect(createTask(root, "20260928-lifetime-fix", "gateway/medium")).rejects.toThrow(/already exists/);
+  expect((await readState(root, "20260928-lifetime-fix")).repairs_used).toBe(1);
+});
+
+test("路径规范化、symlink 禁区与已跟踪 .cw 不进入 tree", async () => {
+  const root = await repo();
+  await mkdir(path.join(root, "tests"), { recursive: true });
+  await writeFile(path.join(root, "tests", "a.py"), "pass\n");
+  await mkdir(path.join(root, ".cw", "tasks"), { recursive: true });
+  const file = path.join(root, "contract.toml");
+  await writeFile(file, contract({ rest: `frozen = ["tests/../tests/a.py"]` }));
+  await expect(readContract(file, root)).rejects.toThrow(/refuses \. or \.\./);
+  await writeFile(file, contract({ rest: `frozen = ["tests/a.py/../../outside.py"]` }));
+  await expect(readContract(file, root)).rejects.toThrow(/refuses \. or \.\./);
+  await symlink(path.join(root, ".cw"), path.join(root, "alias"));
+  await writeFile(file, contract({ rest: `frozen = ["alias/tasks/20260928-lifetime-fix/state.json"]` }));
+  await expect(readContract(file, root)).rejects.toThrow(/\.cw is not allowed/);
+  await writeFile(file, contract({ rest: `baseline_inputs = ["alias/validate.sh"]` }));
+  const aliased = await readContract(file, root);
+  expect(aliased.baseline_inputs).toEqual([".cw/validate.sh"]);
+  await writeFile(file, contract({ rest: `baseline_inputs = [".cw/missing/tasks/state.json"]` }));
+  await expect(readContract(file, root)).rejects.toThrow(/task state/);
+  await writeFile(file, contract({ rest: `frozen = ["tests/./a.py", "tests/a.py"]` }));
+  await expect(readContract(file, root)).rejects.toThrow(/refuses \. or \.\./);
+  await mkdir(path.join(root, "nested"));
+  await symlink(path.join(root, "tests", "a.py"), path.join(root, "nested", "same.py"));
+  await writeFile(file, contract({ rest: `frozen = ["tests/a.py", "nested/same.py"]` }));
+  await expect(readContract(file, root)).rejects.toThrow(/duplicate frozen/);
+
+  await writeFile(path.join(root, ".cw", "tracked"), "secret\n");
+  await git(root, ["add", ".cw/tracked"]);
+  await git(root, ["-c", "user.email=cw@example.com", "-c", "user.name=cw", "commit", "-m", "track cw"]);
+  const withTracked = await treeHash(root);
+  if (!withTracked.supported) throw new Error("git tree expected");
+  await writeFile(path.join(root, ".cw", "tracked"), "changed\n");
+  expect((await treeHash(root)).value).toBe(withTracked.value);
+  const listed = await git(root, ["ls-tree", "-r", "--name-only", withTracked.value]);
+  expect(listed).not.toContain(".cw");
+  const outside = await mkdtemp(path.join(tmpdir(), "cw-m1-ledger-"));
+  await writeFile(path.join(outside, "state.json"), "{\"repairs_used\":7}\n");
+  await symlink(outside, path.join(root, ".cw", "tasks", "20260928-outside-fix"));
+  await expect(createTask(root, "20260928-outside-fix", "gateway/medium")).rejects.toThrow(/symlink/);
+  expect(await readFile(path.join(outside, "state.json"), "utf8")).toContain("7");
+  expect((await blobHash(root, "missing.txt")).value).toBeNull();
 });
 
 function git(cwd: string, args: string[]): Promise<string> {

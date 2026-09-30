@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { assertTaskId } from "./paths.js";
+import { assertTaskId, isNotFound, pathInside } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
 import { Type } from "typebox";
 import type { LockHolder, TaskReference, TaskState } from "./types.js";
@@ -33,6 +34,8 @@ const lockSchema = Type.Object({
   acquired_at: Type.String({ minLength: 1 }),
 }, { additionalProperties: false });
 
+const lockFlags = constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW;
+
 export class TaskLockError extends Error {
   readonly holder: LockHolder;
   constructor(holder: LockHolder) {
@@ -42,28 +45,36 @@ export class TaskLockError extends Error {
   }
 }
 
-export function taskPaths(root: string, taskId: string): { dir: string; state: string; lock: string; runs: string } {
-  const dir = path.join(root, ".cw", "tasks", taskId);
-  return { dir, state: path.join(dir, "state.json"), lock: path.join(dir, "lock"), runs: path.join(dir, "runs") };
-}
-
 export async function createTask(repo: string, taskId: string, model: string): Promise<string> {
   assertTaskId(taskId);
-  const paths = taskPaths(repo, taskId);
-  await mkdir(paths.dir, { recursive: true });
+  const parent = await ensureParents(repo);
+  const dir = path.join(parent, taskId);
+  await rejectUnexpected(dir, "task directory");
+  try {
+    await mkdir(dir);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new Error(`task already exists ${taskId}`);
+    }
+    throw error;
+  }
   const state: TaskState = {
     task_id: taskId, status: "drafting", model,
     repairs_used: 0, tokens_used: 0, wall_started_at: null,
     last_verified: null, evidence_invalid_reason: null, conflicts: [], sessions: [], version: 1,
   };
-  await writeState(repo, taskId, state);
-  return realpath(paths.dir);
+  const release = await acquireLock(repo, taskId, "create");
+  try {
+    await putState(dir, taskId, state);
+  } finally {
+    await release();
+  }
+  return realpath(dir);
 }
 
 export async function saveReference(repo: string, file: string, taskId: string): Promise<TaskReference> {
-  assertTaskId(taskId);
-  const reference: TaskReference = { task_id: taskId, path: await realpath(taskPaths(repo, taskId).dir) };
-  if (path.basename(reference.path) !== taskId) throw new Error("task reference: directory does not match task_id");
+  const dir = await existingTaskDir(repo, taskId);
+  const reference: TaskReference = { task_id: taskId, path: dir };
   await mkdir(path.dirname(file), { recursive: true });
   await atomicWrite(file, `${JSON.stringify(reference)}\n`);
   return reference;
@@ -77,23 +88,27 @@ export async function readReference(file: string): Promise<TaskReference> {
   }, { additionalProperties: false }), parsed, "task reference");
   const reference = parsed as TaskReference;
   assertTaskId(reference.task_id);
+  if (!path.isAbsolute(reference.path)) throw new Error("task reference: path must be absolute");
   const actual = await realpath(reference.path);
-  if (path.basename(actual) !== reference.task_id) throw new Error("task reference: directory does not match task_id");
+  if (!isAuthority(actual, reference.task_id)) throw new Error("task reference: not an authority task directory");
   return { task_id: reference.task_id, path: actual };
 }
 
 export async function readState(repo: string, taskId: string): Promise<TaskState> {
-  const parsed: unknown = JSON.parse(await readFile(taskPaths(repo, taskId).state, "utf8"));
+  const dir = await existingTaskDir(repo, taskId);
+  const file = path.join(dir, "state.json");
+  await rejectUnexpected(file, "state.json");
+  const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
   rejectUnknown(stateSchema, parsed, "state.json");
   const state = parsed as TaskState;
   if (state.task_id !== taskId) throw new Error("state.json: task_id mismatch");
   return state;
 }
 
-export async function writeState(repo: string, taskId: string, state: TaskState): Promise<void> {
-  if (state.task_id !== taskId || state.version !== 1) throw new Error("state.json: identity mismatch");
-  rejectUnknown(stateSchema, state, "state.json");
-  await atomicWrite(taskPaths(repo, taskId).state, `${JSON.stringify(state)}\n`);
+export async function writeState(repo: string, taskId: string, session: string, state: TaskState): Promise<void> {
+  const dir = await existingTaskDir(repo, taskId);
+  await assertHeld(dir, session);
+  await putState(dir, taskId, state);
 }
 
 export async function updateState(
@@ -102,23 +117,27 @@ export async function updateState(
 ): Promise<TaskState> {
   return withTaskLock(repo, taskId, session, async () => {
     const next = await change(await readState(repo, taskId));
-    await writeState(repo, taskId, next);
+    await writeState(repo, taskId, session, next);
     return next;
   });
 }
 
 export async function allocateRun(repo: string, taskId: string, session: string): Promise<number> {
-  return withTaskLock(repo, taskId, session, async () => nextRun(repo, taskId));
-}
-
-async function nextRun(repo: string, taskId: string): Promise<number> {
-  const runs = taskPaths(repo, taskId).runs;
-  await mkdir(runs, { recursive: true });
-  const names = await readFileNames(runs);
-  const used = names.map((name) => Number(name)).filter((value) => Number.isInteger(value) && value > 0);
-  const next = (used.length === 0 ? 0 : Math.max(...used)) + 1;
-  await mkdir(path.join(runs, String(next)), { recursive: false });
-  return next;
+  return withTaskLock(repo, taskId, session, async () => {
+    const dir = await existingTaskDir(repo, taskId);
+    const runs = path.join(dir, "runs");
+    await rejectUnexpected(runs, "runs");
+    try {
+      await mkdir(runs);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+    }
+    const names = await readdir(runs);
+    const used = names.map((name) => Number(name)).filter((value) => Number.isInteger(value) && value > 0);
+    const next = (used.length === 0 ? 0 : Math.max(...used)) + 1;
+    await mkdir(path.join(runs, String(next)));
+    return next;
+  });
 }
 
 export async function withTaskLock<T>(
@@ -133,10 +152,13 @@ export async function withTaskLock<T>(
 }
 
 export async function acquireLock(repo: string, taskId: string, session: string): Promise<() => Promise<void>> {
-  const lockPath = taskPaths(repo, taskId).lock;
+  const dir = await existingTaskDir(repo, taskId);
+  const lockPath = path.join(dir, "lock");
   const holder: LockHolder = { pid: process.pid, session, acquired_at: new Date().toISOString() };
-  const handle = await open(lockPath, "wx").catch(async (error: NodeJS.ErrnoException) => {
+  const handle = await open(lockPath, lockFlags).catch(async (error: NodeJS.ErrnoException) => {
+    if (error.code === "ELOOP") throw new Error("task lock must not be a symlink");
     if (error.code !== "EEXIST") throw error;
+    await rejectUnexpected(lockPath, "task lock");
     throw new TaskLockError(await readHolder(lockPath));
   });
   try {
@@ -151,12 +173,24 @@ export async function acquireLock(repo: string, taskId: string, session: string)
   return async () => {
     if (released) return;
     released = true;
-    const current = await readHolder(lockPath);
-    if (current.pid !== process.pid || current.session !== session) {
-      throw new Error("task lock: holder changed before release");
-    }
+    await assertHeld(dir, session);
     await rm(lockPath);
   };
+}
+
+async function putState(dir: string, taskId: string, state: TaskState): Promise<void> {
+  if (state.task_id !== taskId || state.version !== 1) throw new Error("state.json: identity mismatch");
+  rejectUnknown(stateSchema, state, "state.json");
+  const file = path.join(dir, "state.json");
+  await rejectUnexpected(file, "state.json");
+  await atomicWrite(file, `${JSON.stringify(state)}\n`);
+}
+
+async function assertHeld(dir: string, session: string): Promise<void> {
+  const holder = await readHolder(path.join(dir, "lock"));
+  if (holder.pid !== process.pid || holder.session !== session) {
+    throw new TaskLockError(holder);
+  }
 }
 
 async function readHolder(lockPath: string): Promise<LockHolder> {
@@ -187,14 +221,69 @@ async function holderAlive(pid: number): Promise<boolean> {
   }
 }
 
+async function existingTaskDir(repo: string, taskId: string): Promise<string> {
+  assertTaskId(taskId);
+  const root = await realpath(repo);
+  const dir = await walk(root, [".cw", "tasks", taskId]);
+  if (!isAuthority(dir, taskId)) throw new Error("task directory escapes repository");
+  return dir;
+}
+
+async function ensureParents(repo: string): Promise<string> {
+  const root = await realpath(repo);
+  let cursor = root;
+  for (const part of [".cw", "tasks"]) {
+    const next = path.join(cursor, part);
+    try {
+      cursor = await step(root, next);
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+      await mkdir(next);
+      cursor = next;
+    }
+  }
+  if (!pathInside(root, cursor)) throw new Error("task directory escapes repository");
+  return cursor;
+}
+
+async function walk(root: string, parts: string[]): Promise<string> {
+  let cursor = root;
+  for (const part of parts) {
+    cursor = await step(root, path.join(cursor, part));
+  }
+  return cursor;
+}
+
+async function step(root: string, next: string): Promise<string> {
+  const stat = await lstat(next);
+  if (stat.isSymbolicLink()) {
+    const target = await realpath(next);
+    if (!pathInside(root, target)) throw new Error(`task path symlink escapes repository ${next}`);
+    throw new Error(`task path must not be a symlink ${next}`);
+  }
+  if (!stat.isDirectory()) throw new Error(`task path is not a directory ${next}`);
+  return next;
+}
+
+function isAuthority(dir: string, taskId: string): boolean {
+  const parts = dir.split(path.sep);
+  return parts.at(-3) === ".cw" && parts.at(-2) === "tasks" && parts.at(-1) === taskId;
+}
+
+async function rejectUnexpected(file: string, label: string): Promise<void> {
+  let stat;
+  try {
+    stat = await lstat(file);
+  } catch (error) {
+    if (isNotFound(error)) return;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symlink`);
+}
+
 async function atomicWrite(file: string, contents: string): Promise<void> {
+  await rejectUnexpected(file, path.basename(file));
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, contents);
   await rename(temporary, file);
 }
-
-async function readFileNames(dir: string): Promise<string[]> {
-  return readdir(dir);
-}
-
-

@@ -15,32 +15,41 @@ export function assertTaskId(taskId: string): void {
   }
 }
 
-/** Repo-relative path that cannot escape or name `.cw`. Missing files stay lexical. */
-export async function repoPath(repo: string, value: string, allowCwScript: boolean): Promise<string> {
+/** Repo-relative segments. `.`, `..`, and empty segments are rejected, not normalized away. */
+export function relativeParts(value: string): string[] {
   if (value === "" || path.isAbsolute(value) || path.win32.isAbsolute(value)) {
     throw new Error(`path: must be repo-relative ${value}`);
   }
-  const normalized = path.normalize(value);
-  if (normalized === ".." || normalized.startsWith(`..${path.sep}`) || path.isAbsolute(normalized)) {
-    throw new Error(`path: escapes repository ${value}`);
+  const parts = value.split("/");
+  if (parts.some((part) => part === "" || part === "." || part === "..")) {
+    throw new Error(`path: refuses . or .. segment ${value}`);
   }
-  const parts = normalized.split(path.sep).filter((part) => part !== ".");
-  if (parts.some((part) => part === "..")) throw new Error(`path: escapes repository ${value}`);
-  const cw = parts.includes(".cw");
-  if (cw && !allowCwScript) throw new Error(`path: .cw is not allowed ${value}`);
-  if (cw && (parts.length < 2 || parts[0] !== ".cw")) throw new Error(`path: .cw location invalid ${value}`);
+  return parts;
+}
 
+/**
+ * Walk `value` from `repo`. The returned path is the repo-relative location actually checked.
+ * Lexical `.cw` rules apply before the walk, and again to each symlink target.
+ */
+export async function repoPath(repo: string, value: string, allowCwScript: boolean): Promise<string> {
+  const parts = relativeParts(value);
+  forbid(parts, allowCwScript, value);
   const root = await realpath(repo);
   let cursor = root;
-  const resolved: string[] = [];
-  for (const part of parts) {
+  let resolved: string[] = [];
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index]!;
     const next = path.join(cursor, part);
     let stat;
     try {
       stat = await lstat(next);
     } catch (error) {
-      if (isNotFound(error)) return normalized;
-      throw error;
+      if (!isNotFound(error)) throw error;
+      for (const rest of parts.slice(index)) {
+        resolved.push(rest);
+        forbid(resolved, allowCwScript, value);
+      }
+      return resolved.join("/");
     }
     if (stat.isSymbolicLink()) {
       let target: string;
@@ -50,23 +59,34 @@ export async function repoPath(repo: string, value: string, allowCwScript: boole
         if (isNotFound(error)) throw new Error(`path: symlink target missing ${value}`);
         throw error;
       }
-      if (!isInside(root, target)) throw new Error(`path: symlink escapes repository ${value}`);
+      if (!pathInside(root, target)) throw new Error(`path: symlink escapes repository ${value}`);
+      const relative = path.relative(root, target);
+      resolved = relative === "" ? [] : relative.split(path.sep);
+      forbid(resolved, allowCwScript, value);
       cursor = target;
-      resolved.push(...path.relative(root, target).split(path.sep).filter(Boolean));
     } else {
+      resolved = [...resolved, part];
+      forbid(resolved, allowCwScript, value);
       cursor = next;
-      resolved.push(part);
     }
-    if (resolved[0] === ".cw" && resolved[1] === "tasks") throw new Error(`path: task state is not a baseline input ${value}`);
   }
-  return normalized;
+  if (resolved.length === 0) throw new Error(`path: empty ${value}`);
+  forbid(resolved, allowCwScript, value);
+  return resolved.join("/");
 }
 
-function isInside(root: string, candidate: string): boolean {
+export function pathInside(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function isNotFound(error: unknown): boolean {
+function forbid(parts: string[], allowCwScript: boolean, value: string): void {
+  const cw = parts.indexOf(".cw");
+  if (cw < 0) return;
+  if (!allowCwScript) throw new Error(`path: .cw is not allowed ${value}`);
+  if (parts.slice(cw + 1).includes("tasks")) throw new Error(`path: task state is not a baseline input ${value}`);
+}
+
+export function isNotFound(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
