@@ -141,3 +141,10 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+docs/cw/
+AGENTS.md
+.opencode/
+.cache/
+.clangd/
+
