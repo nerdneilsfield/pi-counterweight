@@ -7,7 +7,7 @@ import { contentSha256, judgeEvidence, type ResultReport, type Verdict } from ".
 import { treeHash } from "./gitstate.js";
 import { isNotFound } from "./paths.js";
 import { assertRunRecord, writeRunRecord, type RunRecord } from "./runrecord.js";
-import { readState, runsDir, withTaskLock, writeState } from "./task.js";
+import { readState, runsDir, updateState, withTaskLock, writeState } from "./task.js";
 import type { Contract, GitValue, LastVerified, ValidatorConfig } from "./types.js";
 import { readFile } from "node:fs/promises";
 
@@ -115,6 +115,19 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       let lastVerified: LastVerified | null = null;
       if (verdict.conclusion === "pass" && !abort.cancelled) {
         lastVerified = await recordVerification(request, run, record, verdict, abort);
+        if (lastVerified !== null && abort.cancelled) {
+          // The cancel landed between the pre-write check and the atomic
+          // rename (or just after it): revoke exactly this run's record. An
+          // older verification belonging to another run is left untouched.
+          await updateState(request.repo, request.taskId, request.session, (state) =>
+            state.last_verified !== null && state.last_verified.run === run
+              ? { ...state, last_verified: null, evidence_invalid_reason: "cancelled" }
+              : state);
+          lastVerified = null;
+          verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
+          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
+          await writeRunRecord(path.join(dir, "run.json"), record);
+        }
         if (lastVerified === null && abort.cancelled) {
           verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
           record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -228,11 +228,11 @@ test("工具按声明顺序注册且全部 sequential", async () => {
   expect(fake.commands.has("cw-version")).toBe(true);
 });
 
-test("符号链接别名指向冻结文件被 block，悬空别名与新文件放行，逃逸被 block", async () => {
+test("符号链接别名指向冻结文件被 block，悬空别名 fail-closed，逃逸被 block", async () => {
   const { repo } = await setup();
   await symlink(path.join(repo, "tests", "a.py"), path.join(repo, "alias.py"));
   await symlink(path.join(repo, "tests", "fresh.py"), path.join(repo, "dangling.py"));
-  // 逃逸目标必须真实存在，否则属于悬空别名（保持放行语义）。
+  // 逃逸目标必须真实存在，否则属于悬空别名（同样 fail-closed）。
   await writeFile(path.join(repo, "..", "outside.txt"), "outside\n");
   await symlink(path.join(repo, "..", "outside.txt"), path.join(repo, "escape.py"));
   const { fake, ctx } = await startSession(repo);
@@ -248,10 +248,11 @@ test("符号链接别名指向冻结文件被 block，悬空别名与新文件�
   }), ctx);
   expect(exact).toMatchObject({ block: true });
 
+  // 悬空别名 fail-closed：write 工具会沿链接重建目标，无法核对即拒绝。
   const dangling = await fake.call("tool_call", toolCallEvent("write", {
     path: "dangling.py", content: "x",
   }), ctx);
-  expect(dangling ?? null).toBeNull();
+  expect(dangling).toMatchObject({ block: true });
 
   const fresh = await fake.call("tool_call", toolCallEvent("write", {
     path: "tests/brand-new.py", content: "x",
@@ -268,6 +269,24 @@ test("符号链接别名指向冻结文件被 block，悬空别名与新文件�
     path: `.cw/tasks/${taskId}/notes.md`, edits: [],
   }), ctx);
   expect(notes ?? null).toBeNull();
+});
+
+test("删除冻结目标后的悬空别名：write 被拦截，冻结目标不被重建", async () => {
+  const { repo, approval } = await setup();
+  // alias.py -> tests/a.py；随后删除冻结目标：alias 成为指向受保护路径的悬空链接。
+  await symlink(path.join(repo, "tests", "a.py"), path.join(repo, "alias.py"));
+  await rm(path.join(repo, "tests", "a.py"));
+  expect(approval.frozen_blobs["tests/a.py"]).toBeDefined();
+  const { fake, ctx } = await startSession(repo);
+
+  const blocked = await fake.call("tool_call", toolCallEvent("write", {
+    path: "alias.py", content: "recreated\n",
+  }), ctx);
+  expect(blocked).toMatchObject({ block: true });
+
+  // 真实写入路径的回归：拦截生效时目标不会被沿链接重建。
+  expect(existsSync(path.join(repo, "tests", "a.py"))).toBe(false);
+  await expect(lstat(path.join(repo, "alias.py"))).resolves.toBeTruthy();
 });
 
 test("edit 冻结文件被 block，新测试文件放行，逃出仓库被 block", async () => {
@@ -662,6 +681,59 @@ test("无活动任务时适配层保持被动", async () => {
   }), ctx)) ?? null).toBeNull();
   expect((await fake.call("agent_before_settle", settleEvent(), ctx)) ?? null).toBeNull();
 });
+
+test("取消落在 handback/落盘窗口：撤销本次 verified，不返回通过", async () => {
+  const { repo, validator, writeApproval } = await setup();
+  // 预置大量有效 run，让 writeHandback 的扫描有足够宽度，取消必然落在
+  // handback 写盘与状态发布之间；无论落点先后，撤销逻辑收敛同一终态。
+  const runsDir = path.join(repo, ".cw", "tasks", taskId, "runs");
+  const runRecord = {
+    version: 1, run: 0,
+    started_at: new Date().toISOString(), ended_at: new Date().toISOString(),
+    exit_code: 0, term_signal: null, timed_out: false, cancelled: false,
+    result_discarded: false, runner_error: null, record_error: null,
+    git: true, tree_before: "0".repeat(64), tree_after: "0".repeat(64),
+    input_hashes_before: {}, input_hashes_after: {}, artifact_hashes: {},
+  };
+  const seeded = 120;
+  for (let run = 1; run <= seeded; run++) {
+    const dir = path.join(runsDir, String(run));
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "run.json"), JSON.stringify({ ...runRecord, run }));
+    await writeFile(path.join(dir, "result.json"), report(
+      [{ id: "keep", status: "pass" }, { id: "reg", status: "pass" }],
+      JSON.stringify({ run_id: String(run) })));
+  }
+  // 本次运行将是 seeded+1，验证器报告的 run_id 必须一致才会判定 pass。
+  const nextRun = seeded + 1;
+  await writeApproval({ validator: validator("report", report(
+    [{ id: "keep", status: "pass" }, { id: "reg", status: "pass" }],
+    JSON.stringify({ run_id: String(nextRun) }))) });
+  // 大号 notes.md 拉长 handback.md 的写盘窗口：轮询到 handback.json 后立刻
+  // 取消，取消标志必然在 md 落盘与状态发布之间置位。
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "notes.md"), "x".repeat(8_000_000));
+  const { fake, ctx, controller } = await startSession(repo);
+
+  // 验证通过后 gate 会写 handback.json；轮询到它的一刻触发取消，
+  // 此时 finish 分支仍在执行（md 落盘与状态发布在其后），撤销收敛同一终态。
+  const taskDir = path.join(repo, ".cw", "tasks", taskId);
+  const settling = fake.call("agent_before_settle", settleEvent(), ctx);
+  const handbackJson = path.join(taskDir, "handback.json");
+  while (!existsSync(handbackJson)) await delay(1);
+  controller.abort();
+  const result = await settling;
+
+    const entries = (result as { entries?: Array<{ content: string }> }).entries ?? [];
+    expect(entries.some((entry) => entry.content.includes("验收通过"))).toBe(false);
+    const state = await readState(repo, taskId);
+    expect(state.status).not.toBe("verified");
+    expect(state.last_verified).toBeNull();
+    expect(state.evidence_invalid_reason).toBe("cancelled");
+    const material = JSON.parse(await readFile(
+      path.join(taskDir, "handback.json"), "utf8"));
+    expect(material.reason).toBe("cancelled");
+    expect(material.auto_verified).toBe(false);
+  }, 20_000);
 
 test("session_shutdown 等待验证进程组清理完成后再释放，不发布验证结果", async () => {
   const { repo, validator, writeApproval } = await setup();

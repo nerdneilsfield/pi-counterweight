@@ -13,7 +13,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { contractSha256, readContract } from "../../core/contract.js";
 import { recheckArtifacts } from "../../core/evidence.js";
 import { isProtectedPath, checkFrozen, recheckContract, recheckTree } from "../../core/freeze.js";
@@ -297,14 +297,46 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
           };
         }
         case "finish": {
-          const material = await writeHandback(repo, taskId, session, {
+          // Publication is coordinated with cancellation: no handback material
+          // or verified status may be produced once the user has cancelled,
+          // and a cancel landing during the writes revokes this run's
+          // verification instead of reporting success.
+          if (controller.signal.aborted) return undefined;
+          let material = await writeHandback(repo, taskId, session, {
             contract,
             validator: active.approval.validator,
             reason: "finish",
             questions: [],
             autoVerified: decision.autoVerified,
           });
-          await updateState(repo, taskId, session, (current) => ({ ...current, status: "verified" }));
+          if (!controller.signal.aborted) {
+            await updateState(repo, taskId, session, (current) => ({ ...current, status: "verified" }));
+          }
+          if (controller.signal.aborted) {
+            await updateState(repo, taskId, session, (current) => ({
+              ...current,
+              status: current.status === "verified" ? "running" : current.status,
+              ...(outcome !== null && current.last_verified !== null
+                && current.last_verified.run === outcome.run
+                ? { last_verified: null, evidence_invalid_reason: "cancelled" }
+                : {}),
+            }));
+            material = await writeHandback(repo, taskId, session, {
+              contract,
+              validator: active.approval.validator,
+              reason: "cancelled",
+              questions: ["用户在验收结果发布期间取消任务"],
+              autoVerified: false,
+            });
+            return {
+              entries: [...event.entries, {
+                type: "custom_message" as const,
+                customType: "counterweight",
+                content: `[counterweight] 用户取消，验收结果未发布。材料：${material.md}`,
+                display: true,
+              }],
+            };
+          }
           return {
             entries: [...event.entries, {
               type: "custom_message" as const,
@@ -481,9 +513,10 @@ const UNVERIFIABLE_REASON = (value: string) =>
 /**
  * Whether a write tool may touch `raw`. Checks the lexical path and, for
  * existing targets, the fully resolved real path — an alias pointing at a
- * frozen file is blocked even though its lexical name is not protected.
- * Dangling aliases are judged by their eventual parent directory plus final
- * segment, so a safe new file stays writable.
+ * frozen file is blocked even though its lexical name is not protected. A
+ * dangling alias is fail-closed: the write tool would follow it and recreate
+ * an unverifiable target, so only a plain missing path (a genuinely new file)
+ * stays writable.
  */
 async function checkProtectedTarget(
   active: ActiveTask, raw: string,
@@ -498,34 +531,32 @@ async function checkProtectedTarget(
   if (isProtectedPath(lexical, active.contract, active.taskId)) {
     return { block: true, reason: PROTECTED_REASON(lexical) };
   }
-  const candidates: string[] = [];
+  let resolved: string;
   try {
-    candidates.push(await resolveSymlinkInRepo(active.root, lexical));
+    resolved = await resolveSymlinkInRepo(active.root, lexical);
   } catch (error) {
-    if (isNotFound(error)) {
-      // Missing target or dangling alias: judge the eventual location —
-      // the resolved parent directory plus the final segment.
-      const dir = path.posix.dirname(lexical);
-      if (dir !== ".") {
-        try {
-          const resolvedDir = await resolveSymlinkInRepo(active.root, dir);
-          const viaParent = resolvedDir === "" ? path.posix.basename(lexical)
-            : `${resolvedDir}/${path.posix.basename(lexical)}`;
-          candidates.push(viaParent);
-        } catch (parentError) {
-          if (!isNotFound(parentError)) return { block: true, reason: UNVERIFIABLE_REASON(raw) };
-        }
-      }
-    } else {
+    if (!isNotFound(error)) {
       // Existing target that cannot be resolved inside the repo (symlink
       // escape) — fail closed rather than allow an unverifiable write.
       return { block: true, reason: UNVERIFIABLE_REASON(raw) };
     }
-  }
-  for (const candidate of candidates) {
-    if (candidate !== lexical && isProtectedPath(candidate, active.contract, active.taskId)) {
-      return { block: true, reason: `${PROTECTED_REASON(candidate)}（路径 ${raw} 指向该受保护文件）` };
+    const absolute = path.join(active.root, lexical);
+    let dangling = false;
+    try {
+      dangling = (await lstat(absolute)).isSymbolicLink();
+    } catch {
+      // Nothing exists at the path: a plain new file, judged lexically above.
     }
+    if (dangling) {
+      return {
+        block: true,
+        reason: `[counterweight] ${raw} 是指向缺失目标的符号链接，写入会沿链接重建无法核对的路径，已拒绝。`,
+      };
+    }
+    return undefined;
+  }
+  if (resolved !== lexical && isProtectedPath(resolved, active.contract, active.taskId)) {
+    return { block: true, reason: `${PROTECTED_REASON(resolved)}（路径 ${raw} 指向该受保护文件）` };
   }
   return undefined;
 }
