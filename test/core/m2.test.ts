@@ -285,6 +285,46 @@ test("快照与产物哈希 IO 错误记入 run.json 并判无法判定", async 
   }
 });
 
+test("__proto__ 路径哈希必须记入 run.json 且 recheck 失效", async () => {
+  const root = await gitRepo();
+  await writeFile(path.join(root, "__proto__"), "artifact\n");
+  const contractFile = path.join(root, "contract.toml");
+  await writeFile(contractFile, `version = 1
+task_id = "${taskId}"
+tier = "change"
+deliverable = "code"
+goal = "fix"
+acceptance = ["keep"]
+red = ["keep"]
+regression = ["reg"]
+baseline_inputs = ["tests/a.py", "__proto__"]
+`);
+  const contract = await readContract(contractFile, root);
+  const approved = Object.create(null) as Record<string, string>;
+  approved["tests/a.py"] = createHash("sha256").update("check\n").digest("hex");
+  approved["__proto__"] = createHash("sha256").update("artifact\n").digest("hex");
+  const proof = {
+    protocol: 1, run_id: "1", complete: true,
+    checks: [{ id: "keep", status: "pass" }, { id: "reg", status: "pass" }],
+    artifacts: [{ kind: "build", path: "__proto__", sha256: approved["__proto__"], loaded_by: ["keep"] }],
+    build: { required: true, fresh: true, load_verified: true },
+    summary: "built", logs: [],
+  };
+  const ok = await runValidator({
+    repo: root, taskId, session: "s", contract, approvedInputHashes: approved,
+    validator: validator(root, 30, "body", JSON.stringify(proof)),
+  });
+  expect(ok.verdict.conclusion).toBe("pass");
+  const record = JSON.parse(await readFile(path.join(ok.dir, "run.json"), "utf8"));
+  expect(Object.hasOwn(record.artifact_hashes, "__proto__")).toBe(true);
+  expect(Object.hasOwn(record.input_hashes_after, "__proto__")).toBe(true);
+  expect((await readState(root, taskId)).last_verified).toMatchObject({ run: 1 });
+
+  await writeFile(path.join(root, "__proto__"), "stale\n");
+  expect(await recheckArtifacts(root, taskId, "s")).toBe("artifact changed __proto__");
+  expect((await readState(root, taskId)).last_verified).toBeNull();
+});
+
 test("取消覆盖发布全程：判定阶段取消不写已验证", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);

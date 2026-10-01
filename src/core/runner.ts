@@ -72,7 +72,7 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
     try {
       const after = await snapshot(request.repo, request.contract.baseline_inputs);
       const discard = discardReason(abort, stop);
-      const artifacts = discard !== null ? { hashes: {}, error: null } : await artifactHashes(request.repo, dir);
+      const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(request.repo, dir);
       const recordError = [before.error, after.error, artifacts.error]
         .filter((item): item is string => item !== null)
         .join("; ") || null;
@@ -106,7 +106,7 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       // the result: no last_verified may be published after cancellation.
       if (discard === null && abort.cancelled) {
         verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
-        record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: {} };
+        record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
         await writeRunRecord(path.join(dir, "run.json"), record);
       }
       let lastVerified: LastVerified | null = null;
@@ -114,7 +114,7 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
         lastVerified = await recordVerification(request, run, record, verdict, abort);
         if (lastVerified === null && abort.cancelled) {
           verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
-          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: {} };
+          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
           await writeRunRecord(path.join(dir, "run.json"), record);
         }
       }
@@ -133,6 +133,15 @@ function discardReason(
   if (abort.timedOut) return "timed out";
   if (stop.signal !== null) return `terminated by signal ${stop.signal}`;
   return null;
+}
+
+/**
+ * Plain `{}` turns an assignment to the key `__proto__` into a prototype
+ * assignment: no own property is created and the hash silently disappears
+ * from run.json, so recheckArtifacts would never invalidate it.
+ */
+function emptyHashes(): Record<string, string | null> {
+  return Object.create(null) as Record<string, string | null>;
 }
 
 export async function claimRun(repo: string, taskId: string): Promise<string> {
@@ -181,7 +190,7 @@ async function artifactHashes(
     return { hashes: {}, error: null };
   }
   if (parsed === null || typeof parsed !== "object" || !Array.isArray((parsed as { artifacts?: unknown }).artifacts)) return { hashes: {}, error: null };
-  const hashes: Record<string, string | null> = {};
+  const hashes = emptyHashes();
   let error: string | null = null;
   for (const artifact of (parsed as Pick<ResultReport, "artifacts">).artifacts ?? []) {
     if (artifact === null || typeof artifact !== "object" || typeof (artifact as { path?: unknown }).path !== "string") continue;
@@ -206,7 +215,7 @@ async function snapshot(
   } catch (cause) {
     error = appendError(error, `tree hash failed: ${errorMessage(cause)}`);
   }
-  const hashes: Record<string, string | null> = {};
+  const hashes = emptyHashes();
   for (const input of inputs) {
     try {
       hashes[input] = await contentSha256(repo, input);
