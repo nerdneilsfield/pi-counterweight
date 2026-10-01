@@ -1,0 +1,242 @@
+import { createHash } from "node:crypto";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import path from "node:path";
+import { Type } from "typebox";
+import { isNotFound, pathInside, relativeParts } from "./paths.js";
+import { rejectUnknown, ValidationError } from "./schema.js";
+import { updateState } from "./task.js";
+import type { Contract } from "./types.js";
+import { assertRunRecord, type RunRecord } from "./runrecord.js";
+
+const checkStatus = Type.Union([
+  Type.Literal("pass"), Type.Literal("fail"), Type.Literal("skip"), Type.Literal("error"),
+]);
+
+const resultSchema = Type.Object({
+  protocol: Type.Literal(1),
+  run_id: Type.String({ minLength: 1 }),
+  complete: Type.Boolean(),
+  checks: Type.Array(Type.Object({
+    id: Type.String({ minLength: 1 }),
+    status: checkStatus,
+    message: Type.Optional(Type.String()),
+  }, { additionalProperties: false })),
+  artifacts: Type.Optional(Type.Array(Type.Object({
+    kind: Type.Literal("build"),
+    path: Type.String({ minLength: 1 }),
+    sha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+    loaded_by: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+  }, { additionalProperties: false }))),
+  build: Type.Object({
+    required: Type.Boolean(),
+    fresh: Type.Optional(Type.Boolean()),
+    load_verified: Type.Optional(Type.Boolean()),
+  }, { additionalProperties: false }),
+  summary: Type.String(),
+  logs: Type.Array(Type.String({ minLength: 1 })),
+}, { additionalProperties: false });
+
+export interface CheckReport {
+  id: string;
+  status: "pass" | "fail" | "skip" | "error";
+  message?: string;
+}
+
+export interface ResultReport {
+  protocol: 1;
+  run_id: string;
+  complete: boolean;
+  checks: CheckReport[];
+  artifacts?: Array<{ kind: "build"; path: string; sha256: string; loaded_by: string[] }>;
+  build: { required: boolean; fresh?: boolean; load_verified?: boolean };
+  summary: string;
+  logs: string[];
+}
+
+export type Conclusion = "pass" | "fail" | "undetermined";
+
+export interface Verdict {
+  conclusion: Conclusion;
+  reasons: string[];
+}
+
+export async function judgeEvidence(
+  repo: string,
+  runDir: string,
+  contract: Contract,
+  approvedInputHashes: Record<string, string>,
+): Promise<Verdict> {
+  const record = assertRunRecord(JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")));
+  const text = await readResultText(runDir, record.result_discarded);
+  return judgeRecord(repo, record, text, contract, approvedInputHashes);
+}
+
+export async function judgeRecord(
+  repo: string,
+  record: RunRecord,
+  resultText: string | null,
+  contract: Contract,
+  approvedInputHashes: Record<string, string>,
+): Promise<Verdict> {
+  if (record.cancelled) return undetermined("cancelled");
+  if (record.timed_out) return undetermined("timed out");
+  if (record.term_signal !== null) return undetermined(`terminated by signal ${record.term_signal}`);
+  if (record.runner_error !== null) return undetermined(record.runner_error);
+  if (resultText === null) return undetermined("result.json missing");
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(resultText);
+    rejectUnknown(resultSchema, parsed, "result.json");
+  } catch (error) {
+    const detail = error instanceof ValidationError ? error.issues.join("; ") : error instanceof Error ? error.message : "unreadable";
+    return undetermined(`result.json invalid: ${detail}`);
+  }
+  const result = parsed as ResultReport;
+  const duplicate = duplicateId(result.checks);
+  if (duplicate) return undetermined(`duplicate check id ${duplicate}`);
+  if (result.run_id !== String(record.run)) return undetermined(`run_id mismatch ${result.run_id}`);
+  const proof = await buildProof(repo, result);
+  if (proof) return undetermined(proof);
+
+  if (record.git) {
+    if (record.tree_before === null || record.tree_after === null) return undetermined("git tree missing");
+    if (record.tree_before !== record.tree_after) return undetermined("worktree changed during validation");
+  }
+  const input = inputMismatch(contract, approvedInputHashes, record);
+  if (input) return undetermined(input);
+  if (result.complete !== true) return undetermined("complete is not true");
+
+  const approved = new Set(contract.approved_failures.map((item) => item.id));
+  const overlap = contract.acceptance.find((id) => approved.has(id));
+  if (overlap) return undetermined(`approved failure covers acceptance ${overlap}`);
+  const required = [...contract.acceptance, ...contract.regression.filter((id) => !approved.has(id))];
+  const byId = new Map(result.checks.map((check) => [check.id, check.status]));
+  const missingRequired = required.filter((id) => !byId.has(id)).map((id) => `missing ${id}`);
+  if (missingRequired.length > 0) return { conclusion: "fail", reasons: missingRequired };
+  const missingApproved = [...approved].filter((id) => !byId.has(id)).map((id) => `approved failure not reported ${id}`);
+  if (missingApproved.length > 0) return undetermined(missingApproved.join("; "));
+
+  const errors = required.filter((id) => byId.get(id) === "error");
+  if (errors.length > 0) return undetermined(errors.map((id) => `error ${id}`).join("; "));
+  const skipped = required.filter((id) => byId.get(id) === "skip");
+  if (skipped.length > 0) return { conclusion: "fail", reasons: skipped.map((id) => `skip ${id}`) };
+  const failed = required.filter((id) => byId.get(id) === "fail");
+  if (failed.length > 0) return { conclusion: "fail", reasons: failed.map((id) => `fail ${id}`) };
+  if (record.exit_code !== 0) return undetermined("结果与退出码矛盾");
+  return { conclusion: "pass", reasons: [] };
+}
+
+export async function recheckArtifacts(repo: string, taskId: string, session: string): Promise<string | null> {
+  return updateState(repo, taskId, session, async (state) => {
+    if (state.last_verified === null) return state;
+    const runDir = path.join(repo, ".cw", "tasks", taskId, "runs", String(state.last_verified.run));
+    const record = assertRunRecord(JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")));
+    for (const [file, expected] of Object.entries(record.artifact_hashes)) {
+      const actual = await contentSha256(repo, file);
+      if (actual !== expected) {
+        const reason = `artifact changed ${file}`;
+        return { ...state, last_verified: null, evidence_invalid_reason: reason };
+      }
+    }
+    return state;
+  }).then((state) => state.evidence_invalid_reason);
+}
+
+export async function contentSha256(repo: string, relative: string): Promise<string | null> {
+  const file = await boundedFile(repo, relative);
+  if (file === null) return null;
+  return createHash("sha256").update(await readFile(file)).digest("hex");
+}
+
+async function readResultText(runDir: string, discarded: boolean): Promise<string | null> {
+  if (discarded) return null;
+  try {
+    return await readFile(path.join(runDir, "result.json"), "utf8");
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
+  }
+}
+
+async function buildProof(repo: string, result: ResultReport): Promise<string | null> {
+  const artifacts = result.artifacts ?? [];
+  if (!result.build.required) {
+    if (result.build.fresh !== undefined || result.build.load_verified !== undefined || artifacts.length > 0) {
+      return "build not required but proof fields present";
+    }
+    return null;
+  }
+  if (result.build.fresh !== true || result.build.load_verified !== true) return "build proof incomplete";
+  if (artifacts.length === 0) return "build artifact missing";
+  for (const artifact of artifacts) {
+    const actual = await contentSha256(repo, artifact.path);
+    if (actual === null) return `artifact missing ${artifact.path}`;
+    if (actual !== artifact.sha256) return `artifact hash mismatch ${artifact.path}`;
+  }
+  return null;
+}
+
+function inputMismatch(contract: Contract, approved: Record<string, string>, record: RunRecord): string | null {
+  const expected = contract.baseline_inputs;
+  const approvedKeys = Object.keys(approved).sort();
+  if (approvedKeys.join("\0") !== [...expected].sort().join("\0")) return "approved input set mismatch";
+  const changed: string[] = [];
+  for (const file of expected) {
+    const want = approved[file];
+    if (record.input_hashes_before[file] !== want || record.input_hashes_after[file] !== want) changed.push(file);
+  }
+  const extra = [...new Set([...Object.keys(record.input_hashes_before), ...Object.keys(record.input_hashes_after)])]
+    .filter((file) => !expected.includes(file));
+  if (extra.length > 0) return `unexpected input hash ${extra.join(", ")}`;
+  return changed.length === 0 ? null : `acceptance input changed ${changed.join(", ")}`;
+}
+
+function duplicateId(checks: CheckReport[]): string | null {
+  const seen = new Set<string>();
+  for (const check of checks) {
+    if (seen.has(check.id)) return check.id;
+    seen.add(check.id);
+  }
+  return null;
+}
+
+async function boundedFile(repo: string, relative: string): Promise<string | null> {
+  let parts: string[];
+  try {
+    parts = relativeParts(relative);
+  } catch {
+    return null;
+  }
+  const root = await realpath(repo);
+  let cursor = root;
+  for (const part of parts) {
+    const next = path.join(cursor, part);
+    let stat;
+    try {
+      stat = await lstat(next);
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      let target: string;
+      try {
+        target = await realpath(next);
+      } catch (error) {
+        if (isNotFound(error)) return null;
+        throw error;
+      }
+      if (!pathInside(root, target)) return null;
+      cursor = target;
+    } else {
+      cursor = next;
+    }
+  }
+  const stat = await lstat(cursor);
+  return stat.isFile() ? cursor : null;
+}
+
+function undetermined(reason: string): Verdict {
+  return { conclusion: "undetermined", reasons: [reason] };
+}
