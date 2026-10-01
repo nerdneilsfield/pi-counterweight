@@ -28,5 +28,8 @@ case "$mode" in
     ln -s a.py tests/a.py
     printf "%s\n" "$2" > "$out"
     ;;
+  reportrun)
+    printf "%s\n" "$2" | sed -e "s|@RUN@|$CW_RUN_ID|g" -e "s|@PWD@|$PWD|g" > "$out"
+    ;;
   *) printf "%s\n" "$2" > "$out"; exit "${3:-0}" ;;
 esac

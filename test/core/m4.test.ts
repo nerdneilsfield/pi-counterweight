@@ -13,7 +13,7 @@ const taskId = "20260928-lifetime-fix";
 
 function stateOf(overrides: Partial<TaskState> = {}): TaskState {
   return {
-    task_id: taskId, status: "running", model: "gateway/medium",
+    task_id: taskId, status: "running", model: "gateway/medium", base_commit: null,
     repairs_used: 0, tokens_used: 0, wall_started_at: null,
     last_verified: null, evidence_invalid_reason: null, conflicts: [], sessions: [], version: 1,
     ...overrides,

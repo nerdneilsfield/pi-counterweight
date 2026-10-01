@@ -68,6 +68,8 @@ export interface TaskState {
   task_id: string;
   status: TaskStatus;
   model: string;
+  /** Commit recorded by `/cw task new`; the red check always uses this baseline. */
+  base_commit: string | null;
   repairs_used: number;
   tokens_used: number;
   wall_started_at: string | null;

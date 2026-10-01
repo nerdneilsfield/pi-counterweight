@@ -105,6 +105,27 @@ export async function diffFiles(repo: string, expected: string, actual: string):
   return result.stdout;
 }
 
+/** Whether `sha` resolves to a commit object reachable in this repository. */
+export async function commitExists(repo: string, sha: string): Promise<boolean> {
+  const result = await git(repo, ["cat-file", "-e", `${sha}^{commit}`]);
+  return result.code === 0;
+}
+
+/**
+ * Detached worktree at `commit` inside `dir`, which must not exist yet. Used
+ * by the red check to run the validator against the original baseline; the
+ * caller removes the directory and calls `worktreePrune` afterwards.
+ */
+export async function worktreeAdd(repo: string, dir: string, commit: string): Promise<void> {
+  const result = await git(repo, ["worktree", "add", "--detach", dir, commit]);
+  if (result.code !== 0) throw new Error(result.stderr.trim() || "git worktree add failed");
+}
+
+/** Drop worktree metadata whose directory is already gone. Best effort. */
+export async function worktreePrune(repo: string): Promise<void> {
+  await git(repo, ["worktree", "prune"]);
+}
+
 function git(repo: string, args: string[], index?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {

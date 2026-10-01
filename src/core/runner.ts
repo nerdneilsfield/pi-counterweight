@@ -40,114 +40,153 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
     const run = Number(path.basename(dir));
     const started = new Date().toISOString();
     const before = await snapshot(request.repo, request.contract.baseline_inputs);
-    const stdout = await open(path.join(dir, "stdout.log"), "wx");
-    const stderr = await open(path.join(dir, "stderr.log"), "wx");
-    const abort = linkAbort(request.signal, request.validator.timeout_s * 1000);
-    let child: ChildProcess | undefined;
-    let watch: ChildWatch | undefined;
-    let runnerError: string | null = null;
-    try {
-      if (!abort.signal.aborted && request.validator.cmd.length > 0) {
-        child = spawn(request.validator.cmd[0]!, request.validator.cmd.slice(1), {
-          cwd: request.repo,
-          detached: true,
-          stdio: ["ignore", stdout.fd, stderr.fd],
-          env: {
-            ...process.env,
-            ...request.validator.env,
-            CW_TASK_ID: request.taskId,
-            CW_RESULT_DIR: dir,
-            CW_RUN_ID: String(run),
-            CW_REQUIRED_IDS: requiredIds(request.contract),
-          },
-        });
-        watch = watchChild(child);
-      } else if (request.validator.cmd.length === 0) {
-        runnerError = "validator command empty";
-      }
-    } catch (error) {
-      runnerError = error instanceof Error ? error.message : "validator failed to start";
-    } finally {
-      await stdout.close();
-      await stderr.close();
+    const outcome = await runValidatorProcess({
+      cwd: request.repo,
+      cmd: request.validator.cmd,
+      env: {
+        ...process.env,
+        ...request.validator.env,
+        CW_TASK_ID: request.taskId,
+        CW_RESULT_DIR: dir,
+        CW_RUN_ID: String(run),
+        CW_REQUIRED_IDS: requiredIds(request.contract),
+      },
+      timeoutMs: request.validator.timeout_s * 1000,
+      stdoutPath: path.join(dir, "stdout.log"),
+      stderrPath: path.join(dir, "stderr.log"),
+      signal: request.signal,
+    });
+    const after = await snapshot(request.repo, request.contract.baseline_inputs);
+    const discard = discardReason(outcome);
+    const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(request.repo, dir);
+    const recordError = [before.error, after.error, artifacts.error]
+      .filter((item): item is string => item !== null)
+      .join("; ") || null;
+    let record: RunRecord = {
+      version: 1,
+      run,
+      started_at: started,
+      ended_at: new Date().toISOString(),
+      exit_code: outcome.exitCode,
+      term_signal: outcome.signal,
+      timed_out: outcome.timedOut,
+      cancelled: outcome.cancelled,
+      result_discarded: discard !== null,
+      runner_error: outcome.runnerError,
+      record_error: recordError,
+      git: before.git,
+      tree_before: before.tree,
+      tree_after: after.tree,
+      input_hashes_before: before.inputs,
+      input_hashes_after: after.inputs,
+      artifact_hashes: artifacts.hashes,
+    };
+    await writeRunRecord(path.join(dir, "run.json"), record);
+    let verdict: Verdict;
+    if (discard !== null) {
+      verdict = { conclusion: "undetermined", reasons: [discard] };
+    } else {
+      verdict = await judgeEvidence(request.repo, dir, request.contract, request.approvedInputHashes);
     }
-    const stop = watch ? await stopGroup(watch, abort) : { exitCode: null, signal: null };
-    try {
-      const after = await snapshot(request.repo, request.contract.baseline_inputs);
-      const discard = discardReason(abort, stop);
-      const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(request.repo, dir);
-      const recordError = [before.error, after.error, artifacts.error]
-        .filter((item): item is string => item !== null)
-        .join("; ") || null;
-      let record: RunRecord = {
-        version: 1,
-        run,
-        started_at: started,
-        ended_at: new Date().toISOString(),
-        exit_code: stop.exitCode,
-        term_signal: stop.signal,
-        timed_out: abort.timedOut,
-        cancelled: abort.cancelled,
-        result_discarded: discard !== null,
-        runner_error: runnerError,
-        record_error: recordError,
-        git: before.git,
-        tree_before: before.tree,
-        tree_after: after.tree,
-        input_hashes_before: before.inputs,
-        input_hashes_after: after.inputs,
-        artifact_hashes: artifacts.hashes,
-      };
+    // A cancel that arrives while the verdict is being judged still discards
+    // the result: no last_verified may be published after cancellation.
+    if (discard === null && outcome.cancelled) {
+      verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
+      record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
       await writeRunRecord(path.join(dir, "run.json"), record);
-      let verdict: Verdict;
-      if (discard !== null) {
-        verdict = { conclusion: "undetermined", reasons: [discard] };
-      } else {
-        verdict = await judgeEvidence(request.repo, dir, request.contract, request.approvedInputHashes);
-      }
-      // A cancel that arrives while the verdict is being judged still discards
-      // the result: no last_verified may be published after cancellation.
-      if (discard === null && abort.cancelled) {
+    }
+    let lastVerified: LastVerified | null = null;
+    if (verdict.conclusion === "pass" && !outcome.cancelled) {
+      lastVerified = await recordVerification(request, run, record, verdict, outcome);
+      if (lastVerified !== null && outcome.cancelled) {
+        // The cancel landed between the pre-write check and the atomic
+        // rename (or just after it): revoke exactly this run's record. An
+        // older verification belonging to another run is left untouched.
+        // The task lock is already held by runValidator, so the revocation
+        // must not take it again.
+        await revokeRunVerification(request.repo, request.taskId, request.session, run);
+        lastVerified = null;
         verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
         record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
         await writeRunRecord(path.join(dir, "run.json"), record);
       }
-      let lastVerified: LastVerified | null = null;
-      if (verdict.conclusion === "pass" && !abort.cancelled) {
-        lastVerified = await recordVerification(request, run, record, verdict, abort);
-        if (lastVerified !== null && abort.cancelled) {
-          // The cancel landed between the pre-write check and the atomic
-          // rename (or just after it): revoke exactly this run's record. An
-          // older verification belonging to another run is left untouched.
-          // The task lock is already held by runValidator, so the revocation
-          // must not take it again.
-          await revokeRunVerification(request.repo, request.taskId, request.session, run);
-          lastVerified = null;
-          verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
-          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
-          await writeRunRecord(path.join(dir, "run.json"), record);
-        }
-        if (lastVerified === null && abort.cancelled) {
-          verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
-          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
-          await writeRunRecord(path.join(dir, "run.json"), record);
-        }
+      if (lastVerified === null && outcome.cancelled) {
+        verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
+        record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
+        await writeRunRecord(path.join(dir, "run.json"), record);
       }
-      const failures = verdict.conclusion === "fail" ? await failureChecks(dir, request.contract) : [];
-      return { run, dir, record, verdict, lastVerified, failures };
-    } finally {
-      abort.dispose();
     }
+    const failures = verdict.conclusion === "fail" ? await failureChecks(dir, request.contract) : [];
+    return { run, dir, record, verdict, lastVerified, failures };
   });
 }
 
+export interface ProcessRun {
+  exitCode: number | null;
+  signal: string | null;
+  timedOut: boolean;
+  cancelled: boolean;
+  /** Set when the process never started (spawn failure or empty command). */
+  runnerError: string | null;
+}
+
+/**
+ * Run one validator command detached as its own process-group leader inside
+ * `cwd`, stdout/stderr into the given log files. Timeout or caller abort first
+ * SIGTERMs the whole group, SIGKILL follows after the grace period; the
+ * promise resolves only after every group member is gone, so no late result
+ * can race the caller's judgment.
+ */
+export async function runValidatorProcess(options: {
+  cwd: string;
+  cmd: string[];
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  stdoutPath: string;
+  stderrPath: string;
+  signal?: AbortSignal;
+}): Promise<ProcessRun> {
+  const stdout = await open(options.stdoutPath, "wx");
+  const stderr = await open(options.stderrPath, "wx");
+  const abort = linkAbort(options.signal, options.timeoutMs);
+  let child: ChildProcess | undefined;
+  let watch: ChildWatch | undefined;
+  let runnerError: string | null = null;
+  try {
+    if (!abort.signal.aborted && options.cmd.length > 0) {
+      child = spawn(options.cmd[0]!, options.cmd.slice(1), {
+        cwd: options.cwd,
+        detached: true,
+        stdio: ["ignore", stdout.fd, stderr.fd],
+        env: options.env,
+      });
+      watch = watchChild(child);
+    } else if (options.cmd.length === 0) {
+      runnerError = "validator command empty";
+    }
+  } catch (error) {
+    runnerError = error instanceof Error ? error.message : "validator failed to start";
+  } finally {
+    await stdout.close();
+    await stderr.close();
+  }
+  const stop = watch ? await stopGroup(watch, abort) : { exitCode: null, signal: null };
+  abort.dispose();
+  return {
+    exitCode: runnerError === null ? stop.exitCode : null,
+    signal: stop.signal,
+    timedOut: abort.timedOut,
+    cancelled: abort.cancelled,
+    runnerError,
+  };
+}
+
 function discardReason(
-  abort: { cancelled: boolean; timedOut: boolean },
-  stop: StopResult,
+  outcome: { cancelled: boolean; timedOut: boolean; signal: string | null },
 ): string | null {
-  if (abort.cancelled) return "cancelled";
-  if (abort.timedOut) return "timed out";
-  if (stop.signal !== null) return `terminated by signal ${stop.signal}`;
+  if (outcome.cancelled) return "cancelled";
+  if (outcome.timedOut) return "timed out";
+  if (outcome.signal !== null) return `terminated by signal ${outcome.signal}`;
   return null;
 }
 

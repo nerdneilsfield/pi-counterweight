@@ -34,6 +34,7 @@ import {
   type Approval,
 } from "../../core/task.js";
 import type { Contract, ProjectConfig } from "../../core/types.js";
+import { registerCommands } from "./commands.js";
 import { registerTools } from "./tools.js";
 
 /**
@@ -72,7 +73,8 @@ const DEFAULT_TIMEOUTS: AdapterTimeouts = {
   shutdownWaitMs: 10_000,
 };
 
-interface ValidationHandle {
+/** A validation (gate or command-driven red check) that shutdown must reap. */
+export interface ValidationHandle {
   controller: AbortController;
   done: Promise<void>;
 }
@@ -270,7 +272,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
           approvedInputHashes: active.approval.baseline_inputs_sha256,
           signal: controller.signal,
         });
-        validation = { controller, done: run.then(() => undefined, () => undefined) };
+        setValidation({ controller, done: run.then(() => undefined, () => undefined) });
         outcome = await run;
         decision = decide({
           ...base,
@@ -372,7 +374,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       }
     } finally {
       for (const { source, fn } of forwards) source.removeEventListener("abort", fn);
-      if (validation !== null && validation.controller === controller) validation = null;
+      if (validation !== null && validation.controller === controller) setValidation(null);
     }
   }
 
@@ -389,7 +391,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       // undetermined decision.
       current.controller.abort();
       await current.done;
-      if (validation !== null && validation.controller === current.controller) validation = null;
+      if (validation !== null && validation.controller === current.controller) setValidation(null);
     }
     if (active === null || event.outcome !== "completed") return undefined;
     try {
@@ -460,20 +462,18 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // ---- session_shutdown: idempotent termination of any running validation ----
   pi.on("session_shutdown", (_event: SessionShutdownEvent, _ctx: ExtensionContext) =>
     withTimeout(limits.shutdownWaitMs * 2, async () => {
-      const current = validation;
-      if (current !== null) {
-        // Wait for the validator process group and all associated cleanup to
-        // finish before releasing the reference; the reference is never
-        // dropped while work is still running. Cleanup is bounded: the abort
-        // sends SIGTERM to the group, SIGKILL follows after a 5s grace.
-        current.controller.abort();
-        await current.done;
-        validation = null;
-      }
+      await stopValidation();
       return undefined;
     }, () => undefined));
 
   registerTools(pi, { getTask: () => task });
+
+  registerCommands(pi, {
+    getTask: () => task,
+    setTask: (next) => { task = next; },
+    setValidation,
+    stopValidation,
+  });
 
   pi.registerCommand("cw-version", {
     description: "显示 Counterweight 当前加载的 Pi 版本",
@@ -481,6 +481,25 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       ctx.ui.notify(`Counterweight: pi ${VERSION}`, "info");
     },
   });
+
+  /** Store the handle of the validation currently in flight, or null. */
+  function setValidation(handle: ValidationHandle | null): void {
+    validation = handle;
+  }
+
+  /**
+   * Abort the in-flight validation (gate or command-driven red check) and
+   * wait until its process group and cleanup have fully settled. Idempotent;
+   * the reference is only cleared when it still points at the awaited handle.
+   */
+  async function stopValidation(): Promise<void> {
+    const current = validation;
+    if (current === null) return;
+    // The abort sends SIGTERM to the group, SIGKILL follows after a 5s grace.
+    current.controller.abort();
+    await current.done;
+    if (validation !== null && validation.controller === current.controller) setValidation(null);
+  }
 }
 
 async function locateTask(ctx: ExtensionContext): Promise<ActiveTask | null> {
@@ -491,7 +510,16 @@ async function locateTask(ctx: ExtensionContext): Promise<ActiveTask | null> {
   if (matches.length > 1) {
     ctx.ui.notify(`Counterweight: 发现多个活动任务 ${matches.join(", ")}，接管最新的 ${matches.at(-1)}`, "warning");
   }
-  const taskId = matches.at(-1)!;
+  return loadTask(repo, matches.at(-1)!, session);
+}
+
+/**
+ * Load the full session view of a task: contract, approval record, and
+ * project config, all from the authoritative task directory. Throws when any
+ * piece is missing or malformed — callers surface that as an error, never as
+ * a silently ungated session.
+ */
+export async function loadTask(repo: string, taskId: string, session: string): Promise<ActiveTask> {
   const root = await realpath(repo);
   const contract = await readContract(path.join(root, ".cw", "tasks", taskId, "contract.toml"), root);
   const approval = await readApproval(root, taskId);

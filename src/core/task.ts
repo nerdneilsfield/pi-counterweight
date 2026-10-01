@@ -8,6 +8,9 @@ import { rejectUnknown } from "./schema.js";
 import { Type } from "typebox";
 import type { LockHolder, TaskReference, TaskState } from "./types.js";
 
+const hexSha256 = Type.String({ pattern: "^[0-9a-f]{64}$" });
+const gitObjectId = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+
 const stateSchema = Type.Object({
   task_id: Type.String({ minLength: 1 }),
   status: Type.Union([
@@ -15,6 +18,7 @@ const stateSchema = Type.Object({
     Type.Literal("verified"), Type.Literal("handed_back"), Type.Literal("cancelled"),
   ]),
   model: Type.String({ minLength: 1 }),
+  base_commit: Type.Union([gitObjectId, Type.Null()]),
   repairs_used: Type.Integer({ minimum: 0 }),
   tokens_used: Type.Integer({ minimum: 0 }),
   wall_started_at: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
@@ -37,9 +41,6 @@ const lockSchema = Type.Object({
 
 const lockFlags = constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW;
 
-const hexSha256 = Type.String({ pattern: "^[0-9a-f]{64}$" });
-const gitObjectId = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
-
 const approvalSchema = Type.Object({
   version: Type.Literal(1),
   contract_sha256: hexSha256,
@@ -52,7 +53,7 @@ const approvalSchema = Type.Object({
   base_commit: gitObjectId,
   baseline_inputs_sha256: Type.Record(Type.String({ minLength: 1 }), hexSha256),
   frozen_blobs: Type.Record(Type.String({ minLength: 1 }), gitObjectId),
-  red_check_run: Type.Integer({ minimum: 1 }),
+  red_check_run: Type.Integer({ minimum: 0 }),
   approved_at: Type.String({ minLength: 1 }),
 }, { additionalProperties: false });
 
@@ -65,6 +66,7 @@ export interface Approval {
   base_commit: string;
   baseline_inputs_sha256: Record<string, string>;
   frozen_blobs: Record<string, string>;
+  /** Run number of the approving red-check run; 0 when the deliverable skips it. */
   red_check_run: number;
   approved_at: string;
 }
@@ -121,7 +123,9 @@ export class TaskLockError extends Error {
   }
 }
 
-export async function createTask(repo: string, taskId: string, model: string): Promise<string> {
+export async function createTask(
+  repo: string, taskId: string, model: string, baseCommit: string | null = null,
+): Promise<string> {
   assertTaskId(taskId);
   const parent = await ensureParents(repo);
   const dir = path.join(parent, taskId);
@@ -135,7 +139,7 @@ export async function createTask(repo: string, taskId: string, model: string): P
     throw error;
   }
   const state: TaskState = {
-    task_id: taskId, status: "drafting", model,
+    task_id: taskId, status: "drafting", model, base_commit: baseCommit,
     repairs_used: 0, tokens_used: 0, wall_started_at: null,
     last_verified: null, evidence_invalid_reason: null, conflicts: [], sessions: [], version: 1,
   };
@@ -387,6 +391,57 @@ export async function readApproval(repo: string, taskId: string): Promise<Approv
   const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
   rejectUnknown(approvalSchema, parsed, "approval.json");
   return parsed as Approval;
+}
+
+/**
+ * Harness-only write of the approval record plus the `drafting`/`handed_back`
+ * → `approved` transition, registering the approving session. Refuses when the
+ * task is in any other state; the record is only written after the caller has
+ * validated the contract and (for code deliverables) the red check.
+ */
+export async function writeApproval(
+  repo: string, taskId: string, session: string, approval: Approval,
+): Promise<TaskState> {
+  assertTaskId(taskId);
+  return withTaskLock(repo, taskId, session, async () => {
+    const dir = await existingTaskDir(repo, taskId);
+    rejectUnknown(approvalSchema, approval, "approval.json");
+    const file = path.join(dir, "approval.json");
+    await rejectUnexpected(file, "approval.json");
+    await atomicWrite(file, `${JSON.stringify(approval, null, 2)}\n`);
+    const state = await readState(repo, taskId);
+    if (state.status !== "drafting" && state.status !== "handed_back") {
+      throw new Error(`approve: task status is ${state.status}, not drafting/handed_back`);
+    }
+    const sessions = state.sessions.includes(session) ? state.sessions : [...state.sessions, session];
+    const next: TaskState = { ...state, status: "approved", sessions };
+    await putState(dir, taskId, next);
+    return next;
+  });
+}
+
+/** All task directories whose state has one of the given statuses, sorted by id. */
+export async function findTasksByStatus(repo: string, statuses: readonly TaskState["status"][]): Promise<string[]> {
+  const root = await realpath(repo);
+  let entries: Dirent[];
+  try {
+    entries = await readdir(path.join(root, ".cw", "tasks"), { withFileTypes: true });
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
+  }
+  const matches: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      assertTaskId(entry.name);
+      const state = await readState(root, entry.name);
+      if (statuses.includes(state.status)) matches.push(entry.name);
+    } catch {
+      // A malformed or foreign task directory is not manageable.
+    }
+  }
+  return matches.sort();
 }
 
 /** Active tasks for a session: status `approved`/`running` with the session registered. */

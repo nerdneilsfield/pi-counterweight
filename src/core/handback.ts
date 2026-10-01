@@ -9,7 +9,7 @@ import { readState, runsDir, withTaskLock } from "./task.js";
 import type { Contract, LastVerified, TaskState, ValidatorConfig } from "./types.js";
 import { assertRunRecord, type RunRecord } from "./runrecord.js";
 
-export type HandbackOutcome = HandbackReason | "finish" | "cancelled";
+export type HandbackOutcome = HandbackReason | "finish" | "cancelled" | "manual";
 
 export interface HandbackRequest {
   contract: Contract;
@@ -80,6 +80,7 @@ const REASON_LABELS: Record<HandbackOutcome, string> = {
   repairs_exhausted: "自动修复次数已用尽",
   finish: "验收通过，任务结束",
   cancelled: "用户取消，验收结果未发布",
+  manual: "用户手动交还",
 };
 
 /**
