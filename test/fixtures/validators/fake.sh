@@ -18,5 +18,10 @@ case "$mode" in
     printf "%s\n" "{\"protocol\":1,\"run_id\":\"$CW_RUN_ID\",\"complete\":true,\"checks\":[{\"id\":\"keep\",\"status\":\"pass\"}],\"build\":{\"required\":false},\"summary\":\"touched\",\"logs\":[]}" > "$out"
     ;;
   none) exit 0 ;;
+  dirmkdir) mkdir "$out" ;;
+  passmark)
+    printf "%s\n" "$2" > "$out"
+    : > "$CW_RESULT_DIR/marker"
+    ;;
   *) printf "%s\n" "$2" > "$out"; exit "${3:-0}" ;;
 esac

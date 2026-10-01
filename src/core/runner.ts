@@ -6,7 +6,7 @@ import { contentSha256, judgeEvidence, type ResultReport, type Verdict } from ".
 import { treeHash } from "./gitstate.js";
 import { isNotFound } from "./paths.js";
 import { assertRunRecord, writeRunRecord, type RunRecord } from "./runrecord.js";
-import { readState, withTaskLock, writeState } from "./task.js";
+import { readState, runsDir, withTaskLock, writeState } from "./task.js";
 import type { Contract, LastVerified, ValidatorConfig } from "./types.js";
 import { readFile } from "node:fs/promises";
 
@@ -69,39 +69,69 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       await stderr.close();
     }
     const stop = watch ? await stopGroup(watch, abort) : { exitCode: null, signal: null };
-    abort.dispose();
-    const after = await snapshot(request.repo, request.contract.baseline_inputs);
-    const discarded = abort.cancelled || abort.timedOut || stop.signal !== null;
-    const record: RunRecord = {
-      version: 1,
-      run,
-      started_at: started,
-      ended_at: new Date().toISOString(),
-      exit_code: stop.exitCode,
-      term_signal: stop.signal,
-      timed_out: abort.timedOut,
-      cancelled: abort.cancelled,
-      result_discarded: discarded,
-      runner_error: runnerError,
-      git: before.git,
-      tree_before: before.tree,
-      tree_after: after.tree,
-      input_hashes_before: before.inputs,
-      input_hashes_after: after.inputs,
-      artifact_hashes: discarded ? {} : await artifactHashes(request.repo, dir),
-    };
-    await writeRunRecord(path.join(dir, "run.json"), record);
-    const verdict = await judgeEvidence(request.repo, dir, request.contract, request.approvedInputHashes);
-    const lastVerified = await recordVerification(request, run, record, verdict);
-    return { run, dir, record, verdict, lastVerified };
+    try {
+      const after = await snapshot(request.repo, request.contract.baseline_inputs);
+      const discard = discardReason(abort, stop);
+      let record: RunRecord = {
+        version: 1,
+        run,
+        started_at: started,
+        ended_at: new Date().toISOString(),
+        exit_code: stop.exitCode,
+        term_signal: stop.signal,
+        timed_out: abort.timedOut,
+        cancelled: abort.cancelled,
+        result_discarded: discard !== null,
+        runner_error: runnerError,
+        git: before.git,
+        tree_before: before.tree,
+        tree_after: after.tree,
+        input_hashes_before: before.inputs,
+        input_hashes_after: after.inputs,
+        artifact_hashes: discard !== null ? {} : await artifactHashes(request.repo, dir),
+      };
+      await writeRunRecord(path.join(dir, "run.json"), record);
+      let verdict: Verdict;
+      if (discard !== null) {
+        verdict = { conclusion: "undetermined", reasons: [discard] };
+      } else {
+        verdict = await judgeEvidence(request.repo, dir, request.contract, request.approvedInputHashes);
+      }
+      // A cancel that arrives while the verdict is being judged still discards
+      // the result: no last_verified may be published after cancellation.
+      if (discard === null && abort.cancelled) {
+        verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
+        record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: {} };
+        await writeRunRecord(path.join(dir, "run.json"), record);
+      }
+      let lastVerified: LastVerified | null = null;
+      if (verdict.conclusion === "pass" && !abort.cancelled) {
+        lastVerified = await recordVerification(request, run, record, verdict, abort);
+        if (lastVerified === null && abort.cancelled) {
+          verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
+          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: {} };
+          await writeRunRecord(path.join(dir, "run.json"), record);
+        }
+      }
+      return { run, dir, record, verdict, lastVerified };
+    } finally {
+      abort.dispose();
+    }
   });
 }
 
+function discardReason(
+  abort: { cancelled: boolean; timedOut: boolean },
+  stop: StopResult,
+): string | null {
+  if (abort.cancelled) return "cancelled";
+  if (abort.timedOut) return "timed out";
+  if (stop.signal !== null) return `terminated by signal ${stop.signal}`;
+  return null;
+}
+
 export async function claimRun(repo: string, taskId: string): Promise<string> {
-  const runs = path.join(repo, ".cw", "tasks", taskId, "runs");
-  await mkdir(runs, { recursive: false }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "EEXIST") throw error;
-  });
+  const runs = await runsDir(repo, taskId);
   const names = await readdir(runs);
   const used = names.map((name) => Number(name)).filter((value) => Number.isInteger(value) && value > 0);
   const next = (used.length === 0 ? 0 : Math.max(...used)) + 1;
@@ -119,14 +149,16 @@ export async function claimRun(repo: string, taskId: string): Promise<string> {
 
 async function recordVerification(
   request: RunRequest, run: number, record: RunRecord, verdict: Verdict,
+  abort: { cancelled: boolean },
 ): Promise<LastVerified | null> {
   if (verdict.conclusion !== "pass" || !record.git || record.tree_after === null) return null;
+  const state = await readState(request.repo, request.taskId);
+  if (abort.cancelled) return null;
   const verified: LastVerified = {
     run,
     tree: record.tree_after,
     contract_sha256: contractSha256(request.contract),
   };
-  const state = await readState(request.repo, request.taskId);
   await writeState(request.repo, request.taskId, request.session, { ...state, last_verified: verified });
   return verified;
 }

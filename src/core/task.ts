@@ -124,20 +124,32 @@ export async function updateState(
 
 export async function allocateRun(repo: string, taskId: string, session: string): Promise<number> {
   return withTaskLock(repo, taskId, session, async () => {
-    const dir = await existingTaskDir(repo, taskId);
-    const runs = path.join(dir, "runs");
-    await rejectUnexpected(runs, "runs");
-    try {
-      await mkdir(runs);
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
-    }
+    const runs = await runsDir(repo, taskId);
     const names = await readdir(runs);
     const used = names.map((name) => Number(name)).filter((value) => Number.isInteger(value) && value > 0);
     const next = (used.length === 0 ? 0 : Math.max(...used)) + 1;
     await mkdir(path.join(runs, String(next)));
     return next;
   });
+}
+
+/**
+ * The authoritative task directory's `runs` directory, created if missing.
+ * Symlinks and non-directories are rejected so run directories, logs, and
+ * results can never land outside the task directory.
+ */
+export async function runsDir(repo: string, taskId: string): Promise<string> {
+  const dir = await existingTaskDir(repo, taskId);
+  const runs = path.join(dir, "runs");
+  try {
+    await mkdir(runs);
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+  }
+  const stat = await lstat(runs);
+  if (stat.isSymbolicLink()) throw new Error("runs must not be a symlink");
+  if (!stat.isDirectory()) throw new Error("runs must be a directory");
+  return runs;
 }
 
 export async function withTaskLock<T>(

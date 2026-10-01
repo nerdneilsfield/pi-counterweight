@@ -66,8 +66,20 @@ export async function judgeEvidence(
   contract: Contract,
   approvedInputHashes: Record<string, string>,
 ): Promise<Verdict> {
-  const record = assertRunRecord(JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")));
-  const text = await readResultText(runDir, record.result_discarded);
+  let record: RunRecord;
+  try {
+    record = assertRunRecord(JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")));
+  } catch (error) {
+    return undetermined(`run.json unreadable: ${errorMessage(error)}`);
+  }
+  if (record.result_discarded) return judgeRecord(repo, record, null, contract, approvedInputHashes);
+  let text: string;
+  try {
+    text = await readFile(path.join(runDir, "result.json"), "utf8");
+  } catch (error) {
+    if (isNotFound(error)) return undetermined("result.json missing");
+    return undetermined(`result.json unreadable: ${errorMessage(error)}`);
+  }
   return judgeRecord(repo, record, text, contract, approvedInputHashes);
 }
 
@@ -131,9 +143,19 @@ export async function recheckArtifacts(repo: string, taskId: string, session: st
   return updateState(repo, taskId, session, async (state) => {
     if (state.last_verified === null) return state;
     const runDir = path.join(repo, ".cw", "tasks", taskId, "runs", String(state.last_verified.run));
-    const record = assertRunRecord(JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")));
+    let record: RunRecord;
+    try {
+      record = assertRunRecord(JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")));
+    } catch (error) {
+      return { ...state, last_verified: null, evidence_invalid_reason: `run record unreadable: ${errorMessage(error)}` };
+    }
     for (const [file, expected] of Object.entries(record.artifact_hashes)) {
-      const actual = await contentSha256(repo, file);
+      let actual: string | null;
+      try {
+        actual = await contentSha256(repo, file);
+      } catch (error) {
+        return { ...state, last_verified: null, evidence_invalid_reason: `artifact unreadable ${file}: ${errorMessage(error)}` };
+      }
       if (actual !== expected) {
         const reason = `artifact changed ${file}`;
         return { ...state, last_verified: null, evidence_invalid_reason: reason };
@@ -149,16 +171,6 @@ export async function contentSha256(repo: string, relative: string): Promise<str
   return createHash("sha256").update(await readFile(file)).digest("hex");
 }
 
-async function readResultText(runDir: string, discarded: boolean): Promise<string | null> {
-  if (discarded) return null;
-  try {
-    return await readFile(path.join(runDir, "result.json"), "utf8");
-  } catch (error) {
-    if (isNotFound(error)) return null;
-    throw error;
-  }
-}
-
 async function buildProof(repo: string, result: ResultReport): Promise<string | null> {
   const artifacts = result.artifacts ?? [];
   if (!result.build.required) {
@@ -169,8 +181,16 @@ async function buildProof(repo: string, result: ResultReport): Promise<string | 
   }
   if (result.build.fresh !== true || result.build.load_verified !== true) return "build proof incomplete";
   if (artifacts.length === 0) return "build artifact missing";
+  const reported = new Set(result.checks.map((check) => check.id));
   for (const artifact of artifacts) {
-    const actual = await contentSha256(repo, artifact.path);
+    const unknown = artifact.loaded_by.filter((id) => !reported.has(id));
+    if (unknown.length > 0) return `loaded_by unknown check ${unknown.join(", ")}`;
+    let actual: string | null;
+    try {
+      actual = await contentSha256(repo, artifact.path);
+    } catch (error) {
+      return `artifact unreadable ${artifact.path}: ${errorMessage(error)}`;
+    }
     if (actual === null) return `artifact missing ${artifact.path}`;
     if (actual !== artifact.sha256) return `artifact hash mismatch ${artifact.path}`;
   }
@@ -216,8 +236,9 @@ async function boundedFile(repo: string, relative: string): Promise<string | nul
     try {
       stat = await lstat(next);
     } catch (error) {
-      if (isNotFound(error)) return null;
-      throw error;
+      // ENOTDIR: an intermediate segment is a plain file (e.g. tests/a.py/sub.bin).
+      if (!isMissing(error)) throw error;
+      return null;
     }
     if (stat.isSymbolicLink()) {
       let target: string;
@@ -233,8 +254,23 @@ async function boundedFile(repo: string, relative: string): Promise<string | nul
       cursor = next;
     }
   }
-  const stat = await lstat(cursor);
-  return stat.isFile() ? cursor : null;
+  let final;
+  try {
+    final = await lstat(cursor);
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+    return null;
+  }
+  return final.isFile() ? cursor : null;
+}
+
+function isMissing(error: unknown): boolean {
+  const code = error instanceof Error && "code" in error ? error.code : "";
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "unreadable";
 }
 
 function undetermined(reason: string): Verdict {

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -213,10 +214,11 @@ test("已有 run 目录不复用，非 Git 通过也不绑定", async () => {
   const root = await gitRepo();
   await mkdir(path.join(root, ".cw", "tasks", taskId, "runs"), { recursive: true });
   await mkdir(path.join(root, ".cw", "tasks", taskId, "runs", "1"));
-  await expect(claimRun(root, taskId)).resolves.toBe(path.join(root, ".cw", "tasks", taskId, "runs", "2"));
+  const resolvedRoot = await realpath(root);
+  await expect(claimRun(root, taskId)).resolves.toBe(path.join(resolvedRoot, ".cw", "tasks", taskId, "runs", "2"));
   const occupied = path.join(root, ".cw", "tasks", taskId, "runs", "3");
   await mkdir(occupied);
-  await expect(claimRun(root, taskId)).resolves.toBe(path.join(root, ".cw", "tasks", taskId, "runs", "4"));
+  await expect(claimRun(root, taskId)).resolves.toBe(path.join(resolvedRoot, ".cw", "tasks", taskId, "runs", "4"));
 
   const plain = await mkdtemp(path.join(tmpdir(), "cw-m2-plain-"));
   await mkdir(path.join(plain, "tests"), { recursive: true });
@@ -242,6 +244,86 @@ test("验收输入哈希不符则无法判定", async () => {
   });
   expect(outcome.verdict.reasons[0]).toContain("acceptance input changed tests/a.py");
   expect((await readState(root, taskId)).last_verified).toBeNull();
+});
+
+test("取消覆盖发布全程：判定阶段取消不写已验证", async () => {
+  const root = await gitRepo();
+  const { contract, hashes } = await prepared(root);
+  const controller = new AbortController();
+  const pending = runValidator({
+    repo: root, taskId, session: "s", contract, approvedInputHashes: hashes,
+    // 验证器先写出可通过的 result.json，再留 marker 随即退出；abort 落在退出后的
+    // 快照/判定/发布阶段，证明迟到取消会丢弃本可通过的结果。
+    validator: validator(root, 30, "passmark", report(passChecks)),
+    signal: controller.signal,
+  });
+  const marker = path.join(root, ".cw", "tasks", taskId, "runs", "1", "marker");
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(marker)) {
+    if (Date.now() > deadline) throw new Error("validator never wrote marker");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  controller.abort();
+  const outcome = await pending;
+  expect(outcome.verdict).toEqual({ conclusion: "undetermined", reasons: ["cancelled"] });
+  expect(outcome.record.cancelled).toBe(true);
+  expect(outcome.record.result_discarded).toBe(true);
+  expect(outcome.lastVerified).toBeNull();
+  expect((await readState(root, taskId)).last_verified).toBeNull();
+}, 20_000);
+
+test("runs 目录拒绝 symlink、普通文件与越界写入", async () => {
+  const root = await gitRepo();
+  const runs = path.join(root, ".cw", "tasks", taskId, "runs");
+  const outside = await mkdtemp(path.join(tmpdir(), "cw-m2-out-"));
+  await symlink(outside, runs);
+  await expect(claimRun(root, taskId)).rejects.toThrow(/runs must not be a symlink/);
+  await expect(readdir(outside)).resolves.toEqual([]);
+  await rm(runs);
+  await writeFile(runs, "not a directory");
+  await expect(claimRun(root, taskId)).rejects.toThrow(/runs must be a directory/);
+  await rm(runs);
+  const resolvedRoot = await realpath(root);
+  await expect(claimRun(root, taskId)).resolves.toBe(path.join(resolvedRoot, ".cw", "tasks", taskId, "runs", "1"));
+});
+
+test("loaded_by 未知 ID 与 result.json 形状错误均为无法判定且保留 run 记录", async () => {
+  const root = await gitRepo();
+  const { contract, hashes } = await prepared(root);
+  await mkdir(path.join(root, "build"));
+  const artifact = path.join(root, "build", "out.bin");
+  await writeFile(artifact, "fresh\n");
+  const sha = createHash("sha256").update(await readFile(artifact)).digest("hex");
+  const proof = {
+    protocol: 1, run_id: "1", complete: true,
+    checks: [{ id: "keep", status: "pass" }, { id: "reg", status: "pass" }],
+    artifacts: [{ kind: "build", path: "build/out.bin", sha256: sha, loaded_by: ["ghost"] }],
+    build: { required: true, fresh: true, load_verified: true },
+    summary: "built", logs: [],
+  };
+  const ghost = await runValidator({
+    repo: root, taskId, session: "s", contract, approvedInputHashes: hashes,
+    validator: validator(root, 30, "body", JSON.stringify(proof)),
+  });
+  expect(ghost.verdict.conclusion).toBe("undetermined");
+  expect(ghost.verdict.reasons[0]).toContain("loaded_by unknown check ghost");
+
+  const dirResult = await runValidator({
+    repo: root, taskId, session: "s", contract, approvedInputHashes: hashes,
+    validator: validator(root, 30, "dirmkdir"),
+  });
+  expect(dirResult.verdict.conclusion).toBe("undetermined");
+  expect(dirResult.verdict.reasons[0]).toContain("result.json unreadable");
+  const record = JSON.parse(await readFile(path.join(dirResult.dir, "run.json"), "utf8"));
+  expect(record.run).toBe(2);
+
+  const nested = { ...proof, run_id: "3", artifacts: [{ ...proof.artifacts[0], path: "tests/a.py/nested.bin", loaded_by: ["keep"] }] };
+  const midFile = await runValidator({
+    repo: root, taskId, session: "s", contract, approvedInputHashes: hashes,
+    validator: validator(root, 30, "body", JSON.stringify(nested)),
+  });
+  expect(midFile.verdict.conclusion).toBe("undetermined");
+  expect(midFile.verdict.reasons[0]).toContain("artifact missing tests/a.py/nested.bin");
 });
 
 function git(cwd: string, args: string[]): Promise<void> {
