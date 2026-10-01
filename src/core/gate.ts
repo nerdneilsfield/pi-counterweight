@@ -38,6 +38,21 @@ const MAX_FAILURES = 10;
 const MAX_MESSAGE = 300;
 
 /**
+ * Fixed vocabulary the continue message must never carry, even when quoted
+ * from validator output. Censoring is a pure string replace — no judgment
+ * about what the text means.
+ */
+export const CONTINUE_FORBIDDEN = ["建议", "应该", "尝试", "下一步"] as const;
+
+const forbiddenPattern = new RegExp(CONTINUE_FORBIDDEN.join("|"), "g");
+const CENSOR = "□";
+
+/** Deterministic censoring for validator-supplied dynamic fields. */
+export function censorForbidden(text: string): string {
+  return text.replace(forbiddenPattern, CENSOR);
+}
+
+/**
  * Gate decision for one `agent_before_settle`. Pure: reads only its input and
  * never touches state; persisting `repairs_used` and generating handback
  * material belong to the caller. The order below is the contract — earlier
@@ -79,8 +94,9 @@ function continueMessage(input: GateInput, attempt: number): string {
   const lines = [
     `[counterweight] 验收未通过（第 ${attempt}/${input.budget.repairs} 次自动修复）`,
     "失败项：",
-    ...failureItems(input).map((item) => `- ${item.id}: ${truncate(item.message, MAX_MESSAGE)}`),
-    `完整日志：${input.logPath}`,
+    ...failureItems(input).map((item) =>
+      `- ${censorForbidden(item.id)}: ${truncate(censorForbidden(item.message), MAX_MESSAGE)}`),
+    `完整日志：${censorForbidden(input.logPath)}`,
   ];
   return lines.join("\n");
 }

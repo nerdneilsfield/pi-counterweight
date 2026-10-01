@@ -4,7 +4,7 @@ import path from "node:path";
 import { expect, test } from "vitest";
 import type { Verdict } from "../../src/core/evidence.ts";
 import { writeRunRecord } from "../../src/core/runrecord.ts";
-import { decide, type GateFailure, type GateInput } from "../../src/core/gate.ts";
+import { decide, censorForbidden, CONTINUE_FORBIDDEN, type GateFailure, type GateInput } from "../../src/core/gate.ts";
 import { failureFingerprint, notesSection, writeHandback } from "../../src/core/handback.ts";
 import { createTask, updateState } from "../../src/core/task.ts";
 import type { Contract, TaskState } from "../../src/core/types.ts";
@@ -129,8 +129,7 @@ test("fail 且次数用尽：handback repairs_exhausted", () => {
   }))).toEqual({ kind: "handback", reason: "repairs_exhausted" });
 });
 
-test("失败项最多 10 个，message 截断到 300 字符，无失败时退回结论原因", () => {
-  const long = "x".repeat(350);
+test("失败项最多 10 个，message 截断到 300 字符，无失败时退回结论原因", () => {  const long = "x".repeat(350);
   const many: GateFailure[] = Array.from({ length: 12 }, (_, index) => ({
     id: `tests/a.py::t${index}`, message: long,
   }));
@@ -147,6 +146,34 @@ test("失败项最多 10 个，message 截断到 300 字符，无失败时退回
   expect(fallback.message).toContain("- skip tests/a.py::t2: ");
 });
 
+test("continue 消息对验证器动态文本脱敏：禁词被确定性替换，不回灌建议", () => {
+  const decision = decide(inputOf({
+    verdict: failVerdict,
+    failures: [
+      { id: "tests/尝试夹具::t1", message: "断言失败：应该重试，建议先加缓存，下一步改注入" },
+    ],
+    logPath: `.cw/tasks/${taskId}/runs/1/下一步.log`,
+  })) as { message: string };
+  for (const word of CONTINUE_FORBIDDEN) expect(decision.message).not.toContain(word);
+  expect(decision.message).toContain("- tests/□夹具::t1: 断言失败：□重试，□先加缓存，□改注入");
+  expect(decision.message).toContain(`完整日志：.cw/tasks/${taskId}/runs/1/□.log`);
+
+  // 结论原因路径（缺失 ID 等 harness 文本）同样脱敏。
+  const fallback = decide(inputOf({
+    verdict: { conclusion: "fail", reasons: ["建议人工检查 missing-x"] },
+  })) as { message: string };
+  expect(fallback.message).not.toContain("建议");
+  expect(fallback.message).toContain("□人工检查 missing-x");
+
+  // 先脱敏后截断：300 字符后的禁词也不会漏进消息。
+  const boundary = decide(inputOf({
+    verdict: failVerdict,
+    failures: [{ id: "t", message: "x".repeat(300) + "建议" }],
+  })) as { message: string };
+  expect(boundary.message).not.toContain("建议");
+  expect(boundary.message).toContain(`- t: ${"x".repeat(300)}`);
+});
+
 test("失败指纹：数字、十六进制串、绝对路径不影响指纹；id 与 status 影响", () => {
   const noisy = "expected 42 at /tmp/cw/report.txt line 12 hash 0xdeadbeef98";
   const shifted = "expected 99 at /tmp/cw/other.txt line 99 hash 0xcafebabe77";
@@ -156,6 +183,18 @@ test("失败指纹：数字、十六进制串、绝对路径不影响指纹；id
     .not.toBe(failureFingerprint("t2", "fail", noisy));
   expect(failureFingerprint("t1", "fail", noisy))
     .not.toBe(failureFingerprint("t1", "skip", noisy));
+
+  // 含空格的绝对路径整体去除；十六进制串不限长度（≥2 字符的串）。
+  const spacedA = "missing /tmp/cw data/out put.txt at line 4";
+  const spacedB = "missing /var/other dir/log 2.txt at line 9";
+  expect(failureFingerprint("t1", "fail", spacedA))
+    .toBe(failureFingerprint("t1", "fail", spacedB));
+  expect(failureFingerprint("t1", "fail", "hash 0xdeadbeef"))
+    .toBe(failureFingerprint("t1", "fail", "hash 0x1f"));
+  expect(failureFingerprint("t1", "fail", "hash ab"))
+    .toBe(failureFingerprint("t1", "fail", "hash cd"));
+  expect(failureFingerprint("t1", "fail", spacedA))
+    .not.toBe(failureFingerprint("t1", "fail", "missing file"));
 });
 
 function contractOf(acceptance: string[], regression: string[]): Contract {
@@ -213,7 +252,7 @@ test("handback 生成 md/json：状态原因、验证记录、模型笔记、问
   await putRun(root, 1, [
     { id: "tests/a.py::t1", status: "fail", message: "AssertionError: expected 42 at /tmp/cw/r.txt" },
   ]);
-  // 取消的迟到结果：不进指纹历史，也不算已运行的回归。
+  // 取消的迟到结果：不进指纹历史、不算已运行的回归、不作复现依据。
   await putRun(root, 2, [{ id: "tests/a.py::reg1", status: "pass" }], { cancelled: true });
   await updateState(root, taskId, "s", (state) => ({
     ...state,
@@ -246,6 +285,9 @@ test("handback 生成 md/json：状态原因、验证记录、模型笔记、问
   expect(material.notes).toBe(NOTES);
   expect(material.questions).toEqual(["契约第2条：选 A 还是 B？"]);
   expect(material.not_run_checks).toEqual(["全量回归未运行"]);
+  // run 2 已取消：复现命令与覆盖判断都回退到末次有效 run 1。
+  expect(material.reproduce.env.CW_RUN_ID).toBe("1");
+  expect(material.reproduce.env.CW_RESULT_DIR).toMatch(/\/runs\/1$/);
   expect(material.next_round).toBe("- 先修对象生命周期的注入顺序\n- 再补回归");
   expect(material.fingerprint_history).toEqual([
     {
@@ -262,6 +304,7 @@ test("handback 生成 md/json：状态原因、验证记录、模型笔记、问
   expect(markdown).toContain('CI="1"');
   expect(markdown).toContain(`CW_TASK_ID="${taskId}"`);
   expect(markdown).toContain('"./.cw/validate.sh" "--all"');
+  expect(markdown).toContain('CW_RUN_ID="1"');
   expect(markdown).toContain("- 全量回归未运行");
   expect(markdown).toContain(material.fingerprint_history[0]!.fingerprint);
   expect(markdown).toContain("- 先修对象生命周期的注入顺序");
@@ -299,6 +342,74 @@ test("handback：回归已运行则不写全量回归未运行；无 notes 时�
   const markdown = await readFile(path.join(root, ".cw", "tasks", taskId, "handback.md"), "utf8");
   expect(markdown).toContain("- 验证：未经自动验证");
   expect(markdown).toContain("- 原因：冻结文件冲突");
+
+  await rm(root, { recursive: true, force: true });
+});
+
+test("handback：最高 run 无效时回退到末次有效 run，run_id 不符与协议不符同样无效", async () => {
+  const root = await taskRepo();
+  await putRun(root, 1, [
+    { id: "tests/a.py::t1", status: "fail", message: "boom" },
+    { id: "tests/a.py::reg1", status: "pass" },
+  ]);
+  const dir = path.join(root, ".cw", "tasks", taskId, "runs");
+  // run 2：result.json 损坏。
+  await mkdir(path.join(dir, "2"), { recursive: true });
+  await writeRunRecord(path.join(dir, "2", "run.json"), runRecord(2));
+  await writeFile(path.join(dir, "2", "result.json"), "{not json");
+  // run 3：形状合法但 run_id 不匹配。
+  await putRun(root, 3, [{ id: "tests/a.py::t1", status: "pass" }]);
+  await writeFile(path.join(dir, "3", "result.json"), JSON.stringify({
+    protocol: 1, run_id: "9", checks: [{ id: "tests/a.py::t1", status: "pass" }],
+    build: { required: false }, summary: "s", logs: [],
+  }));
+  // run 4：协议号不对。
+  await putRun(root, 4, []);
+  await writeFile(path.join(dir, "4", "result.json"), JSON.stringify({
+    protocol: 2, run_id: "4", checks: [], build: { required: false }, summary: "s", logs: [],
+  }));
+
+  const { material } = await writeHandback(root, taskId, "s", {
+    contract: contractOf(["tests/a.py::t1"], ["tests/a.py::reg1"]),
+    validator: { cmd: ["./.cw/validate.sh"], timeout_s: 600, env: {} },
+    reason: "undetermined",
+    questions: [],
+    autoVerified: false,
+  });
+
+  expect(material.reproduce.env.CW_RUN_ID).toBe("1");
+  expect(material.reproduce.env.CW_RESULT_DIR).toMatch(/\/runs\/1$/);
+  expect(material.not_run_checks).toEqual([]);
+  expect(material.fingerprint_history.map((entry) => entry.run)).toEqual([1]);
+
+  await rm(root, { recursive: true, force: true });
+});
+
+test("handback：没有任何有效运行时明确未运行并使用占位符", async () => {
+  const root = await taskRepo();
+  const dir = path.join(root, ".cw", "tasks", taskId, "runs", "1");
+  await mkdir(dir, { recursive: true });
+  await writeRunRecord(path.join(dir, "run.json"), runRecord(1, { cancelled: true }));
+  await writeFile(path.join(dir, "result.json"), JSON.stringify({ checks: [] }));
+  await updateState(root, taskId, "s", (state) => ({
+    ...state,
+    last_verified: { run: 1, tree: "t".repeat(64), contract_sha256: "c".repeat(64) },
+  }));
+
+  const { material } = await writeHandback(root, taskId, "s", {
+    contract: contractOf(["tests/a.py::t1"], ["tests/a.py::reg1"]),
+    validator: { cmd: ["./.cw/validate.sh"], timeout_s: 600, env: {} },
+    reason: "budget",
+    questions: [],
+    autoVerified: false,
+  });
+
+  expect(material.reproduce.env.CW_RUN_ID).toBe("<run>");
+  expect(material.reproduce.env.CW_RESULT_DIR).toContain("<run>");
+  expect(material.not_run_checks).toEqual(["全量回归未运行"]);
+  expect(material.fingerprint_history).toEqual([]);
+  // 记录路径是 state 事实，不受运行有效性影响。
+  expect(material.last_verified_record).toBe(`.cw/tasks/${taskId}/runs/1/run.json`);
 
   await rm(root, { recursive: true, force: true });
 });

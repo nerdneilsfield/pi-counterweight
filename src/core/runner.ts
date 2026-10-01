@@ -331,7 +331,11 @@ function signalGroup(pid: number, signal: NodeJS.Signals): void {
     process.kill(-pid, signal);
   } catch (error) {
     const code = error instanceof Error && "code" in error ? error.code : "";
-    if (code !== "ESRCH") throw error;
+    // The group belongs to this process's own detached child, so a same-uid
+    // live group cannot refuse the signal. macOS reports EPERM instead of
+    // ESRCH for an already-exited group; both mean it is gone. Throwing here
+    // would surface as an uncaught exception from the abort listener.
+    if (code !== "ESRCH" && code !== "EPERM") throw error;
   }
 }
 

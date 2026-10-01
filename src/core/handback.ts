@@ -7,6 +7,7 @@ import { assertTaskId } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
 import { readState, runsDir, withTaskLock } from "./task.js";
 import type { Contract, LastVerified, TaskState, ValidatorConfig } from "./types.js";
+import { assertRunRecord, type RunRecord } from "./runrecord.js";
 
 export type HandbackOutcome = HandbackReason | "finish";
 
@@ -82,17 +83,23 @@ const REASON_LABELS: Record<HandbackOutcome, string> = {
 
 /**
  * Failure fingerprint: sha256 over check id + status + message text with
- * numbers, hexadecimal runs, and absolute paths removed, so retry noise
- * (line numbers, addresses, hashes) does not mask a repeating failure.
+ * absolute paths (including paths containing spaces), hexadecimal runs of any
+ * length, and numbers removed, so retry noise (line numbers, addresses,
+ * hashes) does not mask a repeating failure. id and status stay in the hash.
  * Fingerprints never affect the gate decision; they only annotate handback
  * material.
  */
 export function failureFingerprint(id: string, status: string, message: string): string {
-  const stable = message
-    .replace(/(?:\/[^\s"'`]+)+/g, " ")
-    .replace(/[0-9a-fA-F]{6,}/g, "")
+  return createHash("sha256").update(id + status + stripVolatile(message)).digest("hex");
+}
+
+function stripVolatile(message: string): string {
+  return message
+    // A path starts at "/" and continues over spaces into tokens that carry
+    // another "/", a dot, or a hyphen; the first plain word ends it.
+    .replace(/\/\S*(?: \S*[.\-/]\S*)*/g, " ")
+    .replace(/[0-9a-fA-F]{2,}/g, "")
     .replace(/\d+/g, "");
-  return createHash("sha256").update(id + status + stable).digest("hex");
 }
 
 /**
@@ -123,8 +130,9 @@ async function buildMaterial(
   repo: string, taskId: string, state: TaskState, request: HandbackRequest,
 ): Promise<HandbackMaterial> {
   const runs = await scanRuns(repo, taskId);
-  const last = runs.at(-1) ?? null;
-  const history = runs.flatMap((run) =>
+  const valid = runs.filter((run) => run.valid);
+  const last = valid.at(-1) ?? null;
+  const history = valid.flatMap((run) =>
     run.messages
       .filter((check) => check.status !== "pass")
       .map((check) => ({
@@ -136,7 +144,7 @@ async function buildMaterial(
   );
 
   const regression = request.contract.regression;
-  const covered = last !== null && last.checks !== null
+  const covered = last?.checks != null
     && regression.every((id) => last.checks!.has(id));
   const notRun = regression.length > 0 && !covered ? ["全量回归未运行"] : [];
 
@@ -190,12 +198,35 @@ function reproduceEnv(
 
 interface RunSummary {
   run: number;
-  /** Check ids by id, when the run produced a readable result. */
+  /**
+   * Usable as the basis for "last run": run.json is intact and not
+   * cancelled/discarded, and result.json satisfies the protocol's core
+   * validity rules (protocol 1, run_id matches, well-shaped unique checks).
+   * Full evidence-schema judgment stays in evidence.ts; this is the subset
+   * handback consumes.
+   */
+  valid: boolean;
   checks: Map<string, string> | null;
   messages: Array<{ id: string; status: string; message: string }>;
 }
 
-/** Lenient pass over `runs/`: history is best-effort context, not evidence. */
+const invalidRun: { valid: boolean; checks: Map<string, string> | null; messages: RunSummary["messages"] } = {
+  valid: false, checks: null, messages: [],
+};
+
+const validResultSchema = Type.Object({
+  protocol: Type.Literal(1),
+  run_id: Type.String({ minLength: 1 }),
+  checks: Type.Array(Type.Object({
+    id: Type.String({ minLength: 1 }),
+    status: Type.Union([
+      Type.Literal("pass"), Type.Literal("fail"), Type.Literal("skip"), Type.Literal("error"),
+    ]),
+    message: Type.Optional(Type.String()),
+  })),
+});
+
+/** Best-effort pass over `runs/`, highest number first for "last valid". */
 async function scanRuns(repo: string, taskId: string): Promise<RunSummary[]> {
   const root = await runsDir(repo, taskId);
   const numbers = (await readdir(root))
@@ -204,58 +235,41 @@ async function scanRuns(repo: string, taskId: string): Promise<RunSummary[]> {
     .sort((a, b) => a - b);
   return Promise.all(numbers.map(async (run) => {
     const dir = path.join(root, String(run));
-    const discarded = await isDiscarded(dir);
-    const result = discarded ? null : await readChecks(path.join(dir, "result.json"));
-    return {
-      run,
-      checks: result === null ? null : new Map(result.map((check) => [check.id, check.status])),
-      messages: result ?? [],
-    };
+    return { run, ...(await readRun(dir, run)) };
   }));
 }
 
-/** Runs whose result the harness discarded (cancelled or lost the race). */
-async function isDiscarded(dir: string): Promise<boolean> {
-  let text: string;
+async function readRun(
+  dir: string, run: number,
+): Promise<{ valid: boolean; checks: Map<string, string> | null; messages: RunSummary["messages"] }> {
+  let record: RunRecord;
   try {
-    text = await readFile(path.join(dir, "run.json"), "utf8");
+    record = assertRunRecord(JSON.parse(await readFile(path.join(dir, "run.json"), "utf8")));
   } catch {
-    return false;
+    return invalidRun;
   }
-  try {
-    const record: unknown = JSON.parse(text);
-    if (typeof record !== "object" || record === null) return false;
-    const value = record as Record<string, unknown>;
-    return value.cancelled === true || value.result_discarded === true;
-  } catch {
-    return false;
-  }
-}
-
-async function readChecks(
-  file: string,
-): Promise<Array<{ id: string; status: string; message: string }> | null> {
+  if (record.cancelled || record.result_discarded || record.run !== run) return invalidRun;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await readFile(file, "utf8"));
+    parsed = JSON.parse(await readFile(path.join(dir, "result.json"), "utf8"));
+    rejectUnknown(validResultSchema, parsed, "result.json");
   } catch {
-    return null;
+    return invalidRun;
   }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const checks = (parsed as Record<string, unknown>).checks;
-  if (!Array.isArray(checks)) return null;
-  const items: Array<{ id: string; status: string; message: string }> = [];
-  for (const check of checks) {
-    if (typeof check !== "object" || check === null) continue;
-    const value = check as Record<string, unknown>;
-    if (typeof value.id !== "string" || typeof value.status !== "string") continue;
-    items.push({
-      id: value.id,
-      status: value.status,
-      message: typeof value.message === "string" ? value.message : "",
-    });
+  const result = parsed as { protocol: 1; run_id: string; checks: Array<{ id: string; status: "pass" | "fail" | "skip" | "error"; message?: string }> };
+  if (result.run_id !== String(run)) return invalidRun;
+  const seen = new Set<string>();
+  for (const check of result.checks) {
+    if (seen.has(check.id)) return invalidRun;
+    seen.add(check.id);
   }
-  return items;
+  return {
+    valid: true,
+    checks: new Map(result.checks.map((check) => [check.id, check.status])),
+    messages: result.checks.map((check) => ({
+      id: check.id, status: check.status, message: check.message ?? "",
+    })),
+  };
 }
 
 async function readNotes(repo: string, taskId: string): Promise<string | null> {
