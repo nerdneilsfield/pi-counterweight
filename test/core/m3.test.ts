@@ -5,7 +5,7 @@ import path from "node:path";
 import { expect, test } from "vitest";
 import { contractSha256 } from "../../src/core/contract.ts";
 import { checkFrozen, isProtectedPath, recheckContract, recheckTree } from "../../src/core/freeze.ts";
-import { blobHash, treeHash } from "../../src/core/gitstate.ts";
+import { blobHash, blobHashes, treeHash } from "../../src/core/gitstate.ts";
 import { acquireLock, createTask, readState, TaskLockError, updateState } from "../../src/core/task.ts";
 import type { Contract } from "../../src/core/types.ts";
 
@@ -259,3 +259,43 @@ test("10MB 冻结文件单次检查低于 200ms", async () => {
   expect(outcome.conflicts).toEqual([]);
   expect(elapsed).toBeLessThan(200);
 });
+
+test("5000 个 1KiB 冻结文件：无冲突与少量冲突均低于 200ms", async () => {
+  const root = await gitRepo();
+  await mkdir(path.join(root, "tests", "gen"), { recursive: true });
+  const rels: string[] = [];
+  for (let i = 0; i < 5000; i++) {
+    const rel = `tests/gen/f${String(i).padStart(4, "0")}.bin`;
+    await writeFile(path.join(root, rel), `${"x".repeat(1024)}\n`);
+    rels.push(rel);
+  }
+  await git(root, ["add", "tests"]);
+  await git(root, ["-c", "user.email=cw@example.com", "-c", "user.name=cw", "commit", "-m", "bulk"]);
+  const frozen: Record<string, string> = {};
+  for (let start = 0; start < rels.length; start += 500) {
+    const slice = rels.slice(start, start + 500);
+    const hashes = await blobHashes(root, slice);
+    slice.forEach((rel, index) => { frozen[rel] = hashes[index]!; });
+  }
+
+  const cleanStart = performance.now();
+  const clean = await checkFrozen(root, taskId, "s", frozen);
+  const cleanMs = performance.now() - cleanStart;
+  expect(clean.conflicts).toEqual([]);
+  expect(clean.diffs).toEqual([]);
+  expect(cleanMs).toBeLessThan(200);
+
+  for (const i of [7, 1234, 4999]) {
+    await writeFile(path.join(root, `tests/gen/f${String(i).padStart(4, "0")}.bin`), "tampered\n");
+  }
+  const conflictStart = performance.now();
+  const conflicted = await checkFrozen(root, taskId, "s", frozen);
+  const conflictMs = performance.now() - conflictStart;
+  expect(conflicted.conflicts).toHaveLength(3);
+  expect(conflicted.diffs).toEqual([
+    `.cw/tasks/${taskId}/conflicts/1.diff`,
+    `.cw/tasks/${taskId}/conflicts/2.diff`,
+    `.cw/tasks/${taskId}/conflicts/3.diff`,
+  ]);
+  expect(conflictMs).toBeLessThan(200);
+}, 60_000);

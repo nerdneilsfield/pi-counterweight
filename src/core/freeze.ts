@@ -1,10 +1,10 @@
 import { constants } from "node:fs";
-import { lstat, mkdtemp, open, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { contractSha256 } from "./contract.js";
 import { blobContent, blobHashes, diffFiles, isGitRepo, treeHash } from "./gitstate.js";
-import { assertTaskId, isNotFound, relativeParts, repoPath } from "./paths.js";
+import { assertTaskId, isNotFound, relativeParts, resolveInRepo } from "./paths.js";
 import { readState, taskSubdir, updateState, withTaskLock, writeState } from "./task.js";
 import type { Contract, GitValue } from "./types.js";
 
@@ -32,8 +32,10 @@ const DIFF_FLAGS = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | c
  * the tree hash excludes, so recording a conflict cannot change the evidence
  * that future checks compute.
  *
- * Non-git repos cannot verify blob hashes: nothing is reported and no state
- * is bound (see M1 degrade rules).
+ * The repo is realpathed once and every path is resolved independently, so a
+ * few thousand frozen files stay inside the per-call time budget. Non-git
+ * repos cannot verify blob hashes: nothing is reported and no state is bound
+ * (see M1 degrade rules).
  */
 export async function checkFrozen(
   repo: string, taskId: string, session: string,
@@ -43,32 +45,32 @@ export async function checkFrozen(
   if (!await isGitRepo(repo)) return { git: false, conflicts: [], diffs: [] };
   return withTaskLock(repo, taskId, session, async () => {
     const foundAt = new Date().toISOString();
-    const detectable: Array<{ original: string; expected: string; resolved: string }> = [];
-    const broken: Array<{ original: string; expected: string; detail: string }> = [];
-    for (const [original, expected] of Object.entries(frozenBlobs)) {
-      let resolved: string;
+    const root = await realpath(repo);
+    const checked = await Promise.all(Object.entries(frozenBlobs).map(async ([original, expected]) => {
       try {
-        resolved = await repoPath(repo, original, false);
-      } catch (error) {
-        broken.push({ original, expected, detail: error instanceof Error ? error.message : "path guard rejected" });
-        continue;
-      }
-      let stat;
-      try {
-        stat = await lstat(path.resolve(repo, resolved));
+        const resolved = await resolveInRepo(root, original);
+        const stat = await lstat(path.join(root, resolved));
+        if (!stat.isFile()) {
+          return { original, expected, resolved: null, detail: "not a regular file" };
+        }
+        return { original, expected, resolved, detail: null };
       } catch (error) {
         if (isNotFound(error)) {
-          broken.push({ original, expected, detail: "file missing" });
-          continue;
+          let dangling = false;
+          try {
+            dangling = (await lstat(path.join(root, original))).isSymbolicLink();
+          } catch {
+            // Already reported as missing below.
+          }
+          return { original, expected, resolved: null, detail: dangling ? "symlink target missing" : "file missing" };
         }
-        throw error;
+        return {
+          original, expected, resolved: null,
+          detail: error instanceof Error ? error.message : "path guard rejected",
+        };
       }
-      if (!stat.isFile()) {
-        broken.push({ original, expected, detail: "not a regular file" });
-        continue;
-      }
-      detectable.push({ original, expected, resolved });
-    }
+    }));
+    const detectable = checked.filter((item): item is typeof item & { resolved: string } => item.detail === null);
     const hashes = await blobHashes(repo, detectable.map((item) => item.resolved));
     const detected: Array<{ conflict: FrozenConflict; resolved: string | null; detail: string | null }> = [];
     for (let index = 0; index < detectable.length; index++) {
@@ -81,7 +83,8 @@ export async function checkFrozen(
         detail: null,
       });
     }
-    for (const item of broken) {
+    for (const item of checked) {
+      if (item.detail === null) continue;
       detected.push({
         conflict: { path: item.original, expected: item.expected, actual: null, found_at: foundAt },
         resolved: null,
@@ -91,13 +94,16 @@ export async function checkFrozen(
     if (detected.length === 0) return { git: true, conflicts: [], diffs: [] };
 
     const dir = await taskSubdir(repo, taskId, "conflicts");
-    let number = await nextDiffNumber(dir);
+    const first = await nextDiffNumber(dir);
+    // Rendering is the expensive part (object read plus a diff process per
+    // conflict): run it concurrently, then write the numbered files in order.
+    const rendered = await Promise.all(detected.map((item) => renderDiffBody(repo, item)));
     const diffs: string[] = [];
-    for (const item of detected) {
-      const name = `${number}.diff`;
-      await writeDiff(path.join(dir, name), repo, item);
+    for (let index = 0; index < detected.length; index++) {
+      const name = `${first + index}.diff`;
+      const { body, detail } = rendered[index]!;
+      await writeDiff(path.join(dir, name), conflictHeader(detected[index]!, detail) + body);
       diffs.push(`.cw/tasks/${taskId}/conflicts/${name}`);
-      number += 1;
     }
     const state = await readState(repo, taskId);
     await writeState(repo, taskId, session, {
@@ -184,27 +190,35 @@ interface DetectedConflict {
   detail: string | null;
 }
 
-async function writeDiff(file: string, repo: string, item: DetectedConflict): Promise<void> {
+function conflictHeader(item: DetectedConflict, detail: string | null): string {
   const lines = [
     "path: " + item.conflict.path,
     "expected: " + item.conflict.expected,
     "actual: " + (item.conflict.actual ?? "missing"),
     "found_at: " + item.conflict.found_at,
   ];
-  let detail = item.detail;
-  let body = "";
-  if (item.resolved !== null) {
-    const content = await blobContent(repo, item.conflict.expected);
-    if (content === null) {
-      detail = "approved blob object unavailable in git";
-    } else {
-      body = await renderUnifiedDiff(repo, item.conflict.expected, content, item.resolved);
-    }
-  }
   if (detail !== null) lines.push(`note: ${detail}`);
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Body of a conflict's `.diff` file: the unified difference between the
+ * approved blob and the current file, plus a note when that difference cannot
+ * be rendered at all.
+ */
+async function renderDiffBody(
+  repo: string, item: DetectedConflict,
+): Promise<{ body: string; detail: string | null }> {
+  if (item.resolved === null) return { body: "", detail: item.detail };
+  const content = await blobContent(repo, item.conflict.expected);
+  if (content === null) return { body: "", detail: "approved blob object unavailable in git" };
+  return { body: await renderUnifiedDiff(repo, item.conflict.expected, content, item.resolved), detail: null };
+}
+
+async function writeDiff(file: string, content: string): Promise<void> {
   const handle = await open(file, DIFF_FLAGS);
   try {
-    await handle.writeFile(`${lines.join("\n")}\n${body}`);
+    await handle.writeFile(content);
   } finally {
     await handle.close();
   }

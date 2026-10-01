@@ -80,6 +80,21 @@ export function pathInside(root: string, candidate: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+/**
+ * Fully resolve `value` (every symlink) under a pre-resolved repo `root` with
+ * one realpath, rejecting `.cw` segments both lexically and after resolution.
+ * Callers pass the realpath of the repo so batch checks do not repeat that
+ * walk per path. ENOENT propagates: the path is missing or a dangling symlink.
+ */
+export async function resolveInRepo(root: string, value: string): Promise<string> {
+  forbid(relativeParts(value), false, value);
+  const target = await realpath(path.join(root, value));
+  if (!pathInside(root, target)) throw new Error(`path: symlink escapes repository ${value}`);
+  const resolved = path.relative(root, target).split(path.sep).join("/");
+  forbid(relativeParts(resolved), false, value);
+  return resolved;
+}
+
 function forbid(parts: string[], allowCwScript: boolean, value: string): void {
   const cw = parts.indexOf(".cw");
   if (cw < 0) return;
