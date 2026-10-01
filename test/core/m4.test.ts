@@ -174,27 +174,31 @@ test("continue 消息对验证器动态文本脱敏：禁词被确定性替换�
   expect(boundary.message).toContain(`- t: ${"x".repeat(300)}`);
 });
 
-test("失败指纹：数字、十六进制串、绝对路径不影响指纹；id 与 status 影响", () => {
-  const noisy = "expected 42 at /tmp/cw/report.txt line 12 hash 0xdeadbeef98";
-  const shifted = "expected 99 at /tmp/cw/other.txt line 99 hash 0xcafebabe77";
-  expect(failureFingerprint("t1", "fail", noisy))
-    .toBe(failureFingerprint("t1", "fail", shifted));
-  expect(failureFingerprint("t1", "fail", noisy))
-    .not.toBe(failureFingerprint("t2", "fail", noisy));
-  expect(failureFingerprint("t1", "fail", noisy))
-    .not.toBe(failureFingerprint("t1", "skip", noisy));
+test("失败指纹：路径 span 到分隔边界整体去除，hex 只删独立 token，id/status 区分", () => {
+  const fp = (message: string) => failureFingerprint("t1", "fail", message);
 
-  // 含空格的绝对路径整体去除；十六进制串不限长度（≥2 字符的串）。
-  const spacedA = "missing /tmp/cw data/out put.txt at line 4";
-  const spacedB = "missing /var/other dir/log 2.txt at line 9";
-  expect(failureFingerprint("t1", "fail", spacedA))
-    .toBe(failureFingerprint("t1", "fail", spacedB));
-  expect(failureFingerprint("t1", "fail", "hash 0xdeadbeef"))
-    .toBe(failureFingerprint("t1", "fail", "hash 0x1f"));
-  expect(failureFingerprint("t1", "fail", "hash ab"))
-    .toBe(failureFingerprint("t1", "fail", "hash cd"));
-  expect(failureFingerprint("t1", "fail", spacedA))
-    .not.toBe(failureFingerprint("t1", "fail", "missing file"));
+  // 仅路径/数字差异 → 同指纹：末段普通词随 span 去除，不残留。
+  expect(fp("missing /tmp/cw data/out put、/var/other dir/log x 4"))
+    .toBe(fp("missing /tmp/zz data/out put、/var/other dir/log x 9"));
+  // 引号包裹的路径含空格同样整体去除。
+  expect(fp("cannot read '/tmp/my dir/out 1.txt' code 2"))
+    .toBe(fp("cannot read '/var/other dir/in 2.txt' code 3"));
+  expect(fp("expected 42 at /tmp/cw/report.txt line 12 hash 0xdeadbeef98"))
+    .toBe(fp("expected 99 at /tmp/cw/other.txt line 99 hash 0xcafebabe77"));
+  expect(fp("missing /tmp/cw data/out put")).not.toBe(fp("missing file"));
+
+  // hex 只删独立 token：0x 前缀任意长度、独立 ≥6 位；普通词保留，边界生效。
+  expect(fp("deadbeef x")).toBe(fp("cafebabe x"));
+  expect(fp("hash 0xab")).toBe(fp("hash 0xcd"));
+  expect(fp("failure 0x12")).toBe(fp("failure 0xcd"));
+  expect(fp("failure")).not.toBe(fp("failuredeadbeef"));
+  expect(fp("hash ab")).not.toBe(fp("hash cd"));
+  expect(fp("hash cafe")).not.toBe(fp("hash deadbeef"));
+
+  // 数字与路径仍去除；id 与 status 仍参与哈希。
+  expect(fp("42 at /tmp/a")).toBe(fp("99 at /var/b"));
+  expect(fp("same")).not.toBe(failureFingerprint("t2", "fail", "same"));
+  expect(fp("same")).not.toBe(failureFingerprint("t1", "skip", "same"));
 });
 
 function contractOf(acceptance: string[], regression: string[]): Contract {

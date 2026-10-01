@@ -83,11 +83,13 @@ const REASON_LABELS: Record<HandbackOutcome, string> = {
 
 /**
  * Failure fingerprint: sha256 over check id + status + message text with
- * absolute paths (including paths containing spaces), hexadecimal runs of any
- * length, and numbers removed, so retry noise (line numbers, addresses,
- * hashes) does not mask a repeating failure. id and status stay in the hash.
- * Fingerprints never affect the gate decision; they only annotate handback
- * material.
+ * volatile parts removed. Quoted spans that contain a "/" and absolute path
+ * spans (from the leading "/" to the next message delimiter — punctuation,
+ * quote, or newline — including a plain-word final segment) are dropped
+ * whole. Hexadecimal survives only as standalone tokens: 0x-prefixed of any
+ * length, or word-bounded runs of 6+ hex digits; ordinary words stay.
+ * Digits are always removed, id and status always stay. Fingerprints never
+ * affect the gate decision; they only annotate handback material.
  */
 export function failureFingerprint(id: string, status: string, message: string): string {
   return createHash("sha256").update(id + status + stripVolatile(message)).digest("hex");
@@ -95,10 +97,15 @@ export function failureFingerprint(id: string, status: string, message: string):
 
 function stripVolatile(message: string): string {
   return message
-    // A path starts at "/" and continues over spaces into tokens that carry
-    // another "/", a dot, or a hyphen; the first plain word ends it.
-    .replace(/\/\S*(?: \S*[.\-/]\S*)*/g, " ")
-    .replace(/[0-9a-fA-F]{2,}/g, "")
+    // A quoted span containing a "/" is a path: remove it with its quotes.
+    .replace(/(["'`])([^"'`\n]*)\1/g, (whole, _quote: string, inner: string) =>
+      inner.includes("/") ? " " : whole)
+    // An unquoted absolute path span runs from its leading "/" to the next
+    // message delimiter or end of line. Its final plain word belongs to the
+    // path ("/tmp/cw data/out put" is one span), so it never leaks prose.
+    .replace(/\/[^"'`\n，。；、,;:)\]}]*/g, " ")
+    // Hex only as standalone tokens; ordinary words like "failure" survive.
+    .replace(/\b0[xX][0-9a-fA-F]+\b|\b[0-9a-fA-F]{6,}\b/g, "")
     .replace(/\d+/g, "");
 }
 
