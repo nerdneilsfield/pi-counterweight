@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
+import type { Dirent } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { assertTaskId, isNotFound, pathInside } from "./paths.js";
@@ -35,6 +36,81 @@ const lockSchema = Type.Object({
 }, { additionalProperties: false });
 
 const lockFlags = constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW;
+
+const hexSha256 = Type.String({ pattern: "^[0-9a-f]{64}$" });
+const gitObjectId = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+
+const approvalSchema = Type.Object({
+  version: Type.Literal(1),
+  contract_sha256: hexSha256,
+  project_config_sha256: hexSha256,
+  validator: Type.Object({
+    cmd: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+    timeout_s: Type.Integer({ minimum: 1 }),
+    env: Type.Record(Type.String(), Type.String()),
+  }, { additionalProperties: false }),
+  base_commit: gitObjectId,
+  baseline_inputs_sha256: Type.Record(Type.String({ minLength: 1 }), hexSha256),
+  frozen_blobs: Type.Record(Type.String({ minLength: 1 }), gitObjectId),
+  red_check_run: Type.Integer({ minimum: 1 }),
+  approved_at: Type.String({ minLength: 1 }),
+}, { additionalProperties: false });
+
+/** Approved task record (`.cw/tasks/<id>/approval.json`), written by the M6 approval flow. */
+export interface Approval {
+  version: 1;
+  contract_sha256: string;
+  project_config_sha256: string;
+  validator: { cmd: string[]; timeout_s: number; env: Record<string, string> };
+  base_commit: string;
+  baseline_inputs_sha256: Record<string, string>;
+  frozen_blobs: Record<string, string>;
+  red_check_run: number;
+  approved_at: string;
+}
+
+const blockedSchema = Type.Object({
+  version: Type.Literal(1),
+  reason: Type.String({ minLength: 1 }),
+  questions: Type.Array(Type.String()),
+  session: Type.String({ minLength: 1 }),
+  created_at: Type.String({ minLength: 1 }),
+}, { additionalProperties: false });
+
+/** A `report_blocked` record awaiting the next gate decision. */
+export interface BlockedReport {
+  version: 1;
+  reason: string;
+  questions: string[];
+  session: string;
+  created_at: string;
+}
+
+const PROPOSAL_STATUSES = ["approved", "rejected", "pending"] as const;
+
+export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
+
+const proposalSchema = Type.Object({
+  version: Type.Literal(1),
+  n: Type.Integer({ minimum: 1 }),
+  field: Type.String({ minLength: 1 }),
+  new_value: Type.String({ minLength: 1 }),
+  reason: Type.String({ minLength: 1 }),
+  status: Type.Union(PROPOSAL_STATUSES.map((value) => Type.Literal(value))),
+  session: Type.String({ minLength: 1 }),
+  created_at: Type.String({ minLength: 1 }),
+}, { additionalProperties: false });
+
+export interface Proposal {
+  version: 1;
+  n: number;
+  field: string;
+  new_value: string;
+  reason: string;
+  status: ProposalStatus;
+  session: string;
+  created_at: string;
+}
 
 export class TaskLockError extends Error {
   readonly holder: LockHolder;
@@ -302,4 +378,145 @@ async function atomicWrite(file: string, contents: string): Promise<void> {
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, contents);
   await rename(temporary, file);
+}
+
+/** Read and schema-check the approved task record. */
+export async function readApproval(repo: string, taskId: string): Promise<Approval> {
+  const file = path.join(await existingTaskDir(repo, taskId), "approval.json");
+  await rejectUnexpected(file, "approval.json");
+  const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+  rejectUnknown(approvalSchema, parsed, "approval.json");
+  return parsed as Approval;
+}
+
+/** Active tasks for a session: status `approved`/`running` with the session registered. */
+export async function findSessionTasks(repo: string, session: string): Promise<string[]> {
+  const root = await realpath(repo);
+  let entries: Dirent[];
+  try {
+    entries = await readdir(path.join(root, ".cw", "tasks"), { withFileTypes: true });
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
+  }
+  const matches: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      assertTaskId(entry.name);
+      const state = await readState(root, entry.name);
+      if ((state.status === "approved" || state.status === "running") && state.sessions.includes(session)) {
+        matches.push(entry.name);
+      }
+    } catch {
+      // A malformed or foreign task directory is not manageable from this session.
+    }
+  }
+  return matches.sort();
+}
+
+async function taskFileLocked<T>(
+  repo: string, taskId: string, session: string, body: (dir: string) => Promise<T>,
+): Promise<T> {
+  return withTaskLock(repo, taskId, session, async () => body(await existingTaskDir(repo, taskId)));
+}
+
+/** Record the model's `report_blocked` report for the next gate decision. */
+export async function writeBlocked(
+  repo: string, taskId: string, session: string, report: { reason: string; questions: string[] },
+): Promise<void> {
+  await taskFileLocked(repo, taskId, session, async (dir) => {
+    const record: BlockedReport = {
+      version: 1, reason: report.reason, questions: report.questions,
+      session, created_at: new Date().toISOString(),
+    };
+    rejectUnknown(blockedSchema, record, "blocked.json");
+    await atomicWrite(path.join(dir, "blocked.json"), `${JSON.stringify(record)}\n`);
+  });
+}
+
+/**
+ * The pending `report_blocked` record, or null. A malformed record throws:
+ * an unreadable block report must not be silently ignored by the gate.
+ */
+export async function readBlocked(repo: string, taskId: string): Promise<BlockedReport | null> {
+  const dir = await existingTaskDir(repo, taskId);
+  const file = path.join(dir, "blocked.json");
+  await rejectUnexpected(file, "blocked.json");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
+  }
+  rejectUnknown(blockedSchema, parsed, "blocked.json");
+  return parsed as BlockedReport;
+}
+
+/** Remove the block record once the gate has turned it into handback material. */
+export async function clearBlocked(repo: string, taskId: string, session: string): Promise<void> {
+  await taskFileLocked(repo, taskId, session, async (dir) => {
+    await rejectUnexpected(path.join(dir, "blocked.json"), "blocked.json");
+    await rm(path.join(dir, "blocked.json"), { force: true });
+  });
+}
+
+export interface ProposalInput {
+  field: string;
+  new_value: string;
+  reason: string;
+  status: ProposalStatus;
+}
+
+/** Append a contract-change proposal as `proposals/<max+1>.json` under the task lock. */
+export async function writeProposal(
+  repo: string, taskId: string, session: string, input: ProposalInput,
+): Promise<Proposal> {
+  return taskFileLocked(repo, taskId, session, async (dir) => {
+    const proposals = await taskSubdir(repo, taskId, "proposals");
+    const used = (await readdir(proposals))
+      .map((name) => Number(name.replace(/\.json$/, "")))
+      .filter((value) => Number.isInteger(value) && value > 0);
+    const proposal: Proposal = {
+      version: 1, n: (used.length === 0 ? 0 : Math.max(...used)) + 1,
+      field: input.field, new_value: input.new_value, reason: input.reason,
+      status: input.status, session, created_at: new Date().toISOString(),
+    };
+    rejectUnknown(proposalSchema, proposal, "proposal.json");
+    await atomicWrite(path.join(dir, "proposals", `${proposal.n}.json`), `${JSON.stringify(proposal, null, 2)}\n`);
+    return proposal;
+  });
+}
+
+/**
+ * Highest-numbered proposal that still blocks autonomous work. `pending`
+ * waits for a human decision; `approved` waits for the M6 contract
+ * regeneration and red-check rerun; only `rejected` lets work continue.
+ */
+export async function findUnresolvedProposal(repo: string, taskId: string): Promise<Proposal | null> {
+  const dir = await existingTaskDir(repo, taskId);
+  const proposals = path.join(dir, "proposals");
+  let names: string[];
+  try {
+    names = (await readdir(proposals)).sort();
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
+  }
+  const found: Proposal[] = [];
+  for (const name of names) {
+    if (!/^\d+\.json$/.test(name)) continue;
+    const file = path.join(proposals, name);
+    await rejectUnexpected(file, name);
+    try {
+      const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+      rejectUnknown(proposalSchema, parsed, name);
+      const proposal = parsed as Proposal;
+      if (proposal.status !== "rejected") found.push(proposal);
+    } catch {
+      // A malformed proposal cannot drive the gate; ignore it here.
+    }
+  }
+  return found.length === 0 ? null : found.at(-1)!;
 }

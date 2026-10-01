@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { contractSha256 } from "./contract.js";
+import type { GateFailure } from "./gate.js";
 import { contentSha256, judgeEvidence, type ResultReport, type Verdict } from "./evidence.js";
 import { treeHash } from "./gitstate.js";
 import { isNotFound } from "./paths.js";
@@ -29,6 +30,8 @@ export interface RunOutcome {
   record: RunRecord;
   verdict: Verdict;
   lastVerified: LastVerified | null;
+  /** Required checks that did not pass, for the gate's continue message. */
+  failures: GateFailure[];
 }
 
 export async function runValidator(request: RunRequest): Promise<RunOutcome> {
@@ -118,7 +121,8 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
           await writeRunRecord(path.join(dir, "run.json"), record);
         }
       }
-      return { run, dir, record, verdict, lastVerified };
+      const failures = verdict.conclusion === "fail" ? await failureChecks(dir, request.contract) : [];
+      return { run, dir, record, verdict, lastVerified, failures };
     } finally {
       abort.dispose();
     }
@@ -133,6 +137,33 @@ function discardReason(
   if (abort.timedOut) return "timed out";
   if (stop.signal !== null) return `terminated by signal ${stop.signal}`;
   return null;
+}
+
+/**
+ * Best-effort extraction of failed required checks for the gate's continue
+ * message. The verdict itself is already judged by judgeEvidence; this only
+ * recovers per-check `{id, message}` detail, degrading to an empty list when
+ * the result file is unreadable or malformed.
+ */
+async function failureChecks(runDir: string, contract: Contract): Promise<GateFailure[]> {
+  const approved = new Set(contract.approved_failures.map((item) => item.id));
+  const required = new Set([...contract.acceptance, ...contract.regression.filter((id) => !approved.has(id))]);
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path.join(runDir, "result.json"), "utf8"));
+    const checks = (parsed as Pick<ResultReport, "checks">).checks;
+    if (!Array.isArray(checks)) return [];
+    return checks
+      .filter((check) => check !== null && typeof check === "object"
+        && typeof (check as { id?: unknown }).id === "string"
+        && required.has((check as { id: string }).id)
+        && ((check as { status?: unknown }).status === "fail" || (check as { status?: unknown }).status === "skip"))
+      .map((check) => {
+        const shaped = check as { id: string; message?: string };
+        return { id: shaped.id, message: shaped.message ?? "" };
+      });
+  } catch {
+    return [];
+  }
 }
 
 /**
