@@ -277,16 +277,60 @@ test("删除冻结目标后的悬空别名：write 被拦截，冻结目标不�
   await symlink(path.join(repo, "tests", "a.py"), path.join(repo, "alias.py"));
   await rm(path.join(repo, "tests", "a.py"));
   expect(approval.frozen_blobs["tests/a.py"]).toBeDefined();
-  const { fake, ctx } = await startSession(repo);
 
+  // 等价 fs.writeFile 路径的危险性证明：真实写入会沿悬空链接重建冻结目标。
+  await writeFile(path.join(repo, "alias.py"), "recreated\n");
+  expect(existsSync(path.join(repo, "tests", "a.py"))).toBe(true);
+  await rm(path.join(repo, "tests", "a.py"));
+
+  const { fake, ctx } = await startSession(repo);
   const blocked = await fake.call("tool_call", toolCallEvent("write", {
     path: "alias.py", content: "recreated\n",
   }), ctx);
   expect(blocked).toMatchObject({ block: true });
 
-  // 真实写入路径的回归：拦截生效时目标不会被沿链接重建。
+  // 拦截生效：冻结目标保持不存在，悬空链接本身仍在。
   expect(existsSync(path.join(repo, "tests", "a.py"))).toBe(false);
   await expect(lstat(path.join(repo, "alias.py"))).resolves.toBeTruthy();
+});
+
+test("runner 撤销在已持锁上下文执行：仅清除本次 run 的 last_verified", async () => {
+  const { repo } = await setup();
+  const seed = async (run: number) => {
+    await updateState(repo, taskId, "s1", (state) => ({
+      ...state,
+      last_verified: {
+        run, tree: "0".repeat(64), contract_sha256: "0".repeat(64),
+      },
+      evidence_invalid_reason: null,
+    }));
+  };
+  const { acquireLock } = await import("../../src/core/task.ts");
+  const { revokeRunVerification } = await import("../../src/core/runner.ts");
+
+  // 撤销本次 run：在已持锁上下文内执行（修复前 updateState 重入锁会抛 TaskLockError）。
+  await seed(5);
+  const release = await acquireLock(repo, taskId, "outer");
+  try {
+    await revokeRunVerification(repo, taskId, "outer", 5);
+    const state = await readState(repo, taskId);
+    expect(state.last_verified).toBeNull();
+    expect(state.evidence_invalid_reason).toBe("cancelled");
+  } finally {
+    await release();
+  }
+
+  // 不是本次 run 的已验证记录不动。
+  await seed(5);
+  const release2 = await acquireLock(repo, taskId, "outer");
+  try {
+    await revokeRunVerification(repo, taskId, "outer", 6);
+    const state = await readState(repo, taskId);
+    expect(state.last_verified?.run).toBe(5);
+    expect(state.evidence_invalid_reason).toBeNull();
+  } finally {
+    await release2();
+  }
 });
 
 test("edit 冻结文件被 block，新测试文件放行，逃出仓库被 block", async () => {

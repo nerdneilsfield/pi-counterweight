@@ -7,7 +7,7 @@ import { contentSha256, judgeEvidence, type ResultReport, type Verdict } from ".
 import { treeHash } from "./gitstate.js";
 import { isNotFound } from "./paths.js";
 import { assertRunRecord, writeRunRecord, type RunRecord } from "./runrecord.js";
-import { readState, runsDir, updateState, withTaskLock, writeState } from "./task.js";
+import { readState, runsDir, withTaskLock, writeState } from "./task.js";
 import type { Contract, GitValue, LastVerified, ValidatorConfig } from "./types.js";
 import { readFile } from "node:fs/promises";
 
@@ -119,10 +119,9 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
           // The cancel landed between the pre-write check and the atomic
           // rename (or just after it): revoke exactly this run's record. An
           // older verification belonging to another run is left untouched.
-          await updateState(request.repo, request.taskId, request.session, (state) =>
-            state.last_verified !== null && state.last_verified.run === run
-              ? { ...state, last_verified: null, evidence_invalid_reason: "cancelled" }
-              : state);
+          // The task lock is already held by runValidator, so the revocation
+          // must not take it again.
+          await revokeRunVerification(request.repo, request.taskId, request.session, run);
           lastVerified = null;
           verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
           record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
@@ -219,6 +218,24 @@ async function recordVerification(
   };
   await writeState(request.repo, request.taskId, request.session, { ...state, last_verified: verified });
   return verified;
+}
+
+/**
+ * Revoke exactly `run`'s published verification after a late cancel. The
+ * caller already holds the task lock (runValidator's body), so this uses the
+ * plain read/write pair and must never take the lock again. An older
+ * `last_verified` belonging to another run is left untouched.
+ */
+export async function revokeRunVerification(
+  repo: string, taskId: string, session: string, run: number,
+): Promise<void> {
+  const state = await readState(repo, taskId);
+  if (state.last_verified === null || state.last_verified.run !== run) return;
+  await writeState(repo, taskId, session, {
+    ...state,
+    last_verified: null,
+    evidence_invalid_reason: "cancelled",
+  });
 }
 
 async function artifactHashes(
