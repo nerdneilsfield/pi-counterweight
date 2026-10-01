@@ -7,7 +7,7 @@ import { treeHash } from "./gitstate.js";
 import { isNotFound } from "./paths.js";
 import { assertRunRecord, writeRunRecord, type RunRecord } from "./runrecord.js";
 import { readState, runsDir, withTaskLock, writeState } from "./task.js";
-import type { Contract, LastVerified, ValidatorConfig } from "./types.js";
+import type { Contract, GitValue, LastVerified, ValidatorConfig } from "./types.js";
 import { readFile } from "node:fs/promises";
 
 const KILL_GRACE_MS = 5_000;
@@ -72,6 +72,10 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
     try {
       const after = await snapshot(request.repo, request.contract.baseline_inputs);
       const discard = discardReason(abort, stop);
+      const artifacts = discard !== null ? { hashes: {}, error: null } : await artifactHashes(request.repo, dir);
+      const recordError = [before.error, after.error, artifacts.error]
+        .filter((item): item is string => item !== null)
+        .join("; ") || null;
       let record: RunRecord = {
         version: 1,
         run,
@@ -83,12 +87,13 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
         cancelled: abort.cancelled,
         result_discarded: discard !== null,
         runner_error: runnerError,
+        record_error: recordError,
         git: before.git,
         tree_before: before.tree,
         tree_after: after.tree,
         input_hashes_before: before.inputs,
         input_hashes_after: after.inputs,
-        artifact_hashes: discard !== null ? {} : await artifactHashes(request.repo, dir),
+        artifact_hashes: artifacts.hashes,
       };
       await writeRunRecord(path.join(dir, "run.json"), record);
       let verdict: Verdict;
@@ -163,33 +168,62 @@ async function recordVerification(
   return verified;
 }
 
-async function artifactHashes(repo: string, runDir: string): Promise<Record<string, string | null>> {
+async function artifactHashes(
+  repo: string, runDir: string,
+): Promise<{ hashes: Record<string, string | null>; error: string | null }> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(await readFile(path.join(runDir, "result.json"), "utf8"));
   } catch (error) {
-    if (isNotFound(error)) return {};
-    return {};
+    if (!isNotFound(error)) {
+      return { hashes: {}, error: `result.json unreadable while hashing artifacts: ${errorMessage(error)}` };
+    }
+    return { hashes: {}, error: null };
   }
-  if (parsed === null || typeof parsed !== "object" || !Array.isArray((parsed as { artifacts?: unknown }).artifacts)) return {};
+  if (parsed === null || typeof parsed !== "object" || !Array.isArray((parsed as { artifacts?: unknown }).artifacts)) return { hashes: {}, error: null };
   const hashes: Record<string, string | null> = {};
+  let error: string | null = null;
   for (const artifact of (parsed as Pick<ResultReport, "artifacts">).artifacts ?? []) {
     if (artifact === null || typeof artifact !== "object" || typeof (artifact as { path?: unknown }).path !== "string") continue;
     const file = (artifact as { path: string }).path;
-    hashes[file] = await contentSha256(repo, file);
+    try {
+      hashes[file] = await contentSha256(repo, file);
+    } catch (cause) {
+      hashes[file] = null;
+      error = appendError(error, `artifact hash failed ${file}: ${errorMessage(cause)}`);
+    }
   }
-  return hashes;
+  return { hashes, error };
 }
 
-async function snapshot(repo: string, inputs: string[]): Promise<{
-  git: boolean;
-  tree: string | null;
-  inputs: Record<string, string | null>;
-}> {
-  const tree = await treeHash(repo);
+async function snapshot(
+  repo: string, inputs: string[],
+): Promise<{ git: boolean; tree: string | null; inputs: Record<string, string | null>; error: string | null }> {
+  let error: string | null = null;
+  let tree: GitValue<string> = { supported: false };
+  try {
+    tree = await treeHash(repo);
+  } catch (cause) {
+    error = appendError(error, `tree hash failed: ${errorMessage(cause)}`);
+  }
   const hashes: Record<string, string | null> = {};
-  for (const input of inputs) hashes[input] = await contentSha256(repo, input);
-  return { git: tree.supported, tree: tree.supported ? tree.value : null, inputs: hashes };
+  for (const input of inputs) {
+    try {
+      hashes[input] = await contentSha256(repo, input);
+    } catch (cause) {
+      hashes[input] = null;
+      error = appendError(error, `input hash failed ${input}: ${errorMessage(cause)}`);
+    }
+  }
+  return { git: tree.supported, tree: tree.supported ? tree.value : null, inputs: hashes, error };
+}
+
+function appendError(current: string | null, message: string): string {
+  return current === null ? message : `${current}; ${message}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "unreadable";
 }
 
 function requiredIds(contract: Contract): string {

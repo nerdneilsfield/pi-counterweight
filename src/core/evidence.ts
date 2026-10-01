@@ -94,6 +94,7 @@ export async function judgeRecord(
   if (record.timed_out) return undetermined("timed out");
   if (record.term_signal !== null) return undetermined(`terminated by signal ${record.term_signal}`);
   if (record.runner_error !== null) return undetermined(record.runner_error);
+  if (record.record_error !== null) return undetermined(record.record_error);
   if (resultText === null) return undetermined("result.json missing");
 
   let parsed: unknown;

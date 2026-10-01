@@ -19,6 +19,7 @@ export const runRecordSchema = Type.Object({
   cancelled: Type.Boolean(),
   result_discarded: Type.Boolean(),
   runner_error: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
+  record_error: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
   git: Type.Boolean(),
   tree_before: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
   tree_after: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
@@ -38,6 +39,7 @@ export interface RunRecord {
   cancelled: boolean;
   result_discarded: boolean;
   runner_error: string | null;
+  record_error: string | null;
   git: boolean;
   tree_before: string | null;
   tree_after: string | null;

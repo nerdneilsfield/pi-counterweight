@@ -246,6 +246,45 @@ test("验收输入哈希不符则无法判定", async () => {
   expect((await readState(root, taskId)).last_verified).toBeNull();
 });
 
+test("快照与产物哈希 IO 错误记入 run.json 并判无法判定", async () => {
+  const root = await gitRepo();
+  const { contract, hashes } = await prepared(root);
+  const io = await runValidator({
+    repo: root, taskId, session: "s", contract, approvedInputHashes: hashes,
+    // 验证器把验收输入换成自指 symlink：after 快照哈希 ELOOP，不再裸抛。
+    validator: validator(root, 30, "loopinput", report(passChecks)),
+  });
+  expect(io.verdict.conclusion).toBe("undetermined");
+  expect(io.verdict.reasons[0]).toContain("input hash failed tests/a.py");
+  expect(io.record.record_error).toContain("input hash failed tests/a.py");
+  expect(io.record.input_hashes_after["tests/a.py"]).toBeNull();
+  expect((await readState(root, taskId)).last_verified).toBeNull();
+
+  await mkdir(path.join(root, "build"));
+  await symlink("loop.bin", path.join(root, "build", "loop.bin"));
+  const proof = {
+    protocol: 1, run_id: "2", complete: true,
+    checks: [{ id: "keep", status: "pass" }, { id: "reg", status: "pass" }],
+    artifacts: [{ kind: "build", path: "build/loop.bin", sha256: "a".repeat(64), loaded_by: ["keep"] }],
+    build: { required: true, fresh: true, load_verified: true },
+    summary: "built", logs: [],
+  };
+  const artifact = await runValidator({
+    repo: root, taskId, session: "s", contract, approvedInputHashes: hashes,
+    validator: validator(root, 30, "body", JSON.stringify(proof)),
+  });
+  expect(artifact.verdict.conclusion).toBe("undetermined");
+  expect(artifact.verdict.reasons[0]).toContain("artifact hash failed build/loop.bin");
+  expect(artifact.record.record_error).toContain("artifact hash failed build/loop.bin");
+  expect(artifact.record.artifact_hashes["build/loop.bin"]).toBeNull();
+
+  for (const outcome of [io, artifact]) {
+    const record = JSON.parse(await readFile(path.join(outcome.dir, "run.json"), "utf8"));
+    expect(record.record_error).not.toBeNull();
+    expect(record.exit_code).toBe(0);
+  }
+});
+
 test("取消覆盖发布全程：判定阶段取消不写已验证", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);

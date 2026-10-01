@@ -23,5 +23,10 @@ case "$mode" in
     printf "%s\n" "$2" > "$out"
     : > "$CW_RESULT_DIR/marker"
     ;;
+  loopinput)
+    rm tests/a.py
+    ln -s a.py tests/a.py
+    printf "%s\n" "$2" > "$out"
+    ;;
   *) printf "%s\n" "$2" > "$out"; exit "${3:-0}" ;;
 esac
