@@ -139,17 +139,21 @@ export async function allocateRun(repo: string, taskId: string, session: string)
  * results can never land outside the task directory.
  */
 export async function runsDir(repo: string, taskId: string): Promise<string> {
-  const dir = await existingTaskDir(repo, taskId);
-  const runs = path.join(dir, "runs");
+  return taskSubdir(repo, taskId, "runs");
+}
+
+/** A harness-owned subdirectory of the authoritative task directory. */
+export async function taskSubdir(repo: string, taskId: string, name: string): Promise<string> {
+  const dir = path.join(await existingTaskDir(repo, taskId), name);
   try {
-    await mkdir(runs);
+    await mkdir(dir);
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
   }
-  const stat = await lstat(runs);
-  if (stat.isSymbolicLink()) throw new Error("runs must not be a symlink");
-  if (!stat.isDirectory()) throw new Error("runs must be a directory");
-  return runs;
+  const stat = await lstat(dir);
+  if (stat.isSymbolicLink()) throw new Error(`${name} must not be a symlink`);
+  if (!stat.isDirectory()) throw new Error(`${name} must be a directory`);
+  return dir;
 }
 
 export async function withTaskLock<T>(

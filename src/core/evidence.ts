@@ -4,7 +4,7 @@ import path from "node:path";
 import { Type } from "typebox";
 import { isNotFound, pathInside, relativeParts } from "./paths.js";
 import { rejectUnknown, ValidationError } from "./schema.js";
-import { updateState } from "./task.js";
+import { readState, runsDir, updateState } from "./task.js";
 import type { Contract } from "./types.js";
 import { assertRunRecord, type RunRecord } from "./runrecord.js";
 
@@ -143,7 +143,9 @@ export async function judgeRecord(
 export async function recheckArtifacts(repo: string, taskId: string, session: string): Promise<string | null> {
   return updateState(repo, taskId, session, async (state) => {
     if (state.last_verified === null) return state;
-    const runDir = path.join(repo, ".cw", "tasks", taskId, "runs", String(state.last_verified.run));
+    // runsDir re-applies the authority walk and rejects symlinked run roots,
+    // so a swapped `runs` entry cannot redirect recheck outside the task dir.
+    const runDir = path.join(await runsDir(repo, taskId), String(state.last_verified.run));
     let record: RunRecord;
     try {
       record = assertRunRecord(JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")));

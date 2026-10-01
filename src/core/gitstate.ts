@@ -65,6 +65,46 @@ export async function blobHash(repo: string, file: string): Promise<GitValue<str
   return { supported: true, value: result.stdout.trim() };
 }
 
+/**
+ * Batch `git hash-object`. Output order matches `files` order; callers must
+ * pre-filter missing paths (hash-object fails the whole batch on one miss).
+ * One spawn keeps the freeze check inside its per-call time budget.
+ */
+export async function blobHashes(repo: string, files: string[]): Promise<string[]> {
+  if (files.length === 0) return [];
+  const result = await git(repo, ["hash-object", "--", ...files]);
+  if (result.code !== 0) throw new Error(result.stderr || "git hash-object failed");
+  return result.stdout.split("\n").filter((line) => line !== "");
+}
+
+/** Object content as bytes; null when the object is absent from the database. */
+export async function blobContent(repo: string, sha: string): Promise<Buffer | null> {
+  if (!/^[0-9a-f]{40}$/.test(sha) && !/^[0-9a-f]{64}$/.test(sha)) return null;
+  return new Promise<Buffer | null>((resolve, reject) => {
+    const child = spawn("git", ["cat-file", "blob", sha], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_COUNT: "0" },
+    });
+    const chunks: Buffer[] = [];
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { chunks.push(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) { resolve(Buffer.concat(chunks)); return; }
+      if (/Not a valid object name|Invalid object name|bad file/.test(stderr)) { resolve(null); return; }
+      reject(new Error(stderr || "git cat-file failed"));
+    });
+  });
+}
+
+/** Unified diff of two existing files. Exit 1 means "differs" and is not an error. */
+export async function diffFiles(repo: string, expected: string, actual: string): Promise<string> {
+  const result = await git(repo, ["diff", "--no-index", "--", expected, actual]);
+  if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || "git diff --no-index failed");
+  return result.stdout;
+}
+
 function git(repo: string, args: string[], index?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {
