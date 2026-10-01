@@ -88,11 +88,21 @@ export function pathInside(root: string, candidate: string): boolean {
  */
 export async function resolveInRepo(root: string, value: string): Promise<string> {
   forbid(relativeParts(value), false, value);
-  const target = await realpath(path.join(root, value));
-  if (!pathInside(root, target)) throw new Error(`path: symlink escapes repository ${value}`);
-  const resolved = path.relative(root, target).split(path.sep).join("/");
+  const resolved = await resolveSymlinkInRepo(root, value);
   forbid(relativeParts(resolved), false, value);
   return resolved;
+}
+
+/**
+ * Real-path resolution of an existing repo-relative target without the `.cw`
+ * lexical forbid (`resolveInRepo`), so protected-task paths can be resolved
+ * through symlinks too. ENOENT propagates for missing targets and dangling
+ * symlinks; escapes throw.
+ */
+export async function resolveSymlinkInRepo(root: string, value: string): Promise<string> {
+  const target = await realpath(path.join(root, value));
+  if (!pathInside(root, target)) throw new Error(`path: symlink escapes repository ${value}`);
+  return path.relative(root, target).split(path.sep).join("/");
 }
 
 function forbid(parts: string[], allowCwScript: boolean, value: string): void {

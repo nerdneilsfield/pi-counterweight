@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -94,6 +94,7 @@ interface Setup {
   writeApproval: (changes?: Partial<Approval>) => Promise<void>;
   validator: (mode: string, payload?: string, code?: string, timeout_s?: number) => ValidatorConfig;
   seedVerified: () => Promise<void>;
+  seedRunRecord: () => Promise<void>;
 }
 
 const projectToml = `version = 1
@@ -156,6 +157,20 @@ frozen = [${frozen.map((item) => `"${item}"`).join(", ")}]
   };
   await writeApproval();
   await updateState(repo, taskId, "s1", (state) => ({ ...state, status: "approved", sessions: ["s1"] }));
+  const seedRunRecord = async (): Promise<void> => {
+    const tree = await treeHash(repo);
+    const record = {
+      version: 1 as const, run: 1,
+      started_at: new Date().toISOString(), ended_at: new Date().toISOString(),
+      exit_code: 0, term_signal: null, timed_out: false, cancelled: false,
+      result_discarded: false, runner_error: null, record_error: null,
+      git: true, tree_before: tree.value!, tree_after: tree.value!,
+      input_hashes_before: {}, input_hashes_after: {}, artifact_hashes: {},
+    };
+    const runDir = path.join(repo, ".cw", "tasks", taskId, "runs", "1");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "run.json"), `${JSON.stringify(record)}\n`);
+  };
   return {
     repo,
     contract,
@@ -166,6 +181,7 @@ frozen = [${frozen.map((item) => `"${item}"`).join(", ")}]
       timeout_s,
       env: {},
     }),
+    seedRunRecord,
     seedVerified: async () => {
       const tree = await treeHash(repo);
       await updateState(repo, taskId, "s1", (state) => ({
@@ -210,6 +226,48 @@ test("工具按声明顺序注册且全部 sequential", async () => {
   expect(fake.tools.map((tool) => tool.name)).toEqual(["report_blocked", "propose_contract_change"]);
   expect(fake.tools.every((tool) => tool.executionMode === "sequential")).toBe(true);
   expect(fake.commands.has("cw-version")).toBe(true);
+});
+
+test("符号链接别名指向冻结文件被 block，悬空别名与新文件放行，逃逸被 block", async () => {
+  const { repo } = await setup();
+  await symlink(path.join(repo, "tests", "a.py"), path.join(repo, "alias.py"));
+  await symlink(path.join(repo, "tests", "fresh.py"), path.join(repo, "dangling.py"));
+  // 逃逸目标必须真实存在，否则属于悬空别名（保持放行语义）。
+  await writeFile(path.join(repo, "..", "outside.txt"), "outside\n");
+  await symlink(path.join(repo, "..", "outside.txt"), path.join(repo, "escape.py"));
+  const { fake, ctx } = await startSession(repo);
+
+  const alias = await fake.call("tool_call", toolCallEvent("edit", {
+    path: "alias.py", edits: [],
+  }), ctx);
+  expect(alias).toMatchObject({ block: true });
+  expect(alias.reason).toContain("tests/a.py");
+
+  const exact = await fake.call("tool_call", toolCallEvent("write", {
+    path: "tests/a.py", content: "x",
+  }), ctx);
+  expect(exact).toMatchObject({ block: true });
+
+  const dangling = await fake.call("tool_call", toolCallEvent("write", {
+    path: "dangling.py", content: "x",
+  }), ctx);
+  expect(dangling ?? null).toBeNull();
+
+  const fresh = await fake.call("tool_call", toolCallEvent("write", {
+    path: "tests/brand-new.py", content: "x",
+  }), ctx);
+  expect(fresh ?? null).toBeNull();
+
+  const escape = await fake.call("tool_call", toolCallEvent("write", {
+    path: "escape.py", content: "x",
+  }), ctx);
+  expect(escape).toMatchObject({ block: true });
+
+  // notes.md 仍可写（受保护集合的显式例外），且其自身路径解析不受 .cw 禁区影响。
+  const notes = await fake.call("tool_call", toolCallEvent("edit", {
+    path: `.cw/tasks/${taskId}/notes.md`, edits: [],
+  }), ctx);
+  expect(notes ?? null).toBeNull();
 });
 
 test("edit 冻结文件被 block，新测试文件放行，逃出仓库被 block", async () => {
@@ -269,6 +327,35 @@ test("bash 修改冻结文件：tool_result 记录冲突、追加一行事实、
   const state = await readState(repo, taskId);
   expect(state.last_verified).toBeNull();
   expect(state.conflicts).toHaveLength(1);
+
+  // 同一持续冲突再次出现：不追加新事实、不重复记录、不写新差异。
+  const repeat = await fake.call("tool_result", {
+    type: "tool_result", toolCallId: "t3", toolName: "bash",
+    input: { command: "cat tests/a.py" },
+    content: [{ type: "text", text: "listed" }],
+    isError: false,
+  }, ctx);
+  expect(repeat ?? null).toBeNull();
+  const stateAfterRepeat = await readState(repo, taskId);
+  expect(stateAfterRepeat.conflicts).toHaveLength(1);
+  expect((await readdir(path.join(repo, ".cw", "tasks", taskId, "conflicts"))).filter((name) =>
+    name.endsWith(".diff"))).toHaveLength(1);
+
+  // 新 actual 是新冲突：必须再次记录，不能被去重吞掉。
+  await writeFile(path.join(repo, "tests", "a.py"), "tampered-more\n");
+  const again = await fake.call("tool_result", {
+    type: "tool_result", toolCallId: "t4", toolName: "bash",
+    input: { command: "echo y >> tests/a.py" },
+    content: [{ type: "text", text: "done" }],
+    isError: false,
+  }, ctx);
+  const againContent = again.content as Array<{ type: string; text: string }>;
+  expect(againContent).toHaveLength(2);
+  expect(againContent[1]!.text).toContain("冻结文件冲突");
+  const stateAfterNew = await readState(repo, taskId);
+  expect(stateAfterNew.conflicts).toHaveLength(2);
+  expect((await readdir(path.join(repo, ".cw", "tasks", taskId, "conflicts"))).filter((name) =>
+    name.endsWith(".diff"))).toHaveLength(2);
 });
 
 test("无冻结声明时 tool_result 不追加内容", async () => {
@@ -537,6 +624,34 @@ test("契约文件与批准版本漂移：门禁交还且不验证", async () =>
   expect(await readFile(path.join(repo, "tracked.txt"), "utf8")).toBe("base\n");
 });
 
+test("session_start 后外部改契约：门禁按真实文件判漂移，不使用缓存，证据失效", async () => {
+  const { repo, validator, writeApproval, seedVerified, seedRunRecord, contract } = await setup();
+  await writeApproval({ validator: validator("touch") });
+  await seedRunRecord();
+  await seedVerified();
+  const { fake, ctx } = await startSession(repo);
+
+  // 会话接管之后（契约已入缓存）外部修改权威 contract.toml。
+  const contractFile = path.join(repo, ".cw", "tasks", taskId, "contract.toml");
+  await writeFile(contractFile, (await readFile(contractFile, "utf8")).replace(
+    'goal = "fix lifetime issue"', 'goal = "externally drifted"'));
+  expect(contractSha256(contract)).not.toBe(
+    contractSha256(await readContract(contractFile, repo)));
+
+  const result = await fake.call("agent_before_settle", settleEvent(), ctx);
+  const entry = (result as { entries?: Array<{ content: string }> }).entries?.at(-1);
+  expect(entry?.content).toContain("任务交还");
+
+  const state = await readState(repo, taskId);
+  expect(state.status).toBe("handed_back");
+  expect(state.last_verified).toBeNull();
+  expect(state.evidence_invalid_reason).toContain("contract");
+  expect(await readFile(path.join(repo, "tracked.txt"), "utf8")).toBe("base\n");
+  const material = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "handback.json"), "utf8"));
+  expect(material.questions.join("\n")).toContain("契约文件与批准版本不一致");
+});
+
 test("无活动任务时适配层保持被动", async () => {
   const { repo } = await setup();
   await rm(path.join(repo, ".cw", "tasks", taskId), { recursive: true, force: true });
@@ -547,6 +662,42 @@ test("无活动任务时适配层保持被动", async () => {
   }), ctx)) ?? null).toBeNull();
   expect((await fake.call("agent_before_settle", settleEvent(), ctx)) ?? null).toBeNull();
 });
+
+test("session_shutdown 等待验证进程组清理完成后再释放，不发布验证结果", async () => {
+  const { repo, validator, writeApproval } = await setup();
+  await writeApproval({ validator: validator("hang", "-", "0", 600) });
+  const { fake, ctx } = await startSession(repo);
+
+  const settling = fake.call("agent_before_settle", settleEvent(), ctx);
+  const runs = path.join(repo, ".cw", "tasks", taskId, "runs");
+  let pid: number | undefined;
+  for (let attempt = 0; attempt < 100 && pid === undefined; attempt++) {
+    await delay(100);
+    try {
+      const names = await readdir(runs);
+      const runDir = names.sort().at(-1);
+      if (runDir !== undefined) {
+        const text = await readFile(path.join(runs, runDir, "child.pid"), "utf8").catch(() => null);
+        if (text !== null) pid = Number(text.trim());
+      }
+    } catch {
+      // runs 目录尚未创建
+    }
+  }
+  expect(pid).toBeGreaterThan(0);
+
+  await fake.call("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+  // shutdown 返回时进程组必须已经清理完毕。
+  expect(() => process.kill(pid!, 0)).toThrow();
+
+  const result = await settling;
+  expect(result ?? null).toBeNull();
+  const state = await readState(repo, taskId);
+  expect(state.status).toBe("running");
+  expect(state.last_verified).toBeNull();
+  // 幂等：再次 shutdown 无验证在途，直接返回。
+  await fake.call("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+}, 20_000);
 
 test("session_shutdown 幂等且无验证运行时直接返回", async () => {
   const { repo } = await setup();

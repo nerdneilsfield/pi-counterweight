@@ -137,7 +137,7 @@ test("新增测试文件与 notes.md 不冲突，状态不动", async () => {
   const before = await readState(root, taskId);
 
   const outcome = await checkFrozen(root, taskId, "s", blobs);
-  expect(outcome).toEqual({ git: true, conflicts: [], diffs: [] });
+  expect(outcome).toEqual({ git: true, conflicts: [], newConflicts: [], diffs: [] });
   expect(await readState(root, taskId)).toEqual(before);
 
   // notes.md 不在树哈希内：改动不触发证据失效。
@@ -207,14 +207,21 @@ test("symlink 保护：逃逸、悬空、仓内别名", async () => {
   await symlink("nowhere", link);
   const dangling = await checkFrozen(root, taskId, "s", blobs);
   expect(dangling.conflicts[0]!.actual).toBeNull();
-  expect(dangling.diffs).toEqual([`.cw/tasks/${taskId}/conflicts/2.diff`]);
+  // M5 去重：与逃逸冲突相同的 path+expected+actual 不再重复记录。
+  expect(dangling.diffs).toEqual([]);
+  expect(dangling.newConflicts).toEqual([]);
 
   await rm(link);
   await writeFile(path.join(root, "tests", "other.py"), "other\n");
   await symlink("other.py", link);
   const alias = await checkFrozen(root, taskId, "s", blobs);
   expect(alias.conflicts[0]!.actual).toBe((await blobHash(root, "tests/other.py")).value);
-  expect(alias.diffs).toEqual([`.cw/tasks/${taskId}/conflicts/3.diff`]);
+  // 新 actual 是新冲突，编号延续且不覆盖前次差异。
+  expect(alias.diffs).toEqual([`.cw/tasks/${taskId}/conflicts/2.diff`]);
+  const danglingReadback = await readFile(
+    path.join(root, ".cw", "tasks", taskId, "conflicts", "1.diff"), "utf8",
+  );
+  expect(danglingReadback).toContain("symlink escapes repository");
 });
 
 test("非 Git 仓库：不校验、不绑定、不改状态", async () => {
@@ -229,7 +236,7 @@ test("非 Git 仓库：不校验、不绑定、不改状态", async () => {
   const before = await readState(plain, taskId);
 
   const outcome = await checkFrozen(plain, taskId, "s", { "tests/a.py": "0".repeat(40) });
-  expect(outcome).toEqual({ git: false, conflicts: [], diffs: [] });
+  expect(outcome).toEqual({ git: false, conflicts: [], newConflicts: [], diffs: [] });
   expect(await readState(plain, taskId)).toEqual(before);
   expect(await recheckTree(plain, taskId, "s")).toBeNull();
   expect(await readState(plain, taskId)).toEqual(before);

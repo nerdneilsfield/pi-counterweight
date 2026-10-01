@@ -13,6 +13,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
+import { realpath } from "node:fs/promises";
 import { contractSha256, readContract } from "../../core/contract.js";
 import { recheckArtifacts } from "../../core/evidence.js";
 import { isProtectedPath, checkFrozen, recheckContract, recheckTree } from "../../core/freeze.js";
@@ -20,6 +21,7 @@ import { decide, type GateInput } from "../../core/gate.js";
 import { writeHandback } from "../../core/handback.js";
 import { recordUsage } from "../../core/meter.js";
 import { readProjectConfig } from "../../core/config.js";
+import { isNotFound, resolveSymlinkInRepo } from "../../core/paths.js";
 import { runValidator, type RunOutcome } from "../../core/runner.js";
 import {
   clearBlocked,
@@ -38,11 +40,13 @@ import { registerTools } from "./tools.js";
  * A task this session manages, with everything the event handlers need. All
  * judgment (gate order, evidence verdicts, freeze conflicts) stays in core;
  * this adapter only translates Pi events into core calls and core results
- * into Pi returns.
+ * into Pi returns. `contract` is the session-start snapshot used only for
+ * cheap checks; the gate re-reads the authoritative contract.toml every time.
  */
 export interface ActiveTask {
   taskId: string;
-  repo: string;
+  /** Realpath of the repository root, resolved once at session start. */
+  root: string;
   session: string;
   contract: Contract;
   approval: Approval;
@@ -118,16 +122,20 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
   // ---- session_start: locate the task, restore checks, never rebuild baseline ----
   pi.on("session_start", (event: SessionStartEvent, ctx: ExtensionContext) =>
-    withTimeout(limits.sessionStartMs, async () => {
+    withTimeout(limits.sessionStartMs, async (signal) => {
       void event;
+      if (signal.aborted) return undefined;
       task = await locateTask(ctx);
       if (task !== null) {
         // Restoring a session with verified evidence re-verifies it: tree,
         // recorded artifact hashes, and contract version. Any drift
         // invalidates the evidence in state.json; the baseline is untouched.
-        await recheckTree(task.repo, task.taskId, task.session);
-        await recheckArtifacts(task.repo, task.taskId, task.session);
-        await recheckContract(task.repo, task.taskId, task.session, task.contract);
+        // These writes only invalidate evidence, so they are never cancelled
+        // mid-way: core state functions take no signal and finishing them is
+        // the fail-safe direction.
+        await recheckTree(task.root, task.taskId, task.session);
+        await recheckArtifacts(task.root, task.taskId, task.session);
+        await recheckContract(task.root, task.taskId, task.session, task.contract);
         ctx.ui.notify(`Counterweight: 已接管任务 ${task.taskId}`, "info");
       }
       return undefined;
@@ -139,26 +147,12 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
   // ---- tool_call: block direct writes to protected paths ----
   pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) =>
-    withTimeout(limits.toolCallMs, async () => {
+    withTimeout(limits.toolCallMs, async (signal) => {
       const active = task;
-      if (active === null) return undefined;
+      if (active === null || signal.aborted) return undefined;
       const raw = writeToolPath(event);
       if (raw === null) return undefined;
-      const relative = toRepoRelative(active.repo, raw);
-      if (relative === null) {
-        return {
-          block: true,
-          reason: `[counterweight] 路径不在仓库内，无法核对受保护集合，已拒绝：${raw}`,
-        };
-      }
-      if (isProtectedPath(relative, active.contract, active.taskId)) {
-        return {
-          block: true,
-          reason: `[counterweight] ${relative} 是受保护路径（契约或任务文件）。`
-            + "如需变更请调用 propose_contract_change；不得直接写入。",
-        };
-      }
-      return undefined;
+      return checkProtectedTarget(active, raw);
     }, () => {
       notifyError(ctx, "Counterweight: 写入保护检查未能在时限内完成，本次调用被拒绝");
       return { block: true, reason: "[counterweight] 保护检查超时或失败，写入被拒绝" };
@@ -166,13 +160,16 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
   // ---- tool_result: freeze check, one factual line appended, no extra message ----
   pi.on("tool_result", (event: ToolResultEvent, ctx: ExtensionContext) =>
-    withTimeout(limits.toolResultMs, async () => {
+    withTimeout(limits.toolResultMs, async (signal) => {
       const active = task;
-      if (active === null || Object.keys(active.approval.frozen_blobs).length === 0) return undefined;
-      const outcome = await checkFrozen(active.repo, active.taskId, active.session, active.approval.frozen_blobs);
-      if (outcome.conflicts.length === 0) return undefined;
-      const line = `[counterweight] 冻结文件冲突 ${outcome.conflicts.length} 处`
-        + `（${outcome.conflicts.map((conflict) => conflict.path).join(", ")}）；`
+      if (active === null || signal.aborted) return undefined;
+      if (Object.keys(active.approval.frozen_blobs).length === 0) return undefined;
+      const outcome = await checkFrozen(active.root, active.taskId, active.session, active.approval.frozen_blobs);
+      if (outcome.newConflicts.length === 0) return undefined;
+      // Only new conflicts (path + expected + actual not already recorded)
+      // get a line; a standing conflict is not re-reported on every result.
+      const line = `[counterweight] 冻结文件冲突 ${outcome.newConflicts.length} 处`
+        + `（${outcome.newConflicts.map((conflict) => conflict.path).join(", ")}）；`
         + `证据已失效，差异记录：${outcome.diffs.join(", ") || "无"}`;
       const content = [...event.content, { type: "text" as const, text: line }];
       return event.structuredContent !== undefined
@@ -200,7 +197,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     const active = task;
     if (active === null) return undefined;
     if (event.outcome !== "completed") return undefined;
-    const { repo, taskId } = active;
+    const { root: repo, taskId } = active;
     const session = ctx.sessionManager.getSessionId();
 
     const controller = new AbortController();
@@ -219,6 +216,11 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
     let outcome: RunOutcome | null = null;
     try {
+      // The authoritative contract.toml is re-read for every settle: an
+      // external modification after session_start must not be judged against
+      // the stale snapshot.
+      const contract = await readContract(
+        path.join(active.root, ".cw", "tasks", taskId, "contract.toml"), active.root);
       let state = await readState(repo, taskId);
       if (state.status !== "approved" && state.status !== "running") return undefined;
       if (state.status === "approved") {
@@ -229,19 +231,22 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
       const blocked = await readBlocked(repo, taskId);
       const proposal = await findUnresolvedProposal(repo, taskId);
-      const contractDrift = contractSha256(active.contract) !== active.approval.contract_sha256
+      const contractDrift = contractSha256(contract) !== active.approval.contract_sha256
         ? `契约文件与批准版本不一致（.cw/tasks/${taskId}/contract.toml）`
         : null;
+      // A contract that drifted from the verified version invalidates the
+      // recorded evidence before anything else reads it.
+      await recheckContract(repo, taskId, session, contract);
       const blockedReport = blocked?.reason
         ?? contractDrift
         ?? (proposal === null ? null : unresolvedProposalReason(taskId, proposal.n, proposal.field));
 
-      const tokensBudget = active.contract.budget?.tokens ?? active.project.budget.tokens;
-      const wallMinutes = active.contract.budget?.wall_minutes ?? active.project.budget.wall_minutes;
-      const repairs = active.contract.budget?.repairs ?? active.project.budget.repairs;
+      const tokensBudget = contract.budget?.tokens ?? active.project.budget.tokens;
+      const wallMinutes = contract.budget?.wall_minutes ?? active.project.budget.wall_minutes;
+      const repairs = contract.budget?.repairs ?? active.project.budget.repairs;
       const base: GateInput = {
         state,
-        deliverable: active.contract.deliverable,
+        deliverable: contract.deliverable,
         cancelled: controller.signal.aborted,
         blockedReport,
         budget: {
@@ -260,7 +265,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
           repo,
           taskId,
           session,
-          contract: active.contract,
+          contract,
           validator: active.approval.validator,
           approvedInputHashes: active.approval.baseline_inputs_sha256,
           signal: controller.signal,
@@ -293,7 +298,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         }
         case "finish": {
           const material = await writeHandback(repo, taskId, session, {
-            contract: active.contract,
+            contract,
             validator: active.approval.validator,
             reason: "finish",
             questions: [],
@@ -315,7 +320,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
           if (contractDrift !== null) questions.push(contractDrift);
           if (proposal !== null && blockedReport !== null) questions.push(blockedReport);
           const material = await writeHandback(repo, taskId, session, {
-            contract: active.contract,
+            contract,
             validator: active.approval.validator,
             reason: decision.reason,
             questions,
@@ -347,24 +352,31 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     const active = task;
     const current = validation;
     if (current !== null) {
+      // Handback material is only written after the validator process group
+      // and its cleanup have fully settled — no late result may race the
+      // undetermined decision.
       current.controller.abort();
-      await Promise.race([current.done, delay(limits.shutdownWaitMs)]);
+      await current.done;
+      if (validation !== null && validation.controller === current.controller) validation = null;
     }
     if (active === null || event.outcome !== "completed") return undefined;
     try {
-      const state = await readState(active.repo, active.taskId);
+      const state = await readState(active.root, active.taskId);
       if (state.status !== "running" && state.status !== "approved") return undefined;
-      const material = await writeHandback(active.repo, active.taskId, active.session, {
-        contract: active.contract,
+      // Re-read the authoritative contract; the session snapshot may be stale.
+      const contract = await readContract(
+        path.join(active.root, ".cw", "tasks", active.taskId, "contract.toml"), active.root);
+      const material = await writeHandback(active.root, active.taskId, active.session, {
+        contract,
         validator: active.approval.validator,
         reason: "undetermined",
         questions: ["门禁处理超时或失败，本轮验证结论按无法判定处理"],
         autoVerified: false,
       });
-      await updateState(active.repo, active.taskId, active.session, (current) =>
-        current.status === "running" || current.status === "approved"
-          ? { ...current, status: "handed_back" }
-          : current);
+      await updateState(active.root, active.taskId, active.session, (current2) =>
+        current2.status === "running" || current2.status === "approved"
+          ? { ...current2, status: "handed_back" }
+          : current2);
       return {
         entries: [...event.entries, {
           type: "custom_message" as const,
@@ -382,14 +394,17 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
   // ---- message_end: hand assistant usage to the meter ----
   pi.on("message_end", (event: MessageEndEvent, ctx: ExtensionContext) =>
-    withTimeout(limits.messageEndMs, async () => {
+    withTimeout(limits.messageEndMs, async (signal) => {
       const active = task;
       const message = event.message;
-      if (active === null || message.role !== "assistant") return undefined;
+      if (active === null || signal.aborted || message.role !== "assistant") return undefined;
       const usage = message.usage;
       if (usage === undefined) return undefined;
       const session = ctx.sessionManager.getSessionId();
-      await recordUsage(active.repo, active.taskId, {
+      // A timeout must not leave the usage account half-applied: each write
+      // is only started while the handler is still inside its time budget.
+      if (signal.aborted) return undefined;
+      await recordUsage(active.root, active.taskId, {
         time: new Date().toISOString(),
         session,
         model: message.model,
@@ -399,10 +414,11 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         cache_write: usage.cacheWrite,
         cost_total: usage.cost?.total ?? null,
       });
+      if (signal.aborted) return undefined;
       const total = usage.totalTokens > 0
         ? usage.totalTokens
         : usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-      await updateState(active.repo, active.taskId, session, (current) => ({
+      await updateState(active.root, active.taskId, session, (current) => ({
         ...current,
         tokens_used: current.tokens_used + total,
       }));
@@ -414,10 +430,14 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     withTimeout(limits.shutdownWaitMs * 2, async () => {
       const current = validation;
       if (current !== null) {
+        // Wait for the validator process group and all associated cleanup to
+        // finish before releasing the reference; the reference is never
+        // dropped while work is still running. Cleanup is bounded: the abort
+        // sends SIGTERM to the group, SIGKILL follows after a 5s grace.
         current.controller.abort();
-        await Promise.race([current.done, delay(limits.shutdownWaitMs)]);
+        await current.done;
+        validation = null;
       }
-      validation = null;
       return undefined;
     }, () => undefined));
 
@@ -440,15 +460,74 @@ async function locateTask(ctx: ExtensionContext): Promise<ActiveTask | null> {
     ctx.ui.notify(`Counterweight: 发现多个活动任务 ${matches.join(", ")}，接管最新的 ${matches.at(-1)}`, "warning");
   }
   const taskId = matches.at(-1)!;
-  const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo);
-  const approval = await readApproval(repo, taskId);
-  const project = await readProjectConfig(path.join(repo, ".cw", "project.toml"));
-  return { taskId, repo, session, contract, approval, project };
+  const root = await realpath(repo);
+  const contract = await readContract(path.join(root, ".cw", "tasks", taskId, "contract.toml"), root);
+  const approval = await readApproval(root, taskId);
+  const project = await readProjectConfig(path.join(root, ".cw", "project.toml"));
+  return { taskId, root, session, contract, approval, project };
 }
 
 function unresolvedProposalReason(taskId: string, n: number, field: string): string {
   return `存在未落定的契约变更提议 .cw/tasks/${taskId}/proposals/${n}.json（字段 ${field}），`
     + "需要生成新契约版本并重跑先红检查后才能继续";
+}
+
+const PROTECTED_REASON = (relative: string) => `[counterweight] ${relative} 是受保护路径（契约或任务文件）。`
+  + "如需变更请调用 propose_contract_change；不得直接写入。";
+
+const UNVERIFIABLE_REASON = (value: string) =>
+  `[counterweight] 路径无法核对受保护集合（符号链接逃逸仓库或不可解析），已拒绝：${value}`;
+
+/**
+ * Whether a write tool may touch `raw`. Checks the lexical path and, for
+ * existing targets, the fully resolved real path — an alias pointing at a
+ * frozen file is blocked even though its lexical name is not protected.
+ * Dangling aliases are judged by their eventual parent directory plus final
+ * segment, so a safe new file stays writable.
+ */
+async function checkProtectedTarget(
+  active: ActiveTask, raw: string,
+): Promise<ToolCallEventResult | undefined> {
+  const lexical = toRepoRelative(active.root, raw);
+  if (lexical === null) {
+    return {
+      block: true,
+      reason: `[counterweight] 路径不在仓库内，无法核对受保护集合，已拒绝：${raw}`,
+    };
+  }
+  if (isProtectedPath(lexical, active.contract, active.taskId)) {
+    return { block: true, reason: PROTECTED_REASON(lexical) };
+  }
+  const candidates: string[] = [];
+  try {
+    candidates.push(await resolveSymlinkInRepo(active.root, lexical));
+  } catch (error) {
+    if (isNotFound(error)) {
+      // Missing target or dangling alias: judge the eventual location —
+      // the resolved parent directory plus the final segment.
+      const dir = path.posix.dirname(lexical);
+      if (dir !== ".") {
+        try {
+          const resolvedDir = await resolveSymlinkInRepo(active.root, dir);
+          const viaParent = resolvedDir === "" ? path.posix.basename(lexical)
+            : `${resolvedDir}/${path.posix.basename(lexical)}`;
+          candidates.push(viaParent);
+        } catch (parentError) {
+          if (!isNotFound(parentError)) return { block: true, reason: UNVERIFIABLE_REASON(raw) };
+        }
+      }
+    } else {
+      // Existing target that cannot be resolved inside the repo (symlink
+      // escape) — fail closed rather than allow an unverifiable write.
+      return { block: true, reason: UNVERIFIABLE_REASON(raw) };
+    }
+  }
+  for (const candidate of candidates) {
+    if (candidate !== lexical && isProtectedPath(candidate, active.contract, active.taskId)) {
+      return { block: true, reason: `${PROTECTED_REASON(candidate)}（路径 ${raw} 指向该受保护文件）` };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -468,8 +547,4 @@ function toRepoRelative(repo: string, value: string): string | null {
   const relative = path.relative(repo, absolute);
   if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
   return relative.split(path.sep).join("/");
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

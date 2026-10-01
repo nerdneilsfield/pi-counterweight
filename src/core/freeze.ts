@@ -17,7 +17,10 @@ export interface FrozenConflict {
 
 export interface FreezeOutcome {
   git: boolean;
+  /** All conflicts detected by this call, including already-recorded ones. */
   conflicts: FrozenConflict[];
+  /** Conflicts recorded by this call: not previously in `state.conflicts`. */
+  newConflicts: FrozenConflict[];
   /** Repo-relative paths of the saved `.diff` files, in conflict order. */
   diffs: string[];
 }
@@ -42,7 +45,7 @@ export async function checkFrozen(
   frozenBlobs: Record<string, string>,
 ): Promise<FreezeOutcome> {
   assertTaskId(taskId);
-  if (!await isGitRepo(repo)) return { git: false, conflicts: [], diffs: [] };
+  if (!await isGitRepo(repo)) return { git: false, conflicts: [], newConflicts: [], diffs: [] };
   return withTaskLock(repo, taskId, session, async () => {
     const foundAt = new Date().toISOString();
     const root = await realpath(repo);
@@ -91,29 +94,50 @@ export async function checkFrozen(
         detail: item.detail,
       });
     }
-    if (detected.length === 0) return { git: true, conflicts: [], diffs: [] };
+    if (detected.length === 0) return { git: true, conflicts: [], newConflicts: [], diffs: [] };
+
+    const state = await readState(repo, taskId);
+    // A standing conflict (same path + expected + actual) is not re-recorded
+    // on every check: no new diff, no state append, no "new conflict" report.
+    // A changed actual is a new key and is always recorded.
+    const recorded = new Set(
+      state.conflicts.map((item) => conflictKey(item as FrozenConflict)));
+    const fresh = detected.filter((item) => !recorded.has(conflictKey(item.conflict)));
+    const reason = `frozen file changed ${detected.map((item) => item.conflict.path).join(", ")}`;
+    if (fresh.length === 0 && state.last_verified === null && state.evidence_invalid_reason === reason) {
+      return { git: true, conflicts: detected.map((item) => item.conflict), newConflicts: [], diffs: [] };
+    }
 
     const dir = await taskSubdir(repo, taskId, "conflicts");
     const first = await nextDiffNumber(dir);
     // Rendering is the expensive part (object read plus a diff process per
     // conflict): run it concurrently, then write the numbered files in order.
-    const rendered = await Promise.all(detected.map((item) => renderDiffBody(repo, item)));
+    const rendered = await Promise.all(fresh.map((item) => renderDiffBody(repo, item)));
     const diffs: string[] = [];
-    for (let index = 0; index < detected.length; index++) {
+    for (let index = 0; index < fresh.length; index++) {
       const name = `${first + index}.diff`;
       const { body, detail } = rendered[index]!;
-      await writeDiff(path.join(dir, name), conflictHeader(detected[index]!, detail) + body);
+      await writeDiff(path.join(dir, name), conflictHeader(fresh[index]!, detail) + body);
       diffs.push(`.cw/tasks/${taskId}/conflicts/${name}`);
     }
-    const state = await readState(repo, taskId);
     await writeState(repo, taskId, session, {
       ...state,
-      conflicts: [...state.conflicts, ...detected.map((item) => item.conflict)],
+      conflicts: [...state.conflicts, ...fresh.map((item) => item.conflict)],
       last_verified: null,
-      evidence_invalid_reason: `frozen file changed ${detected.map((item) => item.conflict.path).join(", ")}`,
+      evidence_invalid_reason: reason,
     });
-    return { git: true, conflicts: detected.map((item) => item.conflict), diffs };
+    return {
+      git: true,
+      conflicts: detected.map((item) => item.conflict),
+      newConflicts: fresh.map((item) => item.conflict),
+      diffs,
+    };
   });
+}
+
+/** Deterministic identity of a conflict for de-duplication across checks. */
+function conflictKey(conflict: FrozenConflict): string {
+  return `${conflict.path}\0${conflict.expected}\0${conflict.actual ?? "<missing>"}`;
 }
 
 /**
