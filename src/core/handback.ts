@@ -182,8 +182,12 @@ async function restorePrevious(file: string, previous: PreviousFile): Promise<vo
   }
   if (previous.content === null) return;
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, previous.content);
-  await rename(temporary, file);
+  try {
+    await writeFile(temporary, previous.content);
+    await rename(temporary, file);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
 async function buildMaterial(
@@ -462,6 +466,12 @@ async function writeTaskFile(file: string, content: string): Promise<void> {
   }
   if (stat?.isSymbolicLink()) throw new Error(`${path.basename(file)} must not be a symlink`);
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, content);
-  await rename(temporary, file);
+  try {
+    await writeFile(temporary, content);
+    await rename(temporary, file);
+  } finally {
+    // This call's temp never outlives it: a failed rename (e.g. EISDIR)
+    // leaves no .tmp behind, and a successful rename makes the rm a no-op.
+    await rm(temporary, { force: true });
+  }
 }

@@ -464,8 +464,9 @@ test("escalate --from current withSession 晚段失败：账本持锁回滚、�
     },
   });
   await runCmd(fake, "task escalate --from current", context.ctx);
-  expect(anyNotify(context.notifications, "升级未完成")).toBe(true);
-  expect(anyNotify(context.notifications, "sendMessage failed")).toBe(true);
+  // 失败报告走替换后的有效 ctx（旧 ctx 已失效），不二次抛错。
+  expect(anyNotify(replaced!.notifications, "升级未完成")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "sendMessage failed")).toBe(true);
   // 账本回滚：模型、登记会话、计数全部保持原状。
   const state = await readState(s.repo, taskId);
   expect(state.model).toBe("g/medium");
@@ -478,7 +479,9 @@ test("escalate --from current withSession 晚段失败：账本持锁回滚、�
     { provider: "g", id: "strong" },
     { provider: "g", id: "medium" },
   ]);
-  expect(anyNotify(context.notifications, "会话模型已恢复")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "会话模型已恢复")).toBe(true);
+  // 绝不出现成功伪消息（成功通知已移到全部可失败步骤之后）。
+  expect(replaced!.notifications.some((entry) => entry.message.includes("已切换到升级会话"))).toBe(false);
   // 无假成功材料/事件。
   expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
   expect(await meterEvents(s.repo, taskId)).not.toContain("escalated");
@@ -493,21 +496,23 @@ test("escalate --from current 模型恢复失败：明确报告仍为 strong，�
   const { fake } = await startAdapter(s.repo, undefined, {
     setModelFn: (model) => model.id !== "medium",
   });
+  let replaced: ReturnType<typeof fakeCtx> | null = null;
   const context = fakeCtx(s.repo, {
     session: "s1",
     currentModel: { provider: "g", id: "medium" },
     newSession: async (options) => {
-      const replaced = fakeCtx(s.repo, { session: "s2", failSendMessage: true });
+      replaced = fakeCtx(s.repo, { session: "s2", failSendMessage: true });
       if (options.withSession) await options.withSession(replaced.ctx);
       return { cancelled: false };
     },
   });
   await runCmd(fake, "task escalate --from current", context.ctx);
-  expect(anyNotify(context.notifications, "升级未完成")).toBe(true);
-  // 恢复被尝试过且失败被明确报告，不宣称完全原状。
+  // 恢复被尝试过且失败经有效 ctx 明确报告，不宣称完全原状。
   expect(fake.setModels.at(-1)).toEqual({ provider: "g", id: "medium" });
-  expect(anyNotify(context.notifications, "模型恢复未生效")).toBe(true);
-  expect(anyNotify(context.notifications, "仍为 g/strong")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "升级未完成")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "模型恢复未生效")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "仍为 g/strong")).toBe(true);
+  expect(replaced!.notifications.some((entry) => entry.message.includes("已切换到升级会话"))).toBe(false);
   const state = await readState(s.repo, taskId);
   expect(state.model).toBe("g/medium");
   expect(state.sessions).toEqual(["s1"]);
@@ -529,9 +534,9 @@ test("escalate --from current 模型接管失败：账本从未被改，零材�
     },
   });
   await runCmd(fake, "task escalate --from current", context.ctx);
-  expect(anyNotify(context.notifications, "升级未完成")).toBe(true);
-  expect(anyNotify(context.notifications, "不在模型注册表中")).toBe(true);
-  expect(anyNotify(context.notifications, "会话模型未改动")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "升级未完成")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "不在模型注册表中")).toBe(true);
+  expect(anyNotify(replaced!.notifications, "会话模型未改动")).toBe(true);
   const state = await readState(s.repo, taskId);
   expect(state.model).toBe("g/medium");
   expect(state.sessions).toEqual(["s1"]);

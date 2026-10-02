@@ -702,19 +702,25 @@ async function taskEscalate(
   // can be written only after the switch has fully landed. The session's
   // current model is captured too: a late failure must put the surviving
   // session's model back, not leave it silently on the strong model.
+  // Pi 1.0 invalidates the old command context once newSession replaces the
+  // session: every notification after that point goes through the fresh
+  // ReplacedSessionContext, never through the stale one.
   const notes = await readTaskNotes(ledger, taskId);
   const view = renderTaskView(contract, approval, notes);
   const previousTask = registration.getTask();
   const previousModel = ctx.model;
   let switched = false;
+  let failureNotified = false;
   let failure: string | null = null;
   let cancelled = false;
   let rollbackError: string | null = null;
   let modelSwitched = false;
   let modelNote: string | null = null;
+  let replacedCtx: ExtensionCommandContext | null = null;
   try {
     const result = await ctx.newSession({
       withSession: async (newCtx) => {
+        replacedCtx = newCtx;
         const newSession = newCtx.sessionManager.getSessionId();
         try {
           // Fallible, non-mutating steps first: the model switch either lands
@@ -738,17 +744,21 @@ async function taskEscalate(
             });
             const active = await loadTask(repo, ledger, taskId, newSession);
             registration.setTask(active);
-            newCtx.ui.notify(
-              `Counterweight: 已切换到升级会话（任务 ${taskId}，模型 ${strong}）；`
-              + `修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
-              "info",
-            );
             await newCtx.sendMessage({
               customType: "counterweight",
               content: view,
               display: true,
             }, { triggerTurn: false });
             switched = true;
+            // Success toast LAST, after every fallible step: a lost toast
+            // must never roll back (or lie about) the committed switch.
+            try {
+              newCtx.ui.notify(
+                `Counterweight: 已切换到升级会话（任务 ${taskId}，模型 ${strong}）；`
+                + `修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
+                "info",
+              );
+            } catch { /* notification must never mask the committed switch */ }
           } catch (error) {
             failure = error instanceof Error ? error.message : "unknown";
             // Roll the single ledger write back so state matches the
@@ -763,30 +773,42 @@ async function taskEscalate(
               modelNote = await restorePreviousModel(pi, previousModel, strong);
             }
             registration.setTask(previousTask);
+            // The old command context is stale after the switch; the fresh
+            // replaced context is the valid channel for this report.
+            failureNotified = notifyThrough(newCtx,
+              `Counterweight: 升级未完成（切换失败：${failure ?? "unknown"}）；`
+              + `未写升级材料与计量事件，任务账本已恢复原状；${modelNote ?? "会话模型已恢复"}${
+                rollbackError === null
+                  ? ""
+                  : `；警告：账本恢复失败（${rollbackError}），请人工核对 .cw/tasks/${taskId}/state.json`}。`
+              + `若当前会话已被替换，请用 /cw task resume ${taskId} 重新接管。`);
           }
         } catch (error) {
+          // Failed before anything was mutated (model resolution or setModel).
           failure = error instanceof Error ? error.message : "unknown";
+          failureNotified = notifyThrough(newCtx,
+            `Counterweight: 升级未完成（切换失败：${failure ?? "unknown"}）；`
+            + "会话模型未改动，任务账本未改动。");
         }
       },
     });
     cancelled = result.cancelled;
   } catch (error) {
+    // newSession rejected before any replacement: the original context is
+    // still valid and is the right channel.
     cancelled = true;
     failure = failure ?? (error instanceof Error ? error.message : "unknown");
   }
   if (!switched) {
-    const reasonText = cancelled ? "会话替换被取消" : `切换失败：${failure ?? "unknown"}`;
-    const modelText = modelSwitched
-      ? `；${modelNote ?? "会话模型已恢复"}`
-      : "；会话模型未改动";
-    const rollbackText = rollbackError === null
-      ? ""
-      : `；警告：账本恢复失败（${rollbackError}），请人工核对 .cw/tasks/${taskId}/state.json`;
-    ctx.ui.notify(
-      `Counterweight: 升级未完成（${reasonText}）；未写升级材料与计量事件，任务账本已恢复原状${modelText}${rollbackText}。`
-      + `若当前会话已被替换，请用 /cw task resume ${taskId} 重新接管。`,
-      "error",
-    );
+    if (!failureNotified) {
+      // Only reachable when withSession never ran (replacement cancelled or
+      // rejected up front), so the original context is safe to use.
+      ctx.ui.notify(
+        `Counterweight: 升级未完成（${cancelled ? "会话替换被取消" : `切换失败：${failure ?? "unknown"}`}）；`
+        + "未写升级材料与计量事件，任务账本未改动，会话模型未改动。",
+        "error",
+      );
+    }
     return;
   }
   // The switch fully landed: only now does the escalation material (with its
@@ -805,15 +827,32 @@ async function taskEscalate(
   }
   await recordTaskEvent(ledger, taskId, session, "escalate_target", { mode, model: strong });
   if (materialWarning !== null) {
-    ctx.ui.notify(
+    notifyThrough(replacedCtx ?? ctx,
       `Counterweight: 会话已切换，但升级交还材料生成失败（${materialWarning}）；`
       + `账本与模型切换有效，请人工核对并补齐 .cw/tasks/${taskId}/handback.md。`,
-      "warning",
-    );
+      "warning");
   }
 }
 
 // ---- shared helpers --------------------------------------------------------
+
+/**
+ * Notify through the given context, swallowing a broken channel: a lost
+ * notification must never mask the reported failure or throw a second
+ * exception through the command handler. Returns whether it landed.
+ */
+function notifyThrough(
+  target: { ui: { notify: (message: string, type?: "error" | "info" | "warning") => void } },
+  message: string,
+  type: "error" | "warning" | "info" = "error",
+): boolean {
+  try {
+    target.ui.notify(message, type);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Put the surviving session's model back after a failed switch. Pi 1.0 keeps
