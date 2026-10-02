@@ -32,7 +32,7 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const task = registration.getTask();
       if (task === null) return text("[counterweight] 当前没有受管任务，report_blocked 未记录。");
-      await writeBlocked(task.root, task.taskId, task.session, {
+      await writeBlocked(task.ledger, task.taskId, task.session, {
         reason: params.reason,
         questions: params.questions,
       });
@@ -64,7 +64,7 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
           ? "approved"
           : "rejected"
         : "pending";
-      const proposal = await writeProposal(task.root, task.taskId, task.session, {
+      const proposal = await writeProposal(task.ledger, task.taskId, task.session, {
         field: params.field,
         new_value: params.new_value,
         reason: params.reason,

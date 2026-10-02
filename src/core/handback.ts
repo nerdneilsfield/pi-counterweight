@@ -6,10 +6,12 @@ import type { HandbackReason } from "./gate.js";
 import { assertTaskId } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
 import { readState, runsDir, withTaskLock } from "./task.js";
+import { recordTaskEvent } from "./meter.js";
 import type { Contract, LastVerified, TaskState, ValidatorConfig } from "./types.js";
 import { assertRunRecord, type RunRecord } from "./runrecord.js";
 
-export type HandbackOutcome = HandbackReason | "finish" | "cancelled" | "manual";
+export type HandbackOutcome =
+  | HandbackReason | "finish" | "cancelled" | "manual" | "escalated";
 
 export interface HandbackRequest {
   contract: Contract;
@@ -81,6 +83,7 @@ const REASON_LABELS: Record<HandbackOutcome, string> = {
   finish: "验收通过，任务结束",
   cancelled: "用户取消，验收结果未发布",
   manual: "用户手动交还",
+  escalated: "模型升级，任务移交更强模型的新会话",
 };
 
 /**
@@ -127,6 +130,9 @@ export async function writeHandback(
     const dir = path.dirname(await runsDir(repo, taskId));
     await writeTaskFile(dir, "handback.json", `${JSON.stringify(material, null, 2)}\n`);
     await writeTaskFile(dir, "handback.md", renderMarkdown(material));
+    // The meter line doubles as the task-flow event record: every handback,
+    // finish, cancel, manual handback, and escalation lands here.
+    await recordTaskEvent(repo, taskId, session, request.reason, { auto_verified: request.autoVerified });
     return {
       md: `.cw/tasks/${taskId}/handback.md`,
       json: `.cw/tasks/${taskId}/handback.json`,
@@ -370,6 +376,25 @@ function renderMarkdown(material: HandbackMaterial): string {
       ).join("\n"));
   lines.push("", "## 建议的下一轮任务", "", material.next_round, "");
   return lines.join("\n");
+}
+
+/**
+ * The task's current handback material, or null when absent or unreadable.
+ * Best-effort by design: consumers (resume decoration) treat notes as
+ * informational context and must not fail the command over them.
+ */
+export async function readHandbackMaterial(repo: string, taskId: string): Promise<HandbackMaterial | null> {
+  try {
+    const dir = path.dirname(await runsDir(repo, taskId));
+    const file = path.join(dir, "handback.json");
+    const stat = await lstat(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+    rejectUnknown(materialSchema, parsed, "handback.json");
+    return parsed as HandbackMaterial;
+  } catch {
+    return null;
+  }
 }
 
 async function writeTaskFile(dir: string, name: string, content: string): Promise<void> {

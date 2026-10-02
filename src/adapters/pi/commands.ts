@@ -1,26 +1,30 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { writeFile } from "node:fs/promises";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { lstat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { renderTaskView } from "../../core/approve.js";
-import { readProjectConfig } from "../../core/config.js";
+import { readProjectConfig, tierModel } from "../../core/config.js";
 import { contractSha256, readContract } from "../../core/contract.js";
 import { canonicalSha256 } from "../../core/canonical.js";
 import { contentSha256 } from "../../core/evidence.js";
-import { blobHash, headCommit, isClean } from "../../core/gitstate.js";
-import { writeHandback } from "../../core/handback.js";
+import { EscalateError, REFERENCE_FILE, prepareBaseEscalation } from "../../core/escalate.js";
+import { blobHash, headCommit, isClean, isLinkedWorktree, worktreePrune } from "../../core/gitstate.js";
+import { writeHandback, readHandbackMaterial } from "../../core/handback.js";
+import { recordTaskEvent } from "../../core/meter.js";
 import { CannotIsolateError, runRedCheck } from "../../core/redcheck.js";
-import { assertTaskId } from "../../core/paths.js";
+import { assertTaskId, isNotFound } from "../../core/paths.js";
+import { rm } from "node:fs/promises";
 import {
   createTask,
   findTasksByStatus,
   readApproval,
+  readReference,
   readState,
   updateState,
   writeApproval,
   type Approval,
 } from "../../core/task.js";
 import type { TaskState, Tier } from "../../core/types.js";
-import { loadTask, type ActiveTask, type ValidationHandle } from "./index.js";
+import { applyTaskModel, loadTask, type ActiveTask, type ValidationHandle } from "./index.js";
 
 export interface CommandRegistration {
   getTask: () => ActiveTask | null;
@@ -32,7 +36,8 @@ export interface CommandRegistration {
 const TIERS: readonly Tier[] = ["script", "change", "interface"];
 
 const USAGE = "用法：/cw task new <slug> [--tier script|change|interface] | approve [task_id] | "
-  + "resume <task_id> | status [task_id] | cancel [task_id] | handback [task_id]";
+  + "resume <task_id> | status [task_id] | cancel [task_id] | handback [task_id] | "
+  + "escalate [--from base|current]";
 
 /**
  * The `/cw` command family. Commands are user-initiated: they may use the
@@ -57,6 +62,7 @@ export function registerCommands(pi: ExtensionAPI, registration: CommandRegistra
           case "status": return await taskStatus(ctx, registration, tokens[2]);
           case "cancel": return await taskCancel(ctx, registration, tokens[2]);
           case "handback": return await taskHandback(ctx, registration, tokens[2]);
+          case "escalate": return await taskEscalate(pi, ctx, registration, tokens.slice(2));
           default:
             ctx.ui.notify(`Counterweight: ${USAGE}`, "error");
         }
@@ -117,10 +123,25 @@ async function taskNew(ctx: ExtensionCommandContext, tokens: string[]): Promise<
     ctx.ui.notify("Counterweight: 没有任何提交，无法记录 base_commit，未创建任务", "error");
     return;
   }
-  const dir = await createTask(repo, taskId, "unassigned", head.value);
+  // M7: the tier's model is chosen now and becomes the task's authoritative
+  // model (`state.model`); sessions adopt it when they take the task on.
+  if (await isLinkedWorktree(repo)) {
+    ctx.ui.notify("Counterweight: 当前目录是 git worktree，不能在这里创建任务；请在主检出运行 /cw task new", "error");
+    return;
+  }
+  let project;
+  try {
+    project = await readProjectConfig(path.join(repo, ".cw", "project.toml"));
+  } catch (error) {
+    ctx.ui.notify(`Counterweight: project.toml 不可用，无法按档位选模型，未创建任务（${
+      error instanceof Error ? error.message : "unreadable"}）`, "error");
+    return;
+  }
+  const model = tierModel(project, tier);
+  const dir = await createTask(repo, taskId, model, head.value);
   await writeFile(path.join(dir, "contract.toml"), contractTemplate(taskId, tier));
   ctx.ui.notify(
-    `Counterweight: 已创建任务 ${taskId}（drafting），base_commit ${head.value}。`
+    `Counterweight: 已创建任务 ${taskId}（drafting），base_commit ${head.value}，模型 ${model}。`
     + `请填写 .cw/tasks/${taskId}/contract.toml 后执行 /cw task approve。`,
     "info",
   );
@@ -150,6 +171,10 @@ async function taskApprove(
 ): Promise<void> {
   const repo = ctx.cwd;
   const session = ctx.sessionManager.getSessionId();
+  if (await isLinkedWorktree(repo)) {
+    ctx.ui.notify("Counterweight: 当前目录是 git worktree，不能在这里批准任务；请在主检出运行 /cw task approve", "error");
+    return;
+  }
   const taskId = await pickTask(ctx, tokens[0], ["drafting", "handed_back"]);
   if (taskId === null) return;
   const state = await readState(repo, taskId);
@@ -174,6 +199,7 @@ async function taskApprove(
   let releaseDone!: () => void;
   const done = new Promise<void>((resolve) => { releaseDone = resolve; });
   registration.setValidation({ controller, done });
+  let confirmWaitMs = 0;
   try {
     let red: Awaited<ReturnType<typeof runRedCheck>> | null = null;
     if (contract.deliverable === "code") {
@@ -218,6 +244,8 @@ async function taskApprove(
       }
       // The signal both dismisses the dialog natively and races the wait; the
       // original dialog value is never treated as approval once cancelled.
+      // The wait duration is recorded with the approval meter event.
+      const confirmStarted = Date.now();
       const redFailures = red.redFailures;
       const overlayInputs = red.baselineInputs;
       const confirmed = await confirmCancellable(controller.signal, () => ctx.ui.confirm(
@@ -225,6 +253,7 @@ async function taskApprove(
         renderRedConfirmation(contract, redFailures, overlayInputs),
         { signal: controller.signal },
       ));
+      confirmWaitMs = Date.now() - confirmStarted;
       if (controller.signal.aborted) {
         ctx.ui.notify("Counterweight: 用户已取消，拒绝批准；未写入任何批准记录。", "warning");
         return;
@@ -284,7 +313,15 @@ async function taskApprove(
       ctx.ui.notify("Counterweight: 批准记录已写入，但任务随即被取消；任务视图未附加。", "warning");
       return;
     }
-    registration.setTask(await loadTask(repo, taskId, session));
+    await recordTaskEvent(repo, taskId, session, "approved", {
+      contract_sha256: approval.contract_sha256,
+      red_check_run: approval.red_check_run,
+      confirm_wait_ms: confirmWaitMs,
+    });
+    const active = await loadTask(repo, repo, taskId, session);
+    registration.setTask(active);
+    // M7 adoption point: the session runs the task's approved model from now.
+    await applyTaskModel(pi, ctx, active);
     await appendTaskView(pi, ctx, contract, approval);
     ctx.ui.notify(`Counterweight: 任务 ${taskId} 已批准，任务视图已追加到会话。`, "info");
   } finally {
@@ -334,15 +371,17 @@ function renderRedConfirmation(
   return lines.join("\n");
 }
 
-/** Append the ≤40-line task view when the session is idle; never mid-turn. */
+/** Append the ≤40-line task view when the session is idle; never mid-turn.
+ *  `notes` (escalation resume) rides along as the previous model's unverified
+ *  notes, truncated inside the same cap. */
 async function appendTaskView(
   pi: ExtensionAPI, ctx: ExtensionCommandContext, contract: Awaited<ReturnType<typeof readContract>>,
-  approval: Approval,
+  approval: Approval, notes: string | null = null,
 ): Promise<void> {
   await ctx.waitForIdle();
   pi.sendMessage({
     customType: "counterweight",
-    content: renderTaskView(contract, approval),
+    content: renderTaskView(contract, approval, notes),
     display: true,
   }, { triggerTurn: false });
 }
@@ -358,19 +397,27 @@ async function taskResume(
   }
   const repo = ctx.cwd;
   const session = ctx.sessionManager.getSessionId();
-  const state = await readState(repo, arg);
+  const ledger = await resolveTaskRepo(ctx, arg);
+  if (ledger === null) return;
+  const state = await readState(ledger, arg);
   if (state.status !== "approved" && state.status !== "running") {
     ctx.ui.notify(`Counterweight: 任务 ${arg} 状态为 ${state.status}，只有 approved/running 可恢复`, "error");
     return;
   }
   // Resume only registers the session: the baseline, counters, and evidence
   // record stay exactly as they are; session_start re-verifies evidence.
-  await updateState(repo, arg, session, (current) => current.sessions.includes(session)
+  await updateState(ledger, arg, session, (current) => current.sessions.includes(session)
     ? current
     : { ...current, sessions: [...current.sessions, session] });
-  const task = await loadTask(repo, arg, session);
+  const task = await loadTask(repo, ledger, arg, session);
   registration.setTask(task);
-  await appendTaskView(pi, ctx, task.contract, task.approval);
+  // M7 adoption point: this session now runs the task's approved model.
+  await applyTaskModel(pi, ctx, task);
+  // An escalated task's resumed session carries the previous model's notes
+  // in its first task view (marked unverified), per plan M7.
+  const material = await readHandbackMaterial(ledger, arg);
+  const notes = material?.reason === "escalated" ? material.notes : null;
+  await appendTaskView(pi, ctx, task.contract, task.approval, notes);
   ctx.ui.notify(`Counterweight: 会话已登记到任务 ${arg}；未重建基线。`, "info");
 }
 
@@ -390,13 +437,20 @@ async function taskStatus(
         "drafting", "approved", "running", "verified", "handed_back", "cancelled",
       ]);
       if (all.length === 0) {
+        // Inside an escalation worktree the only visible task is the
+        // referenced one.
+        const referenced = await referencedTaskId(repo);
+        if (referenced !== null) all.push(referenced);
+      }
+      if (all.length === 0) {
         ctx.ui.notify("Counterweight: 没有任何任务；用 /cw task new 创建。", "info");
         return;
       }
       if (all.length > 1) {
         const lines: string[] = [];
         for (const id of all) {
-          const state = await readState(repo, id);
+          const ledger = await resolveTaskRepo(ctx, id);
+          const state = await readState(ledger ?? repo, id);
           lines.push(`${id}：${state.status}`);
         }
         ctx.ui.notify(`Counterweight: 多个任务，指定 ID 查看详情：\n${lines.join("\n")}`, "info");
@@ -405,7 +459,9 @@ async function taskStatus(
       taskId = all[0]!;
     }
   }
-  const state = await readState(repo, taskId);
+  const ledger = await resolveTaskRepo(ctx, taskId);
+  if (ledger === null) return;
+  const state = await readState(ledger, taskId);
   const lines = [
     `任务：${taskId}`,
     `状态：${state.status}`,
@@ -414,8 +470,8 @@ async function taskStatus(
     `会话：${state.sessions.length === 0 ? "无" : state.sessions.join(", ")}`,
   ];
   try {
-    const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId);
-    const project = await readProjectConfig(path.join(repo, ".cw", "project.toml"));
+    const contract = await readContract(path.join(ledger, ".cw", "tasks", taskId, "contract.toml"), ledger, taskId);
+    const project = await readProjectConfig(path.join(ledger, ".cw", "project.toml"));
     const tokensBudget = contract.budget?.tokens ?? project.budget.tokens;
     const wallMinutes = contract.budget?.wall_minutes ?? project.budget.wall_minutes;
     const repairs = contract.budget?.repairs ?? project.budget.repairs;
@@ -437,7 +493,7 @@ async function taskStatus(
   lines.push(`冻结冲突：${state.conflicts.length} 处${
     state.conflicts.length === 0 ? "" : `（${conflicts.map((item) => String(item?.path ?? "?")).join(", ")}）`}`);
   try {
-    const approval = await readApproval(repo, taskId);
+    const approval = await readApproval(ledger, taskId);
     lines.push(`批准：${approval.approved_at}，先红 run ${approval.red_check_run}`);
   } catch {
     lines.push("批准：未批准");
@@ -457,7 +513,9 @@ async function taskCancel(
   // Abort any in-flight validation first: it holds the task lock, and its
   // process group must be gone before the status write.
   await registration.stopValidation();
-  await updateState(repo, taskId, session, (current) => current.status === "drafting"
+  const ledger = await resolveTaskRepo(ctx, taskId);
+  if (ledger === null) return;
+  await updateState(ledger, taskId, session, (current) => current.status === "drafting"
     || current.status === "approved" || current.status === "running"
     ? { ...current, status: "cancelled" }
     : current);
@@ -476,21 +534,23 @@ async function taskHandback(
   const taskId = await pickTask(ctx, arg, ["approved", "running"]);
   if (taskId === null) return;
   await registration.stopValidation();
-  const state = await readState(repo, taskId);
+  const ledger = await resolveTaskRepo(ctx, taskId);
+  if (ledger === null) return;
+  const state = await readState(ledger, taskId);
   if (state.status !== "approved" && state.status !== "running") {
     ctx.ui.notify(`Counterweight: 任务 ${taskId} 状态为 ${state.status}，只有 approved/running 可交还`, "error");
     return;
   }
-  const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId);
-  const approval = await readApproval(repo, taskId);
-  const material = await writeHandback(repo, taskId, session, {
+  const contract = await readContract(path.join(ledger, ".cw", "tasks", taskId, "contract.toml"), ledger, taskId);
+  const approval = await readApproval(ledger, taskId);
+  const material = await writeHandback(ledger, taskId, session, {
     contract,
     validator: approval.validator,
     reason: "manual",
     questions: [],
     autoVerified: false,
   });
-  await updateState(repo, taskId, session, (current) => current.status === "approved"
+  await updateState(ledger, taskId, session, (current) => current.status === "approved"
     || current.status === "running"
     ? { ...current, status: "handed_back" }
     : current);
@@ -502,7 +562,227 @@ async function taskHandback(
   ctx.ui.notify(`Counterweight: 任务 ${taskId} 已手动交还。材料：${material.md}`, "info");
 }
 
+// ---- /cw task escalate -----------------------------------------------------
+
+const ESCALATE_USAGE = "用法：/cw task escalate [--from base|current]（默认 base）";
+
+/**
+ * Hand the task to a stronger-model session. Budget counters and repair
+ * counts are never reset and the escalation allocates no extra budget.
+ *
+ * `--from base` (default): a detached worktree of the original base_commit
+ * receives the approved acceptance inputs and a reference to the one
+ * authoritative ledger. Pi 1.0's command context cannot start a session in
+ * another working directory (`newSession` has no `cwd`), so this command does
+ * NOT claim the upgrade happened — it releases this session's execution
+ * right and tells the user to start Pi in the new worktree and resume.
+ * `--from current`: the session is actually replaced here; the new session is
+ * registered on the same ledger and gets the strong model plus a task view
+ * that carries the previous model's (unverified) notes.
+ */
+async function taskEscalate(
+  pi: ExtensionAPI, ctx: ExtensionCommandContext, registration: CommandRegistration, tokens: string[],
+): Promise<void> {
+  let mode: "base" | "current" = "base";
+  for (let index = 0; index < tokens.length; index++) {
+    if (tokens[index] === "--from") {
+      const value = tokens[index + 1];
+      if (value !== "base" && value !== "current") {
+        ctx.ui.notify(`Counterweight: ${ESCALATE_USAGE}`, "error");
+        return;
+      }
+      mode = value;
+      index++;
+    } else {
+      ctx.ui.notify(`Counterweight: ${ESCALATE_USAGE}`, "error");
+      return;
+    }
+  }
+  const repo = ctx.cwd;
+  const session = ctx.sessionManager.getSessionId();
+  const taskId = await pickTask(ctx, undefined, ["approved", "running"]);
+  if (taskId === null) return;
+  const ledger = await resolveTaskRepo(ctx, taskId);
+  if (ledger === null) return;
+  await registration.stopValidation();
+  const state = await readState(ledger, taskId);
+  if (state.status !== "approved" && state.status !== "running") {
+    ctx.ui.notify(`Counterweight: 任务 ${taskId} 状态为 ${state.status}，只有 approved/running 可升级`, "error");
+    return;
+  }
+  const contract = await readContract(path.join(ledger, ".cw", "tasks", taskId, "contract.toml"), ledger, taskId);
+  const approval = await readApproval(ledger, taskId);
+  const project = await readProjectConfig(path.join(ledger, ".cw", "project.toml"));
+  const strong = project.models.strong;
+  const released = (current: TaskState): TaskState => ({
+    ...current,
+    model: strong,
+    sessions: current.sessions.filter((item) => item !== session),
+  });
+
+  if (mode === "base") {
+    let worktree: string;
+    try {
+      worktree = await prepareBaseEscalation({
+        repo: ledger,
+        taskId,
+        session,
+        baseCommit: approval.base_commit,
+        inputs: contract.baseline_inputs,
+        approvedInputHashes: approval.baseline_inputs_sha256,
+      });
+    } catch (error) {
+      if (error instanceof EscalateError) {
+        ctx.ui.notify(`Counterweight: 无法升级（--from base）：${error.message}`, "error");
+        return;
+      }
+      throw error;
+    }
+    try {
+      await writeHandback(ledger, taskId, session, {
+        contract,
+        validator: approval.validator,
+        reason: "escalated",
+        questions: [
+          `请在升级 worktree ${worktree} 启动新的 pi 会话（加载本扩展），执行 /cw task resume ${taskId}；`
+            + `任务模型已切换为 ${strong}。`,
+        ],
+        autoVerified: false,
+      });
+      // Release this session's execution right; the new session takes the
+      // same task lock when it starts working. Counters stay untouched.
+      await updateState(ledger, taskId, session, released);
+    } catch (error) {
+      // Never leave a half-registered escalation behind.
+      await rm(worktree, { recursive: true, force: true });
+      await worktreePrune(ledger);
+      throw error;
+    }
+    await recordTaskEvent(ledger, taskId, session, "escalate_target", {
+      mode, worktree, model: strong,
+    });
+    if (registration.getTask()?.taskId === taskId) registration.setTask(null);
+    ctx.ui.notify(
+      `Counterweight: 任务 ${taskId} 升级材料已就绪。Pi 无法跨目录替你启动新会话（newSession 无 cwd 参数），`
+      + `请在 ${worktree} 启动新的 pi 并执行 /cw task resume ${taskId}（模型 ${strong}）。`
+      + `原工作树未改动；修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
+      "info",
+    );
+    return;
+  }
+
+  // --from current: the session is really replaced; the ledger keeps one
+  // registered session (the new one) and the strong model.
+  const material = await writeHandback(ledger, taskId, session, {
+    contract,
+    validator: approval.validator,
+    reason: "escalated",
+    questions: [],
+    autoVerified: false,
+  });
+  const notes = material.material.notes;
+  let switched = false;
+  let switchError: string | null = null;
+  let cancelled = false;
+  try {
+    const result = await ctx.newSession({
+      withSession: async (newCtx) => {
+        try {
+          const newSession = newCtx.sessionManager.getSessionId();
+          await updateState(ledger, taskId, newSession, (current) => {
+            const next = released(current);
+            return next.sessions.includes(newSession)
+              ? next
+              : { ...next, sessions: [...next.sessions, newSession] };
+          });
+          const active = await loadTask(repo, ledger, taskId, newSession);
+          registration.setTask(active);
+          // Adoption point of the new session: strong model, from state.
+          await applyTaskModel(pi, newCtx, active);
+          newCtx.ui.notify(
+            `Counterweight: 已切换到升级会话（任务 ${taskId}，模型 ${strong}）；`
+            + `修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
+            "info",
+          );
+          await newCtx.sendMessage({
+            customType: "counterweight",
+            content: renderTaskView(contract, approval, notes),
+            display: true,
+          }, { triggerTurn: false });
+          switched = true;
+        } catch (error) {
+          switchError = error instanceof Error ? error.message : "unknown";
+        }
+      },
+    });
+    cancelled = result.cancelled;
+  } catch (error) {
+    cancelled = true;
+    switchError = error instanceof Error ? error.message : "unknown";
+  }
+  if (!switched) {
+    // The old session keeps its registration: nothing was committed.
+    ctx.ui.notify(
+      `Counterweight: 升级未完成（${cancelled ? "会话替换被取消" : `切换失败：${switchError ?? "unknown"}`}）；`
+      + `任务保持原状，本会话仍是登记会话。`,
+      "error",
+    );
+    return;
+  }
+  await recordTaskEvent(ledger, taskId, session, "escalate_target", {
+    mode, model: strong,
+  });
+}
+
 // ---- shared helpers --------------------------------------------------------
+
+/** The task id a `.cw/task.json` reference points at, or null when absent. */
+async function referencedTaskId(workRoot: string): Promise<string | null> {
+  try {
+    const reference = await readReference(path.join(workRoot, REFERENCE_FILE));
+    return reference.task_id;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The repo root whose `.cw/tasks/<taskId>/` is the authoritative ledger for
+ * `taskId`: the working directory itself when it holds the task, otherwise
+ * the ledger referenced by this worktree's `.cw/task.json`. Null (reported)
+ * when neither resolves.
+ */
+async function resolveTaskRepo(ctx: ExtensionCommandContext, taskId: string): Promise<string | null> {
+  assertTaskId(taskId);
+  const cwd = ctx.cwd;
+  let stat;
+  try {
+    stat = await lstat(path.join(cwd, ".cw", "tasks", taskId));
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+    stat = undefined;
+  }
+  if (stat !== undefined) {
+    if (!stat.isDirectory()) {
+      ctx.ui.notify(`Counterweight: .cw/tasks/${taskId} 不是目录，拒绝操作`, "error");
+      return null;
+    }
+    return cwd;
+  }
+  try {
+    const reference = await readReference(path.join(cwd, REFERENCE_FILE));
+    if (reference.task_id !== taskId) {
+      ctx.ui.notify(
+        `Counterweight: 本目录的引用指向任务 ${reference.task_id}，不是 ${taskId}`, "error");
+      return null;
+    }
+    return path.resolve(reference.path, "..", "..", "..");
+  } catch (error) {
+    ctx.ui.notify(`Counterweight: 找不到任务 ${taskId}（本目录没有该任务，也没有有效的 .cw/task.json 引用：${
+      error instanceof Error ? error.message : "unknown"}）`, "error");
+    return null;
+  }
+}
 
 /**
  * Resolve the task a command operates on: explicit id (status-checked), or
@@ -514,12 +794,13 @@ async function pickTask(
 ): Promise<string | null> {
   const repo = ctx.cwd;
   if (arg !== undefined) {
+    const ledger = await resolveTaskRepo(ctx, arg);
+    if (ledger === null) return null;
     let state: TaskState;
     try {
-      assertTaskId(arg);
-      state = await readState(repo, arg);
+      state = await readState(ledger, arg);
     } catch (error) {
-      ctx.ui.notify(`Counterweight: 任务 ${arg} 不存在或不可读（${
+      ctx.ui.notify(`Counterweight: 任务 ${arg} 不可读（${
         error instanceof Error ? error.message : "unknown"}）`, "error");
       return null;
     }
@@ -535,6 +816,20 @@ async function pickTask(
   const matches = await findTasksByStatus(repo, statuses);
   if (matches.length === 1) return matches[0]!;
   if (matches.length === 0) {
+    // Escalation worktree: the referenced task is the only candidate.
+    const referenced = await referencedTaskId(repo);
+    if (referenced !== null) {
+      const ledger = await resolveTaskRepo(ctx, referenced);
+      if (ledger !== null) {
+        const state = await readState(ledger, referenced);
+        if (statuses.includes(state.status)) return referenced;
+        ctx.ui.notify(
+          `Counterweight: 任务 ${referenced} 状态为 ${state.status}，此命令需要 ${statuses.join("/")}`,
+          "error",
+        );
+        return null;
+      }
+    }
     ctx.ui.notify(`Counterweight: 没有状态为 ${statuses.join("/")} 的任务`, "error");
     return null;
   }

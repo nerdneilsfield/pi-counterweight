@@ -126,6 +126,20 @@ export async function worktreePrune(repo: string): Promise<void> {
   await git(repo, ["worktree", "prune"]);
 }
 
+/**
+ * Whether `repo` is a linked worktree rather than the main checkout
+ * (`--git-common-dir` differs from `--git-dir`). A non-git repo reports
+ * false; callers gate on git support separately.
+ */
+export async function isLinkedWorktree(repo: string): Promise<boolean> {
+  const [common, current] = await Promise.all([
+    git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    git(repo, ["rev-parse", "--path-format=absolute", "--git-dir"]),
+  ]);
+  if (common.code !== 0 || current.code !== 0) return false;
+  return common.stdout.trim() !== current.stdout.trim();
+}
+
 function git(repo: string, args: string[], index?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {

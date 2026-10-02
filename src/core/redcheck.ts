@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { contentSha256, judgeEvidence, type ResultReport } from "./evidence.js";
 import { commitExists, isGitRepo, treeHash, worktreeAdd, worktreePrune } from "./gitstate.js";
+import { recordTaskEvent } from "./meter.js";
 import { isNotFound, pathInside } from "./paths.js";
 import { claimRun, runValidatorProcess } from "./runner.js";
 import { writeRunRecord, type RunRecord } from "./runrecord.js";
@@ -138,6 +139,7 @@ export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOut
   return withTaskLock(request.repo, request.taskId, request.session, async () => {
     const runDir = await claimRun(request.repo, request.taskId);
     const run = Number(path.basename(runDir));
+    await recordTaskEvent(request.repo, request.taskId, request.session, "validation_started", { run });
     const root = await mkdtemp(path.join(tmpdir(), "cw-red-"));
     const baseline = path.join(root, "baseline");
     try {
@@ -201,6 +203,10 @@ export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOut
         const red = valid && result !== null
           ? judgeRedBaseline(request.contract, result)
           : { ok: false, reasons: [] };
+        await recordTaskEvent(request.repo, request.taskId, request.session, "validation_finished", {
+          run,
+          conclusion: valid ? (red.ok ? "red-confirmed" : "red-refused") : "undetermined",
+        });
         return {
           run,
           runDir,
@@ -229,9 +235,10 @@ export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOut
  * written: a symlinked ancestor (pointing anywhere, in or out of the
  * baseline), a non-directory ancestor, an escaping path, or a non-file target
  * rejects the whole overlay — no partial writes leave the baseline, not even
- * when the approval is refused afterwards.
+ * when the approval is refused afterwards. Shared with the M7 escalation,
+ * which restores the same approved inputs into the escalation worktree.
  */
-async function overlayInputs(repo: string, baseline: string, inputs: string[]): Promise<void> {
+export async function overlayInputs(repo: string, baseline: string, inputs: string[]): Promise<void> {
   const root = await realpath(baseline);
   for (const input of inputs) {
     const parts = input.split("/");

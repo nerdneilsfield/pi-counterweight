@@ -14,9 +14,11 @@ interface Section {
  * capped at 40 lines: goal, non-goals, acceptance ids (red items marked),
  * regression ids, frozen paths, and the two model-facing tools' purpose.
  * Oversized list sections are truncated from the tail with an explicit
- * remainder marker; the fixed framing lines are never dropped.
+ * remainder marker; the fixed framing lines are never dropped. When `notes`
+ * is given (M7 escalation), the previous model's notes follow under an
+ * explicit unverified marker, truncated the same way.
  */
-export function renderTaskView(contract: Contract, approval: Approval): string {
+export function renderTaskView(contract: Contract, approval: Approval, notes: string | null = null): string {
   const red = new Set(contract.red);
   const sections: Section[] = [
     { header: "非目标：", items: contract.non_goals.map((item) => `- ${item}`) },
@@ -51,6 +53,16 @@ export function renderTaskView(contract: Contract, approval: Approval): string {
     lines.push(sections[index]!.header);
     lines.push(...items[index]!);
     if (dropped[index]! > 0) lines.push(`（其余 ${dropped[index]} 项略）`);
+  }
+  const trimmedNotes = notes?.trim();
+  if (trimmedNotes !== undefined && trimmedNotes !== "") {
+    const noteLines = ["前一模型的笔记，未经验证：", ...trimmedNotes.split("\n")];
+    const room = VIEW_MAX_LINES - lines.length;
+    if (room > 1) {
+      const kept = noteLines.slice(0, room - 1);
+      if (kept.length < noteLines.length) kept.push("（笔记其余部分略，见 handback.md）");
+      lines.push(...kept);
+    }
   }
   return lines.slice(0, VIEW_MAX_LINES).join("\n");
 }

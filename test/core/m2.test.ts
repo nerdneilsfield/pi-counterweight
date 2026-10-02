@@ -354,6 +354,9 @@ test("取消覆盖发布全程：判定阶段取消不写已验证", async () =>
 test("runs 目录拒绝 symlink、普通文件与越界写入", async () => {
   const root = await gitRepo();
   const runs = path.join(root, ".cw", "tasks", taskId, "runs");
+  // M7 起 createTask 即记录 task_created 计量事件，runs 目录随之存在；
+  // 本测试针对 claimRun 的守卫，先移除再放置异常形态。
+  await rm(runs, { recursive: true, force: true });
   const outside = await mkdtemp(path.join(tmpdir(), "cw-m2-out-"));
   await symlink(outside, runs);
   await expect(claimRun(root, taskId)).rejects.toThrow(/runs must not be a symlink/);

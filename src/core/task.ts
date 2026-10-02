@@ -4,6 +4,7 @@ import type { Dirent } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { contractSha256, readContract } from "./contract.js";
+import { recordTaskEvent } from "./meter.js";
 import { assertTaskId, isNotFound, pathInside } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
 import { Type } from "typebox";
@@ -153,6 +154,7 @@ export async function createTask(
   const release = await acquireLock(repo, taskId, "create");
   try {
     await putState(dir, taskId, state);
+    await recordTaskEvent(repo, taskId, "create", "task_created", { model, base_commit: baseCommit });
   } finally {
     await release();
   }

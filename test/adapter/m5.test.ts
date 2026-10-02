@@ -600,8 +600,11 @@ test("message_end 把 assistant usage 交给 meter 并累计 tokens_used", async
 
   const lines = (await readFile(
     path.join(repo, ".cw", "tasks", taskId, "meter.jsonl"), "utf8")).trim().split("\n");
-  expect(lines).toHaveLength(1);
-  expect(JSON.parse(lines[0]!)).toMatchObject({
+  // M7 起计量文件含 task 事件行；usage 行为与此前一致。
+  const usage = lines.map((line) => JSON.parse(line) as { kind?: string })
+    .filter((record) => record.kind === "usage");
+  expect(usage).toHaveLength(1);
+  expect(usage[0]).toMatchObject({
     session: "s1", model: "g/medium",
     input: 100, output: 20, cache_read: 30, cache_write: 5, cost_total: 3.2,
   });

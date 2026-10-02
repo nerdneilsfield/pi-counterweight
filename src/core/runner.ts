@@ -7,6 +7,7 @@ import { contentSha256, judgeEvidence, type ResultReport, type Verdict } from ".
 import { treeHash } from "./gitstate.js";
 import { isNotFound } from "./paths.js";
 import { assertRunRecord, writeRunRecord, type RunRecord } from "./runrecord.js";
+import { recordTaskEvent } from "./meter.js";
 import { readState, runsDir, withTaskLock, writeState } from "./task.js";
 import type { Contract, GitValue, LastVerified, ValidatorConfig } from "./types.js";
 import { readFile } from "node:fs/promises";
@@ -16,6 +17,12 @@ const GROUP_POLL_MS = 50;
 
 export interface RunRequest {
   repo: string;
+  /**
+   * The working tree the validator runs in and snapshots hash (M7). Defaults
+   * to `repo`; differs only for a session inside an escalation worktree,
+   * while `repo` stays the authoritative ledger root.
+   */
+  workRoot?: string;
   taskId: string;
   session: string;
   contract: Contract;
@@ -36,12 +43,14 @@ export interface RunOutcome {
 
 export async function runValidator(request: RunRequest): Promise<RunOutcome> {
   return withTaskLock(request.repo, request.taskId, request.session, async () => {
+    const work = request.workRoot ?? request.repo;
     const dir = await claimRun(request.repo, request.taskId);
     const run = Number(path.basename(dir));
     const started = new Date().toISOString();
-    const before = await snapshot(request.repo, request.contract.baseline_inputs);
+    await recordTaskEvent(request.repo, request.taskId, request.session, "validation_started", { run });
+    const before = await snapshot(work, request.contract.baseline_inputs);
     const outcome = await runValidatorProcess({
-      cwd: request.repo,
+      cwd: work,
       cmd: request.validator.cmd,
       env: {
         ...process.env,
@@ -57,9 +66,9 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       signal: request.signal,
     });
     try {
-      const after = await snapshot(request.repo, request.contract.baseline_inputs);
+      const after = await snapshot(work, request.contract.baseline_inputs);
       const discard = discardReason(outcome);
-      const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(request.repo, dir);
+      const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(work, dir);
       const recordError = [before.error, after.error, artifacts.error]
         .filter((item): item is string => item !== null)
         .join("; ") || null;
@@ -87,7 +96,7 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       if (discard !== null) {
         verdict = { conclusion: "undetermined", reasons: [discard] };
       } else {
-        verdict = await judgeEvidence(request.repo, dir, request.contract, request.approvedInputHashes);
+        verdict = await judgeEvidence(work, dir, request.contract, request.approvedInputHashes);
       }
       // A cancel that arrives while the verdict is being judged still discards
       // the result: no last_verified may be published after cancellation.
@@ -120,6 +129,12 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
         }
       }
       const failures = verdict.conclusion === "fail" ? await failureChecks(dir, request.contract) : [];
+      await recordTaskEvent(request.repo, request.taskId, request.session, "validation_finished", {
+        run,
+        conclusion: verdict.conclusion,
+        timed_out: outcome.timedOut,
+        cancelled: outcome.cancelled,
+      });
       return { run, dir, record, verdict, lastVerified, failures };
     } finally {
       outcome.dispose();

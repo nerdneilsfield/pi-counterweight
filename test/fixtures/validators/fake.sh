@@ -31,5 +31,11 @@ case "$mode" in
   reportrun)
     printf "%s\n" "$2" | sed -e "s|@RUN@|$CW_RUN_ID|g" -e "s|@PWD@|$PWD|g" > "$out"
     ;;
+  reportfile)
+    # Payload read from the file given as $2, so a test can change the
+    # verdict between validation runs without touching the approved command.
+    # @RUN@ is substituted per run, like reportrun.
+    printf "%s\n" "$(cat "$2")" | sed -e "s|@RUN@|$CW_RUN_ID|g" > "$out"
+    ;;
   *) printf "%s\n" "$2" > "$out"; exit "${3:-0}" ;;
 esac

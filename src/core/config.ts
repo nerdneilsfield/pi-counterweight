@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { Type } from "typebox";
 import { parse } from "smol-toml";
 import { rejectUnknown } from "./schema.js";
-import type { ProjectConfig } from "./types.js";
+import type { ProjectConfig, Tier } from "./types.js";
 
 const ModelName = Type.String({ minLength: 1, pattern: "^[^/\\s]+/[^/\\s]+$" });
 const TierName = Type.Union([Type.Literal("cheap"), Type.Literal("medium"), Type.Literal("strong")]);
@@ -66,4 +66,9 @@ export async function readProjectConfig(path: string): Promise<ProjectConfig> {
     models: value.models,
     tiers: value.tiers,
   };
+}
+
+/** The `provider/model` string a task of `tier` runs on, per `[tiers]` → `[models]`. */
+export function tierModel(project: ProjectConfig, tier: Tier): string {
+  return project.models[project.tiers[tier]];
 }

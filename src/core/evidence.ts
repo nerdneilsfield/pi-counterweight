@@ -140,7 +140,15 @@ export async function judgeRecord(
   return { conclusion: "pass", reasons: [] };
 }
 
-export async function recheckArtifacts(repo: string, taskId: string, session: string): Promise<string | null> {
+/**
+ * Re-hash recorded artifact files. `repo` is the ledger (run records live
+ * there); `workRoot` (M7, default `repo`) is the tree the artifact files are
+ * read from.
+ */
+export async function recheckArtifacts(
+  repo: string, taskId: string, session: string, workRoot?: string,
+): Promise<string | null> {
+  const work = workRoot ?? repo;
   return updateState(repo, taskId, session, async (state) => {
     if (state.last_verified === null) return state;
     // runsDir re-applies the authority walk and rejects symlinked run roots,
@@ -155,7 +163,7 @@ export async function recheckArtifacts(repo: string, taskId: string, session: st
     for (const [file, expected] of Object.entries(record.artifact_hashes)) {
       let actual: string | null;
       try {
-        actual = await contentSha256(repo, file);
+        actual = await contentSha256(work, file);
       } catch (error) {
         return { ...state, last_verified: null, evidence_invalid_reason: `artifact unreadable ${file}: ${errorMessage(error)}` };
       }

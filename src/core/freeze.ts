@@ -35,20 +35,23 @@ const DIFF_FLAGS = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | c
  * the tree hash excludes, so recording a conflict cannot change the evidence
  * that future checks compute.
  *
- * The repo is realpathed once and every path is resolved independently, so a
- * few thousand frozen files stay inside the per-call time budget. Non-git
- * repos cannot verify blob hashes: nothing is reported and no state is bound
- * (see M1 degrade rules).
+ * `repo` is the authoritative ledger root; `workRoot` (M7, default `repo`) is
+ * the working tree the files are hashed in — they differ only for a session
+ * running inside an escalation worktree. The work tree is realpathed once and
+ * every path is resolved independently, so a few thousand frozen files stay
+ * inside the per-call time budget. Non-git working trees cannot verify blob
+ * hashes: nothing is reported and no state is bound (see M1 degrade rules).
  */
 export async function checkFrozen(
   repo: string, taskId: string, session: string,
-  frozenBlobs: Record<string, string>,
+  frozenBlobs: Record<string, string>, workRoot?: string,
 ): Promise<FreezeOutcome> {
   assertTaskId(taskId);
-  if (!await isGitRepo(repo)) return { git: false, conflicts: [], newConflicts: [], diffs: [] };
+  const work = workRoot ?? repo;
+  if (!await isGitRepo(work)) return { git: false, conflicts: [], newConflicts: [], diffs: [] };
   return withTaskLock(repo, taskId, session, async () => {
     const foundAt = new Date().toISOString();
-    const root = await realpath(repo);
+    const root = await realpath(work);
     const checked = await Promise.all(Object.entries(frozenBlobs).map(async ([original, expected]) => {
       try {
         const resolved = await resolveInRepo(root, original);
@@ -112,7 +115,7 @@ export async function checkFrozen(
     const first = await nextDiffNumber(dir);
     // Rendering is the expensive part (object read plus a diff process per
     // conflict): run it concurrently, then write the numbered files in order.
-    const rendered = await Promise.all(fresh.map((item) => renderDiffBody(repo, item)));
+    const rendered = await Promise.all(fresh.map((item) => renderDiffBody(work, item)));
     const diffs: string[] = [];
     for (let index = 0; index < fresh.length; index++) {
       const name = `${first + index}.diff`;
@@ -141,16 +144,20 @@ function conflictKey(conflict: FrozenConflict): string {
 }
 
 /**
- * Invalidate verified evidence when the current worktree tree hash differs
- * from the recorded one. Non-git repos never bind evidence, so they pass.
+ * Invalidate verified evidence when the working tree's hash differs from the
+ * recorded one. `repo` is the ledger; `workRoot` (default `repo`) is the tree
+ * being hashed. Non-git working trees never bind evidence, so they pass.
  */
-export async function recheckTree(repo: string, taskId: string, session: string): Promise<string | null> {
+export async function recheckTree(
+  repo: string, taskId: string, session: string, workRoot?: string,
+): Promise<string | null> {
   let reason: string | null = null;
+  const work = workRoot ?? repo;
   await updateState(repo, taskId, session, async (state) => {
     if (state.last_verified === null) return state;
     let tree: GitValue<string>;
     try {
-      tree = await treeHash(repo);
+      tree = await treeHash(work);
     } catch (error) {
       reason = `tree hash failed: ${error instanceof Error ? error.message : "unreadable"}`;
       return { ...state, last_verified: null, evidence_invalid_reason: reason };
@@ -194,6 +201,8 @@ export function isProtectedPath(
   }
   const joined = parts.join("/");
   if (joined === ".cw/project.toml") return true;
+  // M7 escalation reference: without it a worktree session loses its ledger.
+  if (joined === ".cw/task.json") return true;
   const prefix = `.cw/tasks/${taskId}/`;
   if (joined.startsWith(prefix) && joined !== `${prefix}notes.md`) return true;
   return contract.frozen.includes(joined) || contract.interface.includes(joined);

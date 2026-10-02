@@ -13,8 +13,9 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
-import { lstat, realpath } from "node:fs/promises";
-import { contractSha256, readContract } from "../../core/contract.js";
+import { lstat, realpath } from "node:fs/promises";import { contractSha256, readContract } from "../../core/contract.js";
+import { readReference } from "../../core/task.js";
+import { REFERENCE_FILE } from "../../core/escalate.js";
 import { recheckArtifacts } from "../../core/evidence.js";
 import { isProtectedPath, checkFrozen, recheckContract, recheckTree } from "../../core/freeze.js";
 import { decide, type GateInput } from "../../core/gate.js";
@@ -32,8 +33,7 @@ import {
   readState,
   updateState,
   type Approval,
-} from "../../core/task.js";
-import type { Contract, ProjectConfig } from "../../core/types.js";
+} from "../../core/task.js";import type { Contract, ProjectConfig } from "../../core/types.js";
 import { registerCommands } from "./commands.js";
 import { registerTools } from "./tools.js";
 
@@ -43,11 +43,17 @@ import { registerTools } from "./tools.js";
  * this adapter only translates Pi events into core calls and core results
  * into Pi returns. `contract` is the session-start snapshot used only for
  * cheap checks; the gate re-reads the authoritative contract.toml every time.
+ *
+ * `root` is the working tree (equal to the repo root normally; an escalation
+ * worktree for a session started there). `ledger` is the authoritative repo
+ * root holding `.cw/tasks/<id>/` — always the ledger the task writes to.
  */
 export interface ActiveTask {
   taskId: string;
-  /** Realpath of the repository root, resolved once at session start. */
+  /** Realpath of the working tree, resolved once at session start. */
   root: string;
+  /** Realpath of the authoritative repo root (`.cw/` ledger). */
+  ledger: string;
   session: string;
   contract: Contract;
   approval: Approval;
@@ -135,9 +141,13 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         // These writes only invalidate evidence, so they are never cancelled
         // mid-way: core state functions take no signal and finishing them is
         // the fail-safe direction.
-        await recheckTree(task.root, task.taskId, task.session);
-        await recheckArtifacts(task.root, task.taskId, task.session);
-        await recheckContract(task.root, task.taskId, task.session, task.contract);
+        await recheckTree(task.ledger, task.taskId, task.session, task.root);
+        await recheckArtifacts(task.ledger, task.taskId, task.session, task.root);
+        await recheckContract(task.ledger, task.taskId, task.session, task.contract);
+        // M7: the task's approved model is applied here, at adoption — the
+        // single place a session takes on a task. From the first turn on, the
+        // adapter never touches model, thinking level, tools, or prompts.
+        await applyTaskModel(pi, ctx, task);
         ctx.ui.notify(`Counterweight: 已接管任务 ${task.taskId}`, "info");
       }
       return undefined;
@@ -199,7 +209,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     const active = task;
     if (active === null) return undefined;
     if (event.outcome !== "completed") return undefined;
-    const { root: repo, taskId } = active;
+    const { root: work, ledger: repo, taskId } = active;
     const session = ctx.sessionManager.getSessionId();
 
     const controller = new AbortController();
@@ -222,23 +232,23 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       // external modification after session_start must not be judged against
       // the stale snapshot.
       const contract = await readContract(
-        path.join(active.root, ".cw", "tasks", taskId, "contract.toml"), active.root, taskId);
-      let state = await readState(repo, taskId);
+        path.join(active.ledger, ".cw", "tasks", taskId, "contract.toml"), active.ledger, taskId);
+      let state = await readState(active.ledger, taskId);
       if (state.status !== "approved" && state.status !== "running") return undefined;
       if (state.status === "approved") {
-        state = await updateState(repo, taskId, session, (current) => current.status === "approved"
+        state = await updateState(active.ledger, taskId, session, (current) => current.status === "approved"
           ? { ...current, status: "running", wall_started_at: current.wall_started_at ?? new Date().toISOString() }
           : current);
       }
 
-      const blocked = await readBlocked(repo, taskId);
-      const proposal = await findUnresolvedProposal(repo, taskId);
+      const blocked = await readBlocked(active.ledger, taskId);
+      const proposal = await findUnresolvedProposal(active.ledger, taskId);
       const contractDrift = contractSha256(contract) !== active.approval.contract_sha256
         ? `契约文件与批准版本不一致（.cw/tasks/${taskId}/contract.toml）`
         : null;
       // A contract that drifted from the verified version invalidates the
       // recorded evidence before anything else reads it.
-      await recheckContract(repo, taskId, session, contract);
+      await recheckContract(active.ledger, taskId, session, contract);
       const blockedReport = blocked?.reason
         ?? contractDrift
         ?? (proposal === null ? null : unresolvedProposalReason(taskId, proposal.n, proposal.field));
@@ -257,7 +267,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
             && Date.now() - Date.parse(state.wall_started_at) >= wallMinutes * 60_000,
           repairs,
         },
-        freezeConflicts: (await checkFrozen(repo, taskId, session, active.approval.frozen_blobs)).conflicts,
+        freezeConflicts: (await checkFrozen(repo, taskId, session, active.approval.frozen_blobs, work)).conflicts,
         logPath: "",
       };
 
@@ -265,6 +275,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       if (decision.kind === "validate") {
         const run = runValidator({
           repo,
+          workRoot: work,
           taskId,
           session,
           contract,
@@ -395,19 +406,19 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     }
     if (active === null || event.outcome !== "completed") return undefined;
     try {
-      const state = await readState(active.root, active.taskId);
+      const state = await readState(active.ledger, active.taskId);
       if (state.status !== "running" && state.status !== "approved") return undefined;
       // Re-read the authoritative contract; the session snapshot may be stale.
       const contract = await readContract(
-        path.join(active.root, ".cw", "tasks", active.taskId, "contract.toml"), active.root, active.taskId);
-      const material = await writeHandback(active.root, active.taskId, active.session, {
+        path.join(active.ledger, ".cw", "tasks", active.taskId, "contract.toml"), active.ledger, active.taskId);
+      const material = await writeHandback(active.ledger, active.taskId, active.session, {
         contract,
         validator: active.approval.validator,
         reason: "undetermined",
         questions: ["门禁处理超时或失败，本轮验证结论按无法判定处理"],
         autoVerified: false,
       });
-      await updateState(active.root, active.taskId, active.session, (current2) =>
+      await updateState(active.ledger, active.taskId, active.session, (current2) =>
         current2.status === "running" || current2.status === "approved"
           ? { ...current2, status: "handed_back" }
           : current2);
@@ -438,7 +449,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       // A timeout must not leave the usage account half-applied: each write
       // is only started while the handler is still inside its time budget.
       if (signal.aborted) return undefined;
-      await recordUsage(active.root, active.taskId, {
+      await recordUsage(active.ledger, active.taskId, {
         time: new Date().toISOString(),
         session,
         model: message.model,
@@ -452,7 +463,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       const total = usage.totalTokens > 0
         ? usage.totalTokens
         : usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-      await updateState(active.root, active.taskId, session, (current) => ({
+      await updateState(active.ledger, active.taskId, session, (current) => ({
         ...current,
         tokens_used: current.tokens_used + total,
       }));
@@ -506,11 +517,33 @@ async function locateTask(ctx: ExtensionContext): Promise<ActiveTask | null> {
   const repo = ctx.cwd;
   const session = ctx.sessionManager.getSessionId();
   const matches = await findSessionTasks(repo, session);
-  if (matches.length === 0) return null;
-  if (matches.length > 1) {
-    ctx.ui.notify(`Counterweight: 发现多个活动任务 ${matches.join(", ")}，接管最新的 ${matches.at(-1)}`, "warning");
+  if (matches.length > 0) {
+    if (matches.length > 1) {
+      ctx.ui.notify(`Counterweight: 发现多个活动任务 ${matches.join(", ")}，接管最新的 ${matches.at(-1)}`, "warning");
+    }
+    return loadTask(repo, repo, matches.at(-1)!, session);
   }
-  return loadTask(repo, matches.at(-1)!, session);
+  // M7 escalation worktree: the local `.cw/tasks` is empty; a `.cw/task.json`
+  // reference points at the authoritative ledger. Auto-takeover still
+  // requires this session to be registered in the ledger — a fresh session
+  // runs `/cw task resume` first.
+  return locateReferenceTask(repo, session);
+}
+
+async function locateReferenceTask(workRoot: string, session: string): Promise<ActiveTask | null> {
+  let reference;
+  try {
+    reference = await readReference(path.join(workRoot, REFERENCE_FILE));
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    // A corrupt reference must surface, never silently ungated the session.
+    throw error;
+  }
+  // reference.path = <ledger>/.cw/tasks/<taskId>; strip the three segments.
+  const ledger = path.resolve(reference.path, "..", "..", "..");
+  const state = await readState(ledger, reference.task_id);
+  if (!state.sessions.includes(session)) return null;
+  return loadTask(workRoot, ledger, reference.task_id, session);
 }
 
 /**
@@ -519,12 +552,43 @@ async function locateTask(ctx: ExtensionContext): Promise<ActiveTask | null> {
  * piece is missing or malformed — callers surface that as an error, never as
  * a silently ungated session.
  */
-export async function loadTask(repo: string, taskId: string, session: string): Promise<ActiveTask> {
-  const root = await realpath(repo);
-  const contract = await readContract(path.join(root, ".cw", "tasks", taskId, "contract.toml"), root, taskId);
-  const approval = await readApproval(root, taskId);
-  const project = await readProjectConfig(path.join(root, ".cw", "project.toml"));
-  return { taskId, root, session, contract, approval, project };
+export async function loadTask(
+  workRoot: string, ledger: string, taskId: string, session: string,
+): Promise<ActiveTask> {
+  const root = await realpath(workRoot);
+  const contract = await readContract(path.join(ledger, ".cw", "tasks", taskId, "contract.toml"), ledger, taskId);
+  const approval = await readApproval(ledger, taskId);
+  const project = await readProjectConfig(path.join(ledger, ".cw", "project.toml"));
+  return { taskId, root, ledger, session, contract, approval, project };
+}
+
+/**
+ * Apply the task's approved model (`state.model`) to this session. Called
+ * only at adoption points — session takeover, approval, resume, escalation —
+ * never mid-task. Failures are reported, never faked: an unresolvable model
+ * name or missing provider auth leaves the session's model unchanged and says
+ * so. Skips silently when state.model is the pre-M7 placeholder or the host
+ * exposes no registry (older fakes/tests).
+ */
+export async function applyTaskModel(pi: ExtensionAPI, ctx: ExtensionContext, task: ActiveTask): Promise<void> {
+  const state = await readState(task.ledger, task.taskId);
+  const model = state.model;
+  if (model === "unassigned") return;
+  const split = model.indexOf("/");
+  if (split <= 0) {
+    ctx.ui.notify(`Counterweight: state.model 不是 provider/model 形式（${model}），未设置`, "warning");
+    return;
+  }
+  if (typeof pi.setModel !== "function") return;
+  const found = ctx.modelRegistry?.find(model.slice(0, split), model.slice(split + 1));
+  if (found === undefined) {
+    ctx.ui.notify(`Counterweight: 模型 ${model} 不在模型注册表中，未设置`, "error");
+    return;
+  }
+  const applied = await pi.setModel(found);
+  if (!applied) {
+    ctx.ui.notify(`Counterweight: 模型 ${model} 的 provider 未配置认证，模型未切换`, "warning");
+  }
 }
 
 function unresolvedProposalReason(taskId: string, n: number, field: string): string {
