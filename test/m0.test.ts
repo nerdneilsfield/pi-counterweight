@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 
 test("真实锁定 Pi 通过 RPC 加载扩展并执行 cw-version，无模型请求", async () => {
@@ -33,7 +34,7 @@ test("真实锁定 Pi 通过 RPC 加载扩展并执行 cw-version，无模型请
       });
       child.stdin.write(`${JSON.stringify({ id: "version", type: "prompt", message: "/cw-version" })}\n`);
     });
-    expect(result).toBe("Counterweight: pi 0.99.1");
+    expect(result).toBe(`Counterweight: pi ${VERSION}`);
   } finally {
     lines.close();
     child.kill("SIGTERM");

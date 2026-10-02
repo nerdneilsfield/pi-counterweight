@@ -2,7 +2,7 @@
 
 Counterweight 的 Pi 扩展工程。当前实现 M0–M6：版本命令、网关缓存探针、`project.toml` / `contract.toml` 校验、任务目录与 Git 树快照、验证器运行与验收证据判定、冻结文件保护、门禁决策与交还材料、Pi 事件适配层（门禁接线、工具注册、计量），以及 `/cw` 命令流程与契约先红批准。
 
-需要 Node.js `>=22.19.0`。Pi 固定为 `0.99.1`。
+需要 Node.js `>=22.19.0`。Pi 固定为 `1.0.0`。
 
 ```sh
 npm ci
@@ -12,7 +12,7 @@ npm run build
 ./node_modules/.bin/pi --extension ./src/adapters/pi/index.ts
 ```
 
-在 Pi 中执行 `/cw-version`，预期通知为 `Counterweight: pi 0.99.1`。`npm test` 使用真实 Pi RPC 验证该命令，不需要模型凭据；缓存探针测试只访问本机伪网关。
+在 Pi 中执行 `/cw-version`，预期通知为 `Counterweight: pi 1.0.0`。`npm test` 使用真实 Pi RPC 验证该命令，不需要模型凭据；缓存探针测试只访问本机伪网关。
 
 扩展加载后，对状态为 `approved`/`running` 且登记了当前会话 ID 的任务（`.cw/tasks/<id>/state.json`）生效：
 
