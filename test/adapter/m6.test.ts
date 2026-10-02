@@ -816,3 +816,41 @@ test("批准期间取消：哈希窗口内取消中止批准，锁定写入前�
   const worktrees = await git(repo, ["worktree", "list", "--porcelain"]);
   expect(worktrees.split("worktree ").length - 1).toBe(1);
 }, 60_000);
+
+test("确认悬挂时 session_shutdown：批准流程收敛，迟到的确认结果不作数", async () => {
+  const { repo } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true, confirmGate: gate });
+  const ctx = context.ctx;
+  await runCmd(fake, `task new ${slug}`, ctx);
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({}));
+
+  const approving = runCmd(fake, "task approve", ctx);
+  const deadline = Date.now() + 10_000;
+  while (context.confirms.length === 0 && Date.now() < deadline) {
+    await delay(5);
+  }
+  expect(context.confirms.length).toBe(1);
+
+  // 确认悬挂时 shutdown：stopValidation 中止 controller，批准流程解除阻塞并收敛，
+  // shutdown 不被永久卡住。
+  const shutting = fake.call("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+  await delay(20);
+  await approving;
+  await shutting;
+  expect((await readState(repo, taskId)).status).toBe("drafting");
+
+  // 用户此后才回答确认框（resolve true）：迟到的结果不得当作批准。
+  release();
+  await delay(30);
+  await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"))
+    .rejects.toThrow();
+  expect((await readState(repo, taskId)).status).toBe("drafting");
+  expect(fake.sent).toHaveLength(0);
+  expect(context.notifications.map((item) => item.message).join("\n")).toContain("用户已取消");
+  const worktrees = await git(repo, ["worktree", "list", "--porcelain"]);
+  expect(worktrees.split("worktree ").length - 1).toBe(1);
+}, 30_000);

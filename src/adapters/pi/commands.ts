@@ -216,15 +216,20 @@ async function taskApprove(
         );
         return;
       }
-      const confirmed = await ctx.ui.confirm(
+      // The signal both dismisses the dialog natively and races the wait; the
+      // original dialog value is never treated as approval once cancelled.
+      const redFailures = red.redFailures;
+      const overlayInputs = red.baselineInputs;
+      const confirmed = await confirmCancellable(controller.signal, () => ctx.ui.confirm(
         "Counterweight 先红确认",
-        renderRedConfirmation(contract, red.redFailures, red.baselineInputs),
-      );
+        renderRedConfirmation(contract, redFailures, overlayInputs),
+        { signal: controller.signal },
+      ));
       if (controller.signal.aborted) {
         ctx.ui.notify("Counterweight: 用户已取消，拒绝批准；未写入任何批准记录。", "warning");
         return;
       }
-      if (!confirmed) {
+      if (confirmed !== true) {
         ctx.ui.notify("Counterweight: 用户未确认先红失败原因与任务相符，拒绝批准；契约保持可修改。", "warning");
         return;
       }
@@ -285,6 +290,33 @@ async function taskApprove(
   } finally {
     registration.setValidation(null);
     releaseDone();
+  }
+}
+
+/** The confirmation wait was cut short by cancellation, not answered by the user. */
+const CONFIRM_CANCELLED = Symbol("cw-confirm-cancelled");
+
+/**
+ * Wait for the user's confirmation, cancellable via `signal`. The signal is
+ * passed to the dialog (Pi 1.0 dismisses it natively) and the dialog promise
+ * is additionally raced against the signal, so the approval flow unblocks even
+ * when a host mode never resolves a dismissed dialog. The dialog promise is
+ * drained (errors count as "not confirmed") — never an unhandled rejection —
+ * and the abort listener is always removed.
+ */
+async function confirmCancellable(
+  signal: AbortSignal, confirm: () => Promise<boolean>,
+): Promise<boolean | typeof CONFIRM_CANCELLED> {
+  if (signal.aborted) return CONFIRM_CANCELLED;
+  let onAbort!: () => void;
+  const cancelledPromise = new Promise<typeof CONFIRM_CANCELLED>((resolve) => { onAbort = () => resolve(CONFIRM_CANCELLED); });
+  const listener = () => { onAbort(); };
+  signal.addEventListener("abort", listener, { once: true });
+  try {
+    const dialog: Promise<boolean | typeof CONFIRM_CANCELLED> = confirm().catch(() => false);
+    return await Promise.race([dialog, cancelledPromise]);
+  } finally {
+    signal.removeEventListener("abort", listener);
   }
 }
 
