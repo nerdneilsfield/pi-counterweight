@@ -762,10 +762,12 @@ test("批准期间取消：确认对话框等待时 /cw task cancel → 批准�
   }
   expect(context.confirms.length).toBe(1);
 
-  // 确认等待期间取消：验证槽中的批准 controller 被中止。
-  await runCmd(fake, "task cancel", ctx);
+  // 确认等待期间取消：cancel 的 stopValidation 同步中止批准 controller，
+  // 然后等待整个批准流程自行收敛（不会写入任何记录）。
+  const cancelling = runCmd(fake, "task cancel", ctx);
+  await delay(20);
   release();
-  await approving;
+  await Promise.all([cancelling, approving]);
 
   expect(lastNotify(context.notifications)).toContain("取消");
   await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"))
@@ -775,3 +777,42 @@ test("批准期间取消：确认对话框等待时 /cw task cancel → 批准�
   const worktrees = await git(repo, ["worktree", "list", "--porcelain"]);
   expect(worktrees.split("worktree ").length - 1).toBe(1);
 }, 30_000);
+
+test("批准期间取消：哈希窗口内取消中止批准，锁定写入前被拦截", async () => {
+  const { repo } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true, confirmGate: gate });
+  const ctx = context.ctx;
+  await runCmd(fake, `task new ${slug}`, ctx);
+  // 300 个冻结文件拉长确认之后的哈希窗口（每个 blobHash 一次 git 调用）。
+  const frozen: string[] = [];
+  await mkdir(path.join(repo, "frozen"), { recursive: true });
+  for (let index = 0; index < 300; index++) {
+    const relative = `frozen/f${index}.txt`;
+    await writeFile(path.join(repo, relative), `frozen ${index}\n`);
+    frozen.push(relative);
+  }
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"),
+    contractToml({ frozen }));
+
+  const approving = runCmd(fake, "task approve", ctx);
+  const deadline = Date.now() + 10_000;
+  while (context.confirms.length === 0 && Date.now() < deadline) {
+    await delay(5);
+  }
+  release();
+  // 确认一放行，approve 进入哈希窗口；cancel 立即中止 controller 并等待流程收敛。
+  await runCmd(fake, "task cancel", ctx);
+  await approving;
+
+  expect(context.notifications.map((item) => item.message).join("\n")).toContain("用户已取消");
+  await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"))
+    .rejects.toThrow();
+  expect((await readState(repo, taskId)).status).toBe("cancelled");
+  expect(fake.sent).toHaveLength(0);
+  const worktrees = await git(repo, ["worktree", "list", "--porcelain"]);
+  expect(worktrees.split("worktree ").length - 1).toBe(1);
+}, 60_000);

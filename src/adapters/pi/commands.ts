@@ -164,24 +164,23 @@ async function taskApprove(
   const validator = project.validator;
   const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId);
 
-  // The approval's controller stays registered in the validation slot for the
-  // whole command: `/cw task cancel` and session shutdown abort it at any
-  // point — mid-run, during the confirmation dialog, or while hashing — and
-  // every stage below re-checks it before publishing anything.
+  // The approval's controller stays registered in the validation slot until
+  // the whole flow commits or unwinds: `/cw task cancel` and session shutdown
+  // abort it in every window — red check, hashing, confirmation dialog, the
+  // locked approval write — and each stage re-checks it before publishing
+  // anything. `done` resolves only when the command finishes, so a cancel
+  // waits for this unwind before flipping the task state.
   const controller = new AbortController();
-  const handle: ValidationHandle = {
-    controller,
-    done: Promise.resolve(),
-  };
-  let red: Awaited<ReturnType<typeof runRedCheck>> | null = null;
-  if (contract.deliverable === "code") {
-    const run = runRedCheck({
-      repo, taskId, session, contract, validator, baseCommit: state.base_commit,
-      signal: controller.signal,
-    });
-    handle.done = run.then(() => undefined, () => undefined);
-    registration.setValidation(handle);
-    try {
+  let releaseDone!: () => void;
+  const done = new Promise<void>((resolve) => { releaseDone = resolve; });
+  registration.setValidation({ controller, done });
+  try {
+    let red: Awaited<ReturnType<typeof runRedCheck>> | null = null;
+    if (contract.deliverable === "code") {
+      const run = runRedCheck({
+        repo, taskId, session, contract, validator, baseCommit: state.base_commit,
+        signal: controller.signal,
+      });
       try {
         red = await run;
       } catch (error) {
@@ -229,53 +228,64 @@ async function taskApprove(
         ctx.ui.notify("Counterweight: 用户未确认先红失败原因与任务相符，拒绝批准；契约保持可修改。", "warning");
         return;
       }
-    } finally {
-      registration.setValidation(null);
     }
-  }
 
-  const baselineInputs: string[] = red !== null ? red.baselineInputs : contract.baseline_inputs;
-  const inputHashes: Record<string, string> = {};
-  for (const input of baselineInputs) {
-    const hash = red !== null ? red.inputHashes[input]! : await contentSha256(repo, input);
-    if (hash === undefined || hash === null) {
-      ctx.ui.notify(`Counterweight: 基线验收输入缺失，拒绝批准：${input}`, "error");
+    const baselineInputs: string[] = red !== null ? red.baselineInputs : contract.baseline_inputs;
+    const inputHashes: Record<string, string> = {};
+    for (const input of baselineInputs) {
+      const hash = red !== null ? red.inputHashes[input]! : await contentSha256(repo, input);
+      if (hash === undefined || hash === null) {
+        ctx.ui.notify(`Counterweight: 基线验收输入缺失，拒绝批准：${input}`, "error");
+        return;
+      }
+      inputHashes[input] = hash;
+    }
+    const frozenBlobs: Record<string, string> = {};
+    for (const file of contract.frozen) {
+      const blob = await blobHash(repo, file);
+      if (!blob.supported) {
+        ctx.ui.notify("Counterweight: 非 git 仓库无法冻结文件，拒绝批准", "error");
+        return;
+      }
+      if (blob.value === null) {
+        ctx.ui.notify(`Counterweight: 冻结文件缺失，拒绝批准：${file}`, "error");
+        return;
+      }
+      frozenBlobs[file] = blob.value;
+    }
+    if (controller.signal.aborted) {
+      ctx.ui.notify("Counterweight: 用户已取消，拒绝批准；未写入任何批准记录。", "warning");
       return;
     }
-    inputHashes[input] = hash;
-  }
-  const frozenBlobs: Record<string, string> = {};
-  for (const file of contract.frozen) {
-    const blob = await blobHash(repo, file);
-    if (!blob.supported) {
-      ctx.ui.notify("Counterweight: 非 git 仓库无法冻结文件，拒绝批准", "error");
+    const approval: Approval = {
+      version: 1,
+      contract_sha256: contractSha256(contract),
+      project_config_sha256: canonicalSha256(project),
+      validator,
+      base_commit: state.base_commit,
+      baseline_inputs_sha256: inputHashes,
+      frozen_blobs: frozenBlobs,
+      red_check_run: red !== null ? red.run : 0,
+      approved_at: new Date().toISOString(),
+    };
+    // The lock re-checks cancellation before and after the record write, so a
+    // cancel in this window leaves no approval file and no proposal
+    // consumption.
+    await writeApproval(repo, taskId, session, approval, contract, () => controller.signal.aborted);
+    if (controller.signal.aborted) {
+      // The commit landed but a cancel is already pending: the cancel command
+      // (waiting on this flow) will converge the state; skip session takeover
+      // and the task view.
+      ctx.ui.notify("Counterweight: 批准记录已写入，但任务随即被取消；任务视图未附加。", "warning");
       return;
     }
-    if (blob.value === null) {
-      ctx.ui.notify(`Counterweight: 冻结文件缺失，拒绝批准：${file}`, "error");
-      return;
-    }
-    frozenBlobs[file] = blob.value;
+    registration.setTask(await loadTask(repo, taskId, session));
+    await appendTaskView(pi, ctx, contract, approval);
+    ctx.ui.notify(`Counterweight: 任务 ${taskId} 已批准，任务视图已追加到会话。`, "info");
+  } finally {
+    registration.setValidation(null);
+    releaseDone();
   }
-  if (controller.signal.aborted) {
-    ctx.ui.notify("Counterweight: 用户已取消，拒绝批准；未写入任何批准记录。", "warning");
-    return;
-  }
-  const approval: Approval = {
-    version: 1,
-    contract_sha256: contractSha256(contract),
-    project_config_sha256: canonicalSha256(project),
-    validator,
-    base_commit: state.base_commit,
-    baseline_inputs_sha256: inputHashes,
-    frozen_blobs: frozenBlobs,
-    red_check_run: red !== null ? red.run : 0,
-    approved_at: new Date().toISOString(),
-  };
-  await writeApproval(repo, taskId, session, approval, contract);
-  registration.setTask(await loadTask(repo, taskId, session));
-  await appendTaskView(pi, ctx, contract, approval);
-  ctx.ui.notify(`Counterweight: 任务 ${taskId} 已批准，任务视图已追加到会话。`, "info");
 }
 
 function renderRedConfirmation(

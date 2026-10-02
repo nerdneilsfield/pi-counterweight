@@ -413,14 +413,17 @@ export async function readApproval(repo: string, taskId: string): Promise<Approv
  */
 export async function writeApproval(
   repo: string, taskId: string, session: string, approval: Approval, contract: Contract,
+  isCancelled?: () => boolean,
 ): Promise<TaskState> {
   assertTaskId(taskId);
+  const cancelled = (): Error => new Error("approve: 用户已取消，拒绝批准");
   return withTaskLock(repo, taskId, session, async () => {
     const dir = await existingTaskDir(repo, taskId);
     const state = await readState(repo, taskId);
     if (state.status !== "drafting" && state.status !== "handed_back") {
       throw new Error(`approve: task status is ${state.status}, not drafting/handed_back`);
     }
+    if (isCancelled?.()) throw cancelled();
     // The approval must describe exactly the contract currently on disk; a
     // file edited between the red check and this write refuses the approval.
     const fresh = await readContract(path.join(dir, "contract.toml"), repo, taskId);
@@ -443,7 +446,14 @@ export async function writeApproval(
     rejectUnknown(approvalSchema, approval, "approval.json");
     const file = path.join(dir, "approval.json");
     await rejectUnexpected(file, "approval.json");
+    if (isCancelled?.()) throw cancelled();
     await atomicWrite(file, `${JSON.stringify(approval, null, 2)}\n`);
+    if (isCancelled?.()) {
+      // The cancel landed between the record write and the state transition:
+      // remove the record this call just wrote so nothing partial survives.
+      await rm(file, { force: true });
+      throw cancelled();
+    }
     const sessions = state.sessions.includes(session) ? state.sessions : [...state.sessions, session];
     const next: TaskState = { ...state, status: "approved", sessions };
     await putState(dir, taskId, next);

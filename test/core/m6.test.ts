@@ -577,3 +577,24 @@ test("redcheck 迟到取消：证据判定期间取消 → valid=false，记录�
   const text = await git(repo, ["worktree", "list", "--porcelain"]);
   expect(text.split("worktree ").length - 1).toBe(1);
 }, 30_000);
+
+test("writeApproval 取消感知：锁内检查取消，不写任何记录", async () => {
+  const { repo, base, contract } = await setup();
+  const approval = approvalOfReal(contract, base);
+  const approvalFile = path.join(repo, ".cw", "tasks", taskId, "approval.json");
+
+  // 窗口一：取消先于锁定写入（进入锁体即已取消）→ 立即拒绝，零写入。
+  const pending = writeApproval(repo, taskId, "sA", approval, contract, () => true);
+  await expect(pending).rejects.toThrow(/用户已取消/);
+  await expect(readFile(approvalFile, "utf8")).rejects.toThrow();
+  expect((await readState(repo, taskId)).status).toBe("drafting");
+
+  // 窗口二：记录写入后、状态迁移前取消 → 刚写入的记录被撤除，状态不变。
+  // 检查点顺序：锁内开始（1，未取消）、写入前（2，未取消）、写入后（3，取消）。
+  let calls = 0;
+  const gated = writeApproval(repo, taskId, "sA", approval, contract, () => calls++ >= 2);
+  await expect(gated).rejects.toThrow(/用户已取消/);
+  await expect(readFile(approvalFile, "utf8")).rejects.toThrow();
+  expect((await readState(repo, taskId)).status).toBe("drafting");
+  expect(calls).toBe(3);
+});
