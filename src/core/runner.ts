@@ -56,68 +56,74 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       stderrPath: path.join(dir, "stderr.log"),
       signal: request.signal,
     });
-    const after = await snapshot(request.repo, request.contract.baseline_inputs);
-    const discard = discardReason(outcome);
-    const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(request.repo, dir);
-    const recordError = [before.error, after.error, artifacts.error]
-      .filter((item): item is string => item !== null)
-      .join("; ") || null;
-    let record: RunRecord = {
-      version: 1,
-      run,
-      started_at: started,
-      ended_at: new Date().toISOString(),
-      exit_code: outcome.exitCode,
-      term_signal: outcome.signal,
-      timed_out: outcome.timedOut,
-      cancelled: outcome.cancelled,
-      result_discarded: discard !== null,
-      runner_error: outcome.runnerError,
-      record_error: recordError,
-      git: before.git,
-      tree_before: before.tree,
-      tree_after: after.tree,
-      input_hashes_before: before.inputs,
-      input_hashes_after: after.inputs,
-      artifact_hashes: artifacts.hashes,
-    };
-    await writeRunRecord(path.join(dir, "run.json"), record);
-    let verdict: Verdict;
-    if (discard !== null) {
-      verdict = { conclusion: "undetermined", reasons: [discard] };
-    } else {
-      verdict = await judgeEvidence(request.repo, dir, request.contract, request.approvedInputHashes);
-    }
-    // A cancel that arrives while the verdict is being judged still discards
-    // the result: no last_verified may be published after cancellation.
-    if (discard === null && outcome.cancelled) {
-      verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
-      record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
+    try {
+      const after = await snapshot(request.repo, request.contract.baseline_inputs);
+      const discard = discardReason(outcome);
+      const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(request.repo, dir);
+      const recordError = [before.error, after.error, artifacts.error]
+        .filter((item): item is string => item !== null)
+        .join("; ") || null;
+      let record: RunRecord = {
+        version: 1,
+        run,
+        started_at: started,
+        ended_at: new Date().toISOString(),
+        exit_code: outcome.exitCode,
+        term_signal: outcome.signal,
+        timed_out: outcome.timedOut,
+        cancelled: outcome.cancelled,
+        result_discarded: discard !== null,
+        runner_error: outcome.runnerError,
+        record_error: recordError,
+        git: before.git,
+        tree_before: before.tree,
+        tree_after: after.tree,
+        input_hashes_before: before.inputs,
+        input_hashes_after: after.inputs,
+        artifact_hashes: artifacts.hashes,
+      };
       await writeRunRecord(path.join(dir, "run.json"), record);
-    }
-    let lastVerified: LastVerified | null = null;
-    if (verdict.conclusion === "pass" && !outcome.cancelled) {
-      lastVerified = await recordVerification(request, run, record, verdict, outcome);
-      if (lastVerified !== null && outcome.cancelled) {
-        // The cancel landed between the pre-write check and the atomic
-        // rename (or just after it): revoke exactly this run's record. An
-        // older verification belonging to another run is left untouched.
-        // The task lock is already held by runValidator, so the revocation
-        // must not take it again.
-        await revokeRunVerification(request.repo, request.taskId, request.session, run);
-        lastVerified = null;
+      let verdict: Verdict;
+      if (discard !== null) {
+        verdict = { conclusion: "undetermined", reasons: [discard] };
+      } else {
+        verdict = await judgeEvidence(request.repo, dir, request.contract, request.approvedInputHashes);
+      }
+      // A cancel that arrives while the verdict is being judged still discards
+      // the result: no last_verified may be published after cancellation.
+      // `outcome.cancelled` stays live until dispose, so this covers cancels
+      // landing after the validator exited but before publication.
+      if (discard === null && outcome.cancelled) {
         verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
         record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
         await writeRunRecord(path.join(dir, "run.json"), record);
       }
-      if (lastVerified === null && outcome.cancelled) {
-        verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
-        record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
-        await writeRunRecord(path.join(dir, "run.json"), record);
+      let lastVerified: LastVerified | null = null;
+      if (verdict.conclusion === "pass" && !outcome.cancelled) {
+        lastVerified = await recordVerification(request, run, record, verdict, outcome);
+        if (lastVerified !== null && outcome.cancelled) {
+          // The cancel landed between the pre-write check and the atomic
+          // rename (or just after it): revoke exactly this run's record. An
+          // older verification belonging to another run is left untouched.
+          // The task lock is already held by runValidator, so the revocation
+          // must not take it again.
+          await revokeRunVerification(request.repo, request.taskId, request.session, run);
+          lastVerified = null;
+          verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
+          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
+          await writeRunRecord(path.join(dir, "run.json"), record);
+        }
+        if (lastVerified === null && outcome.cancelled) {
+          verdict = { conclusion: "undetermined", reasons: ["cancelled"] };
+          record = { ...record, cancelled: true, result_discarded: true, artifact_hashes: emptyHashes() };
+          await writeRunRecord(path.join(dir, "run.json"), record);
+        }
       }
+      const failures = verdict.conclusion === "fail" ? await failureChecks(dir, request.contract) : [];
+      return { run, dir, record, verdict, lastVerified, failures };
+    } finally {
+      outcome.dispose();
     }
-    const failures = verdict.conclusion === "fail" ? await failureChecks(dir, request.contract) : [];
-    return { run, dir, record, verdict, lastVerified, failures };
   });
 }
 
@@ -125,9 +131,12 @@ export interface ProcessRun {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
-  cancelled: boolean;
+  /** Live: stays true-tracking until `dispose` for cancels landing after exit. */
+  readonly cancelled: boolean;
   /** Set when the process never started (spawn failure or empty command). */
   runnerError: string | null;
+  /** Release the parent-signal listener once the caller stops reading `cancelled`. */
+  dispose(): void;
 }
 
 /**
@@ -171,13 +180,19 @@ export async function runValidatorProcess(options: {
     await stderr.close();
   }
   const stop = watch ? await stopGroup(watch, abort) : { exitCode: null, signal: null };
-  abort.dispose();
+  // The timeout is decided once the group is gone, but the parent-signal
+  // listener must survive the return: a cancel landing while the caller
+  // snapshots, judges, and publishes evidence has to stay visible through
+  // `cancelled`. The caller releases the listener via `dispose` when it stops
+  // reading it.
+  abort.cancelTimer();
   return {
     exitCode: runnerError === null ? stop.exitCode : null,
     signal: stop.signal,
     timedOut: abort.timedOut,
-    cancelled: abort.cancelled,
+    get cancelled() { return abort.cancelled; },
     runnerError,
+    dispose: () => abort.dispose(),
   };
 }
 
@@ -348,6 +363,7 @@ function linkAbort(parent: AbortSignal | undefined, timeoutMs: number): {
   signal: AbortSignal;
   cancelled: boolean;
   timedOut: boolean;
+  cancelTimer: () => void;
   dispose: () => void;
 } {
   const controller = new AbortController();
@@ -368,6 +384,7 @@ function linkAbort(parent: AbortSignal | undefined, timeoutMs: number): {
     signal: controller.signal,
     get cancelled() { return state.cancelled; },
     get timedOut() { return state.timedOut; },
+    cancelTimer() { clearTimeout(timer); },
     dispose() {
       clearTimeout(timer);
       parent?.removeEventListener("abort", onParent);

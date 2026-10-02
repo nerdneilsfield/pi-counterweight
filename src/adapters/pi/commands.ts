@@ -164,48 +164,73 @@ async function taskApprove(
   const validator = project.validator;
   const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId);
 
+  // The approval's controller stays registered in the validation slot for the
+  // whole command: `/cw task cancel` and session shutdown abort it at any
+  // point — mid-run, during the confirmation dialog, or while hashing — and
+  // every stage below re-checks it before publishing anything.
+  const controller = new AbortController();
+  const handle: ValidationHandle = {
+    controller,
+    done: Promise.resolve(),
+  };
   let red: Awaited<ReturnType<typeof runRedCheck>> | null = null;
   if (contract.deliverable === "code") {
+    const run = runRedCheck({
+      repo, taskId, session, contract, validator, baseCommit: state.base_commit,
+      signal: controller.signal,
+    });
+    handle.done = run.then(() => undefined, () => undefined);
+    registration.setValidation(handle);
     try {
-      red = await trackedRedCheck(registration, {
-        repo, taskId, session, contract, validator, baseCommit: state.base_commit,
-      });
-    } catch (error) {
-      if (error instanceof CannotIsolateError) {
-        ctx.ui.notify(`Counterweight: 无法隔离验收输入与实现，拒绝批准：${error.message}`, "error");
+      try {
+        red = await run;
+      } catch (error) {
+        if (error instanceof CannotIsolateError) {
+          ctx.ui.notify(`Counterweight: 无法隔离验收输入与实现，拒绝批准：${error.message}`, "error");
+          return;
+        }
+        throw error;
+      }
+      if (controller.signal.aborted) {
+        ctx.ui.notify("Counterweight: 用户已取消，拒绝批准；未写入任何批准记录。", "warning");
         return;
       }
-      throw error;
-    }
-    if (!red.valid) {
-      ctx.ui.notify(
-        `Counterweight: 先红检查运行无效（undetermined），拒绝批准：${red.validityReasons.join("；")}`,
-        "error",
+      if (!red.valid) {
+        ctx.ui.notify(
+          `Counterweight: 先红检查运行无效（undetermined），拒绝批准：${red.validityReasons.join("；")}`,
+          "error",
+        );
+        return;
+      }
+      if (!red.red.ok) {
+        ctx.ui.notify(
+          `Counterweight: 先红判定未通过，拒绝批准：${red.red.reasons.join("；")}`,
+          "error",
+        );
+        return;
+      }
+      if (!ctx.hasUI) {
+        ctx.ui.notify(
+          "Counterweight: 当前无交互界面，无法确认先红失败原因，拒绝批准。"
+          + "请在交互模式（TUI 或 RPC）下执行 /cw task approve。",
+          "error",
+        );
+        return;
+      }
+      const confirmed = await ctx.ui.confirm(
+        "Counterweight 先红确认",
+        renderRedConfirmation(contract, red.redFailures, red.baselineInputs),
       );
-      return;
-    }
-    if (!red.red.ok) {
-      ctx.ui.notify(
-        `Counterweight: 先红判定未通过，拒绝批准：${red.red.reasons.join("；")}`,
-        "error",
-      );
-      return;
-    }
-    if (!ctx.hasUI) {
-      ctx.ui.notify(
-        "Counterweight: 当前无交互界面，无法确认先红失败原因，拒绝批准。"
-        + "请在交互模式（TUI 或 RPC）下执行 /cw task approve。",
-        "error",
-      );
-      return;
-    }
-    const confirmed = await ctx.ui.confirm(
-      "Counterweight 先红确认",
-      renderRedConfirmation(contract, red.redFailures, red.baselineInputs),
-    );
-    if (!confirmed) {
-      ctx.ui.notify("Counterweight: 用户未确认先红失败原因与任务相符，拒绝批准；契约保持可修改。", "warning");
-      return;
+      if (controller.signal.aborted) {
+        ctx.ui.notify("Counterweight: 用户已取消，拒绝批准；未写入任何批准记录。", "warning");
+        return;
+      }
+      if (!confirmed) {
+        ctx.ui.notify("Counterweight: 用户未确认先红失败原因与任务相符，拒绝批准；契约保持可修改。", "warning");
+        return;
+      }
+    } finally {
+      registration.setValidation(null);
     }
   }
 
@@ -232,6 +257,10 @@ async function taskApprove(
     }
     frozenBlobs[file] = blob.value;
   }
+  if (controller.signal.aborted) {
+    ctx.ui.notify("Counterweight: 用户已取消，拒绝批准；未写入任何批准记录。", "warning");
+    return;
+  }
   const approval: Approval = {
     version: 1,
     contract_sha256: contractSha256(contract),
@@ -243,30 +272,10 @@ async function taskApprove(
     red_check_run: red !== null ? red.run : 0,
     approved_at: new Date().toISOString(),
   };
-  await writeApproval(repo, taskId, session, approval);
+  await writeApproval(repo, taskId, session, approval, contract);
   registration.setTask(await loadTask(repo, taskId, session));
   await appendTaskView(pi, ctx, contract, approval);
   ctx.ui.notify(`Counterweight: 任务 ${taskId} 已批准，任务视图已追加到会话。`, "info");
-}
-
-/**
- * Run the red check with its validator registered in the adapter's validation
- * slot, so session shutdown and `/cw task cancel` terminate the process group
- * exactly like a gate validation.
- */
-async function trackedRedCheck(
-  registration: CommandRegistration,
-  request: Parameters<typeof runRedCheck>[0],
-): Promise<ReturnType<typeof runRedCheck>> {
-  const controller = new AbortController();
-  const run = runRedCheck({ ...request, signal: controller.signal });
-  const handle: ValidationHandle = { controller, done: run.then(() => undefined, () => undefined) };
-  registration.setValidation(handle);
-  try {
-    return await run;
-  } finally {
-    registration.setValidation(null);
-  }
 }
 
 function renderRedConfirmation(

@@ -63,7 +63,10 @@ function fakePi(): {
   };
 }
 
-function fakeCtx(repo: string, options: { hasUI?: boolean; confirmResult?: boolean; session?: string } = {}) {
+function fakeCtx(
+  repo: string,
+  options: { hasUI?: boolean; confirmResult?: boolean; session?: string; confirmGate?: Promise<void> } = {},
+) {
   const notifications: Array<{ message: string; type?: string }> = [];
   const confirms: Array<string> = [];
   let waitForIdleCalls = 0;
@@ -77,6 +80,7 @@ function fakeCtx(repo: string, options: { hasUI?: boolean; confirmResult?: boole
       },
       confirm: async (title: string, message: string) => {
         confirms.push(`${title}: ${message}`);
+        if (options.confirmGate !== undefined) await options.confirmGate;
         return options.confirmResult ?? false;
       },
     },
@@ -592,12 +596,24 @@ test("批准的提议：重批前 gate 阻塞交还，重批原子消费后 gate
   expect((await readdir(runsDir)).sort()).toEqual(["1"]);
   expect((await readState(repo, taskId)).status).toBe("handed_back");
 
-  // 用户修订契约并重新批准：提议被原子消费并绑定新契约版本。
+  // 契约未采纳提议（goal 改成了别的值）：重批被拒，提议不消费，批准记录保持第一轮。
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"),
+    contractToml({ goal: "different" }));
+  await runCmd(fake, "task approve", ctx);
+  expect(lastNotify(context.notifications)).toContain("未在当前契约采纳");
+  const untouched = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "proposals", "1.json"), "utf8"));
+  expect(untouched.status).toBe("approved");
+  const onDisk = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"));
+  expect(onDisk.red_check_run).toBe(1);
+  // 用户把契约改到与提议一致：重批成功，提议被原子消费并绑定新契约版本。
   await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"),
     contractToml({ goal: "changed" }));
   await runCmd(fake, "task approve", ctx);
   const approval = JSON.parse(
     await readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"));
+  expect(approval.red_check_run).toBe(3);
   const proposal = JSON.parse(
     await readFile(path.join(repo, ".cw", "tasks", taskId, "proposals", "1.json"), "utf8"));
   expect(proposal.status).toBe("consumed");
@@ -610,7 +626,7 @@ test("批准的提议：重批前 gate 阻塞交还，重批原子消费后 gate
   const message2 = (settled2?.entries ?? []).map((entry: any) =>
     typeof entry?.content === "string" ? entry.content : "").join("\n");
   expect(message2).toContain("验收未通过");
-  expect((await readdir(runsDir)).sort()).toEqual(["1", "2", "3"]);
+  expect((await readdir(runsDir)).sort()).toEqual(["1", "2", "3", "4"]);
 
   // 后来产生的 pending 提议不被清除，继续阻塞；已消费提议保持消费态。
   await writeProposal(repo, taskId, "s1", {
@@ -726,4 +742,36 @@ test("task handback：生成材料并置 handed_back；契约修订后可重新�
     path: `.cw/tasks/${taskId}/contract.toml`, content: "x",
   }), context.ctx);
   expect(blocked).toMatchObject({ block: true });
+}, 30_000);
+
+test("批准期间取消：确认对话框等待时 /cw task cancel → 批准拒绝且不写任何记录", async () => {
+  const { repo } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true, confirmGate: gate });
+  const ctx = context.ctx;
+  await runCmd(fake, `task new ${slug}`, ctx);
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({}));
+
+  const approving = runCmd(fake, "task approve", ctx);
+  const deadline = Date.now() + 10_000;
+  while (context.confirms.length === 0 && Date.now() < deadline) {
+    await delay(5);
+  }
+  expect(context.confirms.length).toBe(1);
+
+  // 确认等待期间取消：验证槽中的批准 controller 被中止。
+  await runCmd(fake, "task cancel", ctx);
+  release();
+  await approving;
+
+  expect(lastNotify(context.notifications)).toContain("取消");
+  await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"))
+    .rejects.toThrow();
+  expect((await readState(repo, taskId)).status).toBe("cancelled");
+  expect(fake.sent).toHaveLength(0);
+  const worktrees = await git(repo, ["worktree", "list", "--porcelain"]);
+  expect(worktrees.split("worktree ").length - 1).toBe(1);
 }, 30_000);

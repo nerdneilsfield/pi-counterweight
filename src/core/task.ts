@@ -3,10 +3,11 @@ import { constants } from "node:fs";
 import type { Dirent } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { contractSha256, readContract } from "./contract.js";
 import { assertTaskId, isNotFound, pathInside } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
 import { Type } from "typebox";
-import type { LockHolder, TaskReference, TaskState } from "./types.js";
+import type { Contract, LockHolder, TaskReference, TaskState } from "./types.js";
 
 const hexSha256 = Type.String({ pattern: "^[0-9a-f]{64}$" });
 const gitObjectId = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
@@ -411,7 +412,7 @@ export async function readApproval(repo: string, taskId: string): Promise<Approv
  * blocking on it; `pending`, `rejected`, and later proposals are untouched.
  */
 export async function writeApproval(
-  repo: string, taskId: string, session: string, approval: Approval,
+  repo: string, taskId: string, session: string, approval: Approval, contract: Contract,
 ): Promise<TaskState> {
   assertTaskId(taskId);
   return withTaskLock(repo, taskId, session, async () => {
@@ -420,6 +421,25 @@ export async function writeApproval(
     if (state.status !== "drafting" && state.status !== "handed_back") {
       throw new Error(`approve: task status is ${state.status}, not drafting/handed_back`);
     }
+    // The approval must describe exactly the contract currently on disk; a
+    // file edited between the red check and this write refuses the approval.
+    const fresh = await readContract(path.join(dir, "contract.toml"), repo, taskId);
+    const freshSha = contractSha256(fresh);
+    if (freshSha !== contractSha256(contract) || freshSha !== approval.contract_sha256) {
+      throw new Error("approve: 契约在批准过程中再次变化，拒绝批准");
+    }
+    // Only user-approved proposals that the current contract actually adopted
+    // belong to this approval version; anything else refuses the approval and
+    // keeps blocking until the user applies or rejects it.
+    const adoptable: Proposal[] = [];
+    for (const proposal of await readProposals(repo, taskId)) {
+      if (proposal.status !== "approved") continue;
+      if (!proposalAdopted(fresh, proposal)) {
+        throw new Error(
+          `approve: 提议 ${proposal.n}（字段 ${proposal.field}）未在当前契约采纳新值，拒绝批准`);
+      }
+      adoptable.push(proposal);
+    }
     rejectUnknown(approvalSchema, approval, "approval.json");
     const file = path.join(dir, "approval.json");
     await rejectUnexpected(file, "approval.json");
@@ -427,45 +447,80 @@ export async function writeApproval(
     const sessions = state.sessions.includes(session) ? state.sessions : [...state.sessions, session];
     const next: TaskState = { ...state, status: "approved", sessions };
     await putState(dir, taskId, next);
-    await consumeApprovedProposals(repo, taskId, approval.contract_sha256);
+    await consumeProposals(repo, taskId, approval.contract_sha256, adoptable);
     return next;
   });
 }
 
 /**
- * Rewrite each `approved` proposal as `consumed`, bound to the contract
- * version that resolved it. Runs under the caller's task lock, so the
- * consumption is atomic with the approval record and state transition.
+ * Whether the proposal's change is actually present in `contract`: string
+ * fields compare textually; list fields compare against the new_value parsed
+ * as a JSON string array (whitespace-tolerant). Unknown fields and
+ * non-string-list values never match — fail closed.
  */
-async function consumeApprovedProposals(repo: string, taskId: string, contractSha: string): Promise<void> {
+export function proposalAdopted(
+  contract: Contract, proposal: Pick<Proposal, "field" | "new_value">,
+): boolean {
+  const current = (contract as unknown as Record<string, unknown>)[proposal.field];
+  if (typeof current === "string") return current === proposal.new_value;
+  if (Array.isArray(current) && current.every((item) => typeof item === "string")) {
+    try {
+      const parsed: unknown = JSON.parse(proposal.new_value);
+      if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) return false;
+      return (parsed as string[]).join("\u0000") === (current as string[]).join("\u0000");
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/** All schema-valid proposals of the task, by number; malformed files are skipped. */
+async function readProposals(repo: string, taskId: string): Promise<Proposal[]> {
   const proposals = path.join(await existingTaskDir(repo, taskId), "proposals");
   let names: string[];
   try {
     names = (await readdir(proposals)).sort();
   } catch (error) {
-    if (isNotFound(error)) return;
+    if (isNotFound(error)) return [];
     throw error;
   }
+  const found: Proposal[] = [];
   for (const name of names) {
     if (!/^\d+\.json$/.test(name)) continue;
     const file = path.join(proposals, name);
     await rejectUnexpected(file, name);
-    let proposal: Proposal;
     try {
-      proposal = JSON.parse(await readFile(file, "utf8")) as Proposal;
-      rejectUnknown(proposalSchema, proposal, name);
+      const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+      rejectUnknown(proposalSchema, parsed, name);
+      found.push(parsed as Proposal);
     } catch {
-      // A malformed proposal cannot drive the gate and is not ours to fix.
-      continue;
+      // A malformed proposal cannot drive the gate; ignore it here.
     }
-    if (proposal.status !== "approved") continue;
+  }
+  return found;
+}
+
+/**
+ * Mark the given proposals `consumed`, bound to the contract version that
+ * resolved them. Runs under the caller's task lock, so the consumption is
+ * atomic with the approval record and state transition.
+ */
+async function consumeProposals(
+  repo: string, taskId: string, contractSha: string, adoptable: readonly Proposal[],
+): Promise<void> {
+  if (adoptable.length === 0) return;
+  const proposals = path.join(await existingTaskDir(repo, taskId), "proposals");
+  for (const proposal of adoptable) {
     const consumed: Proposal = {
       ...proposal,
       status: "consumed",
       resolved_in_contract_sha256: contractSha,
       resolved_at: new Date().toISOString(),
     };
-    rejectUnknown(proposalSchema, consumed, name);
+    rejectUnknown(proposalSchema, consumed, `${proposal.n}.json`);
+    const file = path.join(proposals, `${proposal.n}.json`);
+    await rejectUnexpected(file, `${proposal.n}.json`);
     await atomicWrite(file, `${JSON.stringify(consumed, null, 2)}\n`);
   }
 }
@@ -597,32 +652,12 @@ export async function writeProposal(
 /**
  * Highest-numbered proposal that still blocks autonomous work. `pending`
  * waits for a human decision; `approved` waits for the M6 contract
- * regeneration and red-check rerun (a successful approval consumes it, see
- * `writeApproval`); `rejected` and `consumed` let work continue.
+ * regeneration and red-check rerun (a successful approval consumes it only
+ * when the contract actually adopted it, see `writeApproval`); `rejected` and
+ * `consumed` let work continue.
  */
 export async function findUnresolvedProposal(repo: string, taskId: string): Promise<Proposal | null> {
-  const dir = await existingTaskDir(repo, taskId);
-  const proposals = path.join(dir, "proposals");
-  let names: string[];
-  try {
-    names = (await readdir(proposals)).sort();
-  } catch (error) {
-    if (isNotFound(error)) return null;
-    throw error;
-  }
-  const found: Proposal[] = [];
-  for (const name of names) {
-    if (!/^\d+\.json$/.test(name)) continue;
-    const file = path.join(proposals, name);
-    await rejectUnexpected(file, name);
-    try {
-      const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
-      rejectUnknown(proposalSchema, parsed, name);
-      const proposal = parsed as Proposal;
-      if (proposal.status !== "rejected" && proposal.status !== "consumed") found.push(proposal);
-    } catch {
-      // A malformed proposal cannot drive the gate; ignore it here.
-    }
-  }
+  const found = (await readProposals(repo, taskId))
+    .filter((proposal) => proposal.status !== "rejected" && proposal.status !== "consumed");
   return found.length === 0 ? null : found.at(-1)!;
 }

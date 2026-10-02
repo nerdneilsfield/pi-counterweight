@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { renderTaskView } from "../../src/core/approve.ts";
-import { readContract } from "../../src/core/contract.ts";
+import { contractSha256, readContract } from "../../src/core/contract.ts";
+import { contentSha256 } from "../../src/core/evidence.ts";
 import { judgeRedBaseline, runRedCheck, CannotIsolateError } from "../../src/core/redcheck.ts";
+import { runValidator } from "../../src/core/runner.ts";
 import { treeHash } from "../../src/core/gitstate.ts";
-import { createTask, readState, updateState, writeApproval } from "../../src/core/task.ts";
+import { createTask, proposalAdopted, readState, updateState, writeApproval, writeProposal } from "../../src/core/task.ts";
 import type { Approval } from "../../src/core/task.ts";
 import type { Contract, ValidatorConfig } from "../../src/core/types.ts";
 
@@ -274,13 +276,24 @@ function approvalOf(contract: Contract): Approval {
 }
 
 test("并发批准：后到者锁内被拒且不覆盖已批准记录任何字段", async () => {
-  const { repo } = await setup();
-  const approvalA = { ...approvalOf(baseContract), approved_at: "winner-A" };
-  const approvalB = { ...approvalOf(baseContract), approved_at: "loser-B" };
-  await writeApproval(repo, taskId, "sA", approvalA);
+  const { repo, base, contract } = await setup();
+  const approvalOf = (approvedAt: string): Approval => ({
+    version: 1,
+    contract_sha256: contractSha256(contract),
+    project_config_sha256: "0".repeat(64),
+    validator: { cmd: ["/bin/true"], timeout_s: 600, env: {} },
+    base_commit: base,
+    baseline_inputs_sha256: {},
+    frozen_blobs: {},
+    red_check_run: 1,
+    approved_at: approvedAt,
+  });
+  const approvalA = approvalOf("winner-A");
+  const approvalB = approvalOf("loser-B");
+  await writeApproval(repo, taskId, "sA", approvalA, contract);
 
   // 后到者拿到锁后在状态检查处被拒：approval.json 与会话登记保持胜者原样。
-  await expect(writeApproval(repo, taskId, "sB", approvalB))
+  await expect(writeApproval(repo, taskId, "sB", approvalB, contract))
     .rejects.toThrow(/not drafting\/handed_back/);
   const onDisk = JSON.parse(
     await readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"));
@@ -292,8 +305,8 @@ test("并发批准：后到者锁内被拒且不覆盖已批准记录任何字�
   // 真并发：锁竞争只产生一个胜者，落盘内容必为胜者负载，败者会话不登记。
   await updateState(repo, taskId, "sA", (current) => ({ ...current, status: "handed_back" }));
   const [raceA, raceB] = await Promise.allSettled([
-    writeApproval(repo, taskId, "sA2", { ...approvalA, approved_at: "race-A" }),
-    writeApproval(repo, taskId, "sB2", { ...approvalB, approved_at: "race-B" }),
+    writeApproval(repo, taskId, "sA2", { ...approvalA, approved_at: "race-A" }, contract),
+    writeApproval(repo, taskId, "sB2", { ...approvalB, approved_at: "race-B" }, contract),
   ]);
   const settled = [raceA, raceB];
   const fulfilled = settled.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof writeApproval>>> =>
@@ -308,6 +321,36 @@ test("并发批准：后到者锁内被拒且不覆盖已批准记录任何字�
   expect(state2.sessions).toContain(winnerSessions.at(-1)!);
   expect(state2.sessions).not.toContain(loserSession);
 });
+
+test("批准与契约漂移：契约在先红后再次修改则拒绝批准", async () => {
+  const { repo, base, contract } = await setup();
+  const drifted = contractOf({ goal: "changed on disk" });
+  const approval = {
+    ...approvalOfReal(contract, base),
+    contract_sha256: contractSha256(contract),
+  };
+  // 磁盘上的契约已改为 drifted，writeApproval 传入的却是旧 contract。
+  const file = path.join(repo, ".cw", "tasks", taskId, "contract.toml");
+  await writeFile(file, contractToml(drifted));
+  await expect(writeApproval(repo, taskId, "sA", approval, contract))
+    .rejects.toThrow(/再次变化/);
+  await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"))
+    .rejects.toThrow();
+});
+
+function approvalOfReal(contract: Contract, base: string): Approval {
+  return {
+    version: 1,
+    contract_sha256: contractSha256(contract),
+    project_config_sha256: "0".repeat(64),
+    validator: { cmd: ["/bin/true"], timeout_s: 600, env: {} },
+    base_commit: base,
+    baseline_inputs_sha256: {},
+    frozen_blobs: {},
+    red_check_run: 1,
+    approved_at: new Date().toISOString(),
+  };
+}
 
 test("先红覆盖：基线祖先为指向仓库外 canary 的符号链接时写前拒绝，canary 内容不变", async () => {
   // 仓库外的金丝雀文件：旧实现先写后查会沿基线符号链接把它改写。
@@ -366,3 +409,171 @@ test("任务视图：≤40 行，含目标、先红标记与工具用途；超�
   expect(capped).toContain("（其余");
   expect(capped).toContain("- acc0（先红：基线必须失败）");
 });
+
+test("提议采纳边界：字段值与 new_value 一致才算被契约采纳", () => {
+  const contract = baseContract;
+  expect(proposalAdopted(contract, { field: "goal", new_value: "fix lifetime issue" })).toBe(true);
+  expect(proposalAdopted(contract, { field: "goal", new_value: "changed" })).toBe(false);
+  expect(proposalAdopted(contract, { field: "acceptance", new_value: '["red1","keep"]' })).toBe(true);
+  expect(proposalAdopted(contract, { field: "acceptance", new_value: '[ "red1" , "keep" ]' })).toBe(true);
+  expect(proposalAdopted(contract, { field: "acceptance", new_value: '["red1"]' })).toBe(false);
+  expect(proposalAdopted(contract, { field: "acceptance", new_value: "red1,keep" })).toBe(false);
+  expect(proposalAdopted(contract, { field: "nonexistent", new_value: "x" })).toBe(false);
+  // 空列表字段：契约确实已为空即视为采纳。
+  expect(proposalAdopted(contract, { field: "approved_failures", new_value: "[]" })).toBe(true);
+  const exempted = contractOf({ approved_failures: [{ id: "legacy", reason: "另开任务" }] });
+  expect(proposalAdopted(exempted, { field: "approved_failures", new_value: "[]" })).toBe(false);
+});
+
+test("提议消费：仅采纳中的 approved 提议被消费，未采纳者拒绝批准且全部保留", async () => {
+  const { repo, base, contract } = await setup();
+  const approval = approvalOfReal(contract, base);
+  await writeProposal(repo, taskId, "s1", {
+    field: "goal", new_value: "changed", reason: "目标写错", status: "approved",
+  });
+  await writeProposal(repo, taskId, "s1", {
+    field: "tier", new_value: "script", reason: "任务变小", status: "approved",
+  });
+  await writeProposal(repo, taskId, "s1", {
+    field: "regression", new_value: "[]", reason: "待定", status: "pending",
+  });
+
+  // 契约尚未采纳任何提议：批准被拒，所有提议原样保留。
+  await expect(writeApproval(repo, taskId, "sA", approval, contract))
+    .rejects.toThrow(/未在当前契约采纳/);
+  const proposal1 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "proposals", "1.json"), "utf8"));
+  const proposal2 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "proposals", "2.json"), "utf8"));
+  const proposal3 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "proposals", "3.json"), "utf8"));
+  expect(proposal1.status).toBe("approved");
+  expect(proposal2.status).toBe("approved");
+  expect(proposal3.status).toBe("pending");
+  await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"))
+    .rejects.toThrow();
+
+  // 采纳提议 1（goal → changed）：提议 2 仍未采纳，批准继续被拒。
+  const adoptedFile = path.join(repo, ".cw", "tasks", taskId, "contract.toml");
+  await writeFile(adoptedFile, contractToml(contractOf({ goal: "changed" })));
+  const adopted = await readContract(adoptedFile, repo, taskId);
+  await expect(writeApproval(repo, taskId, "sA", approvalOfReal(adopted, base), adopted))
+    .rejects.toThrow(/提议 2/);
+  expect((await readFile(path.join(repo, ".cw", "tasks", taskId, "proposals", "1.json"), "utf8"))
+    .includes("approved")).toBe(true);
+
+  // 采纳提议 1 与 2（tier → script）：批准成功，1、2 消费且绑定契约版本，3 保持 pending。
+  const fullFile = path.join(repo, ".cw", "tasks", taskId, "contract.toml");
+  await writeFile(fullFile, contractToml(contractOf({ goal: "changed", tier: "script" })));
+  const full = await readContract(fullFile, repo, taskId);
+  const fullApproval = approvalOfReal(full, base);
+  await writeApproval(repo, taskId, "sA", fullApproval, full);
+  const consumed1 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "proposals", "1.json"), "utf8"));
+  const consumed2 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "proposals", "2.json"), "utf8"));
+  const kept3 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "proposals", "3.json"), "utf8"));
+  expect(consumed1.status).toBe("consumed");
+  expect(consumed1.resolved_in_contract_sha256).toBe(fullApproval.contract_sha256);
+  expect(consumed1.resolved_at).toBeTruthy();
+  expect(consumed2.status).toBe("consumed");
+  expect(consumed2.resolved_in_contract_sha256).toBe(fullApproval.contract_sha256);
+  expect(kept3.status).toBe("pending");
+  expect((await readState(repo, taskId)).status).toBe("approved");
+});
+
+const waitFor = async (predicate: () => Promise<boolean>, timeoutMs: number): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("waitFor timeout");
+};
+
+test("runner 迟到取消：验证器退出后、证据发布前取消 → 不发布 last_verified", async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), "cw-m6late-"));
+  await git(repo, ["init"]);
+  await mkdir(path.join(repo, "inputs"), { recursive: true });
+  await writeFile(path.join(repo, "tracked.txt"), "base\n");
+  const inputs: string[] = [];
+  for (let index = 0; index < 800; index++) {
+    const relative = `inputs/f${index}.txt`;
+    await writeFile(path.join(repo, relative), `x${index}\n`);
+    inputs.push(relative);
+  }
+  await git(repo, ["add", "tracked.txt", "inputs"]);
+  await git(repo, ["-c", "user.email=cw@example.com", "-c", "user.name=cw", "commit", "-m", "base"]);
+  const base = (await git(repo, ["rev-parse", "HEAD"])).trim();
+  await createTask(repo, taskId, "unassigned", base);
+  const contract = contractOf({
+    acceptance: ["a"], red: ["a"], regression: [], frozen: [], baseline_inputs: inputs,
+  });
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml(contract));
+  await updateState(repo, taskId, "s1", (current) => ({ ...current, status: "approved" }));
+  const approvedHashes: Record<string, string> = {};
+  for (const input of inputs) approvedHashes[input] = (await contentSha256(repo, input))!;
+
+  const payloadText = JSON.stringify({
+    protocol: 1, run_id: "@RUN@", complete: true,
+    checks: [{ id: "a", status: "pass" }],
+    build: { required: false }, summary: "x", logs: [],
+  });
+  const controller = new AbortController();
+  const run = runValidator({
+    repo, taskId, session: "s1", contract,
+    validator: validator("reportrun", payloadText),
+    approvedInputHashes: approvedHashes,
+    signal: controller.signal,
+  });
+  const runDir = path.join(repo, ".cw", "tasks", taskId, "runs", "1");
+  await waitFor(async () => {
+    try {
+      await readFile(path.join(runDir, "result.json"), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  }, 10_000);
+  controller.abort();
+  const outcome = await run;
+
+  expect(outcome.lastVerified).toBeNull();
+  expect(outcome.verdict.conclusion).toBe("undetermined");
+  expect(outcome.verdict.reasons).toContain("cancelled");
+  expect(outcome.record.cancelled).toBe(true);
+  expect(outcome.record.result_discarded).toBe(true);
+  const state = await readState(repo, taskId);
+  expect(state.last_verified).toBeNull();
+}, 30_000);
+
+test("redcheck 迟到取消：证据判定期间取消 → valid=false，记录改写为已弃置", async () => {
+  const { repo, base, contract } = await setup();
+  const controller = new AbortController();
+  const run = runRedCheck({
+    ...redCheckRequest(repo, contract, base, validator(
+      "reportrun",
+      redOkPayload.replace('"run_id":"1"', '"run_id":"@RUN@"'),
+    )),
+    signal: controller.signal,
+  });
+  const runDir = path.join(repo, ".cw", "tasks", taskId, "runs", "1");
+  await waitFor(async () => {
+    try {
+      await readFile(path.join(runDir, "result.json"), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  }, 10_000);
+  controller.abort();
+  const outcome = await run;
+
+  expect(outcome.valid).toBe(false);
+  expect(outcome.validityReasons).toContain("cancelled");
+  expect(outcome.record.cancelled).toBe(true);
+  expect(outcome.record.result_discarded).toBe(true);
+  const text = await git(repo, ["worktree", "list", "--porcelain"]);
+  expect(text.split("worktree ").length - 1).toBe(1);
+}, 30_000);

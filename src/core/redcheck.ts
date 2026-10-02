@@ -144,7 +144,7 @@ export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOut
       await worktreeAdd(request.repo, baseline, request.baseCommit);
       await overlayInputs(request.repo, baseline, inputs);
       const before = await snapshotBaseline(baseline, inputs, wanted);
-      const outcome = await runValidatorProcess({
+      const processRun = runValidatorProcess({
         cwd: baseline,
         cmd: request.validator.cmd,
         env: {
@@ -160,47 +160,61 @@ export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOut
         stderrPath: path.join(runDir, "stderr.log"),
         signal: request.signal,
       });
-      const after = await snapshotBaseline(baseline, inputs, wanted);
-      const record: RunRecord = {
-        version: 1,
-        run,
-        started_at: before.time,
-        ended_at: new Date().toISOString(),
-        exit_code: outcome.exitCode,
-        term_signal: outcome.signal,
-        timed_out: outcome.timedOut,
-        cancelled: outcome.cancelled,
-        result_discarded: outcome.cancelled || outcome.timedOut || outcome.signal !== null,
-        runner_error: outcome.runnerError,
-        record_error: [before.error, after.error].filter((item) => item !== null).join("; ") || null,
-        git: true,
-        tree_before: before.tree,
-        tree_after: after.tree,
-        input_hashes_before: before.hashes,
-        input_hashes_after: after.hashes,
-        artifact_hashes: Object.create(null) as Record<string, string | null>,
-      };
-      await writeRunRecord(path.join(runDir, "run.json"), record);
-      // Validity first: judged by the ordinary evidence rules against the
-      // baseline directory (its tree, its artifact paths). Any undetermined
-      // reason refuses the approval.
-      const verdict = await judgeEvidence(baseline, runDir, request.contract, Object.fromEntries(wanted));
-      const valid = verdict.conclusion !== "undetermined";
-      const result = await readResult(runDir);
-      const red = valid && result !== null
-        ? judgeRedBaseline(request.contract, result)
-        : { ok: false, reasons: [] };
-      return {
-        run,
-        runDir,
-        record,
-        valid,
-        validityReasons: valid ? [] : verdict.reasons,
-        red,
-        redFailures: result === null ? [] : collectRedFailures(request.contract, result),
-        baselineInputs: [...inputs],
-        inputHashes: Object.fromEntries(wanted),
-      };
+      try {
+        const outcome = await processRun;
+        const after = await snapshotBaseline(baseline, inputs, wanted);
+        let record: RunRecord = {
+          version: 1,
+          run,
+          started_at: before.time,
+          ended_at: new Date().toISOString(),
+          exit_code: outcome.exitCode,
+          term_signal: outcome.signal,
+          timed_out: outcome.timedOut,
+          cancelled: outcome.cancelled,
+          result_discarded: outcome.cancelled || outcome.timedOut || outcome.signal !== null,
+          runner_error: outcome.runnerError,
+          record_error: [before.error, after.error].filter((item) => item !== null).join("; ") || null,
+          git: true,
+          tree_before: before.tree,
+          tree_after: after.tree,
+          input_hashes_before: before.hashes,
+          input_hashes_after: after.hashes,
+          artifact_hashes: Object.create(null) as Record<string, string | null>,
+        };
+        await writeRunRecord(path.join(runDir, "run.json"), record);
+        // Validity first: judged by the ordinary evidence rules against the
+        // baseline directory (its tree, its artifact paths). Any undetermined
+        // reason refuses the approval.
+        const verdict = await judgeEvidence(baseline, runDir, request.contract, Object.fromEntries(wanted));
+        let valid = verdict.conclusion !== "undetermined";
+        let validityReasons: string[] = valid ? [] : verdict.reasons;
+        if (valid && outcome.cancelled) {
+          // The cancel landed after the validator exited but before this
+          // run could become the basis of an approval: discard it.
+          record = { ...record, cancelled: true, result_discarded: true };
+          await writeRunRecord(path.join(runDir, "run.json"), record);
+          valid = false;
+          validityReasons = ["cancelled"];
+        }
+        const result = await readResult(runDir);
+        const red = valid && result !== null
+          ? judgeRedBaseline(request.contract, result)
+          : { ok: false, reasons: [] };
+        return {
+          run,
+          runDir,
+          record,
+          valid,
+          validityReasons,
+          red,
+          redFailures: result === null ? [] : collectRedFailures(request.contract, result),
+          baselineInputs: [...inputs],
+          inputHashes: Object.fromEntries(wanted),
+        };
+      } finally {
+        (await processRun).dispose();
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
       // The baseline directory is gone; drop the worktree metadata entry.
