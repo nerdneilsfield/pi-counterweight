@@ -699,14 +699,19 @@ async function taskEscalate(
   // --from current: the session is really replaced; the ledger keeps one
   // registered session (the new one) and the strong model. The notes for the
   // first task view are read from notes.md up front, so the handback material
-  // can be written only after the switch has fully landed.
+  // can be written only after the switch has fully landed. The session's
+  // current model is captured too: a late failure must put the surviving
+  // session's model back, not leave it silently on the strong model.
   const notes = await readTaskNotes(ledger, taskId);
   const view = renderTaskView(contract, approval, notes);
   const previousTask = registration.getTask();
+  const previousModel = ctx.model;
   let switched = false;
   let failure: string | null = null;
   let cancelled = false;
   let rollbackError: string | null = null;
+  let modelSwitched = false;
+  let modelNote: string | null = null;
   try {
     const result = await ctx.newSession({
       withSession: async (newCtx) => {
@@ -723,35 +728,44 @@ async function taskEscalate(
           if (!(await pi.setModel(model))) {
             throw new Error(`模型 ${strong} 的 provider 未配置认证，未切换`);
           }
-          await updateState(ledger, taskId, newSession, (current) => {
-            const next = released(current);
-            return next.sessions.includes(newSession)
-              ? next
-              : { ...next, sessions: [...next.sessions, newSession] };
-          });
-          const active = await loadTask(repo, ledger, taskId, newSession);
-          registration.setTask(active);
-          newCtx.ui.notify(
-            `Counterweight: 已切换到升级会话（任务 ${taskId}，模型 ${strong}）；`
-            + `修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
-            "info",
-          );
-          await newCtx.sendMessage({
-            customType: "counterweight",
-            content: view,
-            display: true,
-          }, { triggerTurn: false });
-          switched = true;
+          modelSwitched = true;
+          try {
+            await updateState(ledger, taskId, newSession, (current) => {
+              const next = released(current);
+              return next.sessions.includes(newSession)
+                ? next
+                : { ...next, sessions: [...next.sessions, newSession] };
+            });
+            const active = await loadTask(repo, ledger, taskId, newSession);
+            registration.setTask(active);
+            newCtx.ui.notify(
+              `Counterweight: 已切换到升级会话（任务 ${taskId}，模型 ${strong}）；`
+              + `修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
+              "info",
+            );
+            await newCtx.sendMessage({
+              customType: "counterweight",
+              content: view,
+              display: true,
+            }, { triggerTurn: false });
+            switched = true;
+          } catch (error) {
+            failure = error instanceof Error ? error.message : "unknown";
+            // Roll the single ledger write back so state matches the
+            // pre-escalation task, and put the surviving session's model
+            // back; nothing else was committed.
+            try {
+              await updateState(ledger, taskId, newSession, () => oldState);
+            } catch (restoreIssue) {
+              rollbackError = restoreIssue instanceof Error ? restoreIssue.message : "unknown";
+            }
+            if (modelSwitched) {
+              modelNote = await restorePreviousModel(pi, previousModel, strong);
+            }
+            registration.setTask(previousTask);
+          }
         } catch (error) {
           failure = error instanceof Error ? error.message : "unknown";
-          // Roll the single ledger write back so state matches the
-          // pre-escalation task; nothing else was committed.
-          try {
-            await updateState(ledger, taskId, newSession, () => oldState);
-          } catch (restoreIssue) {
-            rollbackError = restoreIssue instanceof Error ? restoreIssue.message : "unknown";
-          }
-          registration.setTask(previousTask);
         }
       },
     });
@@ -762,11 +776,14 @@ async function taskEscalate(
   }
   if (!switched) {
     const reasonText = cancelled ? "会话替换被取消" : `切换失败：${failure ?? "unknown"}`;
+    const modelText = modelSwitched
+      ? `；${modelNote ?? "会话模型已恢复"}`
+      : "；会话模型未改动";
     const rollbackText = rollbackError === null
       ? ""
       : `；警告：账本恢复失败（${rollbackError}），请人工核对 .cw/tasks/${taskId}/state.json`;
     ctx.ui.notify(
-      `Counterweight: 升级未完成（${reasonText}）；未写升级材料与计量事件，任务账本已恢复原状${rollbackText}。`
+      `Counterweight: 升级未完成（${reasonText}）；未写升级材料与计量事件，任务账本已恢复原状${modelText}${rollbackText}。`
       + `若当前会话已被替换，请用 /cw task resume ${taskId} 重新接管。`,
       "error",
     );
@@ -797,6 +814,33 @@ async function taskEscalate(
 }
 
 // ---- shared helpers --------------------------------------------------------
+
+/**
+ * Put the surviving session's model back after a failed switch. Pi 1.0 keeps
+ * the previous model on the context (`ctx.model`, may be undefined) and
+ * `setModel` acts on the current session, so a best-effort restore is
+ * available; when it cannot run, the caller says so instead of claiming the
+ * pre-escalation state. Returns null on success, else a human-readable note.
+ */
+async function restorePreviousModel(
+  pi: ExtensionAPI, previousModel: ExtensionContext["model"], strong: string,
+): Promise<string | null> {
+  if (previousModel === undefined || previousModel === null) {
+    return `切换前会话没有已设置的模型，无法恢复；当前会话模型仍为 ${strong}`;
+  }
+  if (typeof pi.setModel !== "function") {
+    return `宿主未提供 setModel，无法恢复；当前会话模型仍为 ${strong}`;
+  }
+  try {
+    const restored = await pi.setModel(previousModel);
+    if (!restored) {
+      return `模型恢复未生效（provider 认证缺失）；当前会话模型仍为 ${strong}`;
+    }
+    return null;
+  } catch (error) {
+    return `模型恢复失败（${error instanceof Error ? error.message : "unknown"}）；当前会话模型仍为 ${strong}`;
+  }
+}
 
 /** The task id a `.cw/task.json` reference points at, or null when absent. */
 async function referencedTaskId(workRoot: string): Promise<string | null> {

@@ -77,7 +77,7 @@ export async function checkFrozen(
       }
     }));
     const detectable = checked.filter((item): item is typeof item & { resolved: string } => item.detail === null);
-    const hashes = await blobHashes(repo, detectable.map((item) => item.resolved));
+    const hashes = await blobHashes(work, detectable.map((item) => item.resolved));
     const detected: Array<{ conflict: FrozenConflict; resolved: string | null; detail: string | null }> = [];
     for (let index = 0; index < detectable.length; index++) {
       const item = detectable[index]!;

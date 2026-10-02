@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Type } from "typebox";
 import type { HandbackReason } from "./gate.js";
-import { assertTaskId } from "./paths.js";
+import { assertTaskId, isNotFound } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
 import { readState, runsDir, withTaskLock } from "./task.js";
 import { recordTaskEvent } from "./meter.js";
@@ -129,8 +129,22 @@ export async function writeHandback(
     const material = await buildMaterial(repo, taskId, state, request);
     rejectUnknown(materialSchema, material, "handback.json");
     const dir = path.dirname(await runsDir(repo, taskId));
-    await writeTaskFile(dir, "handback.json", `${JSON.stringify(material, null, 2)}\n`);
-    await writeTaskFile(dir, "handback.md", renderMarkdown(material));
+    const jsonPath = path.join(dir, "handback.json");
+    const mdPath = path.join(dir, "handback.md");
+    // Two-file commit semantics: both files are this call's unit. If either
+    // write fails, the pair is rolled back — a half-written handback (json
+    // without md, or vice versa) must never survive, and files from an
+    // earlier handback are preserved verbatim.
+    const previousJson = await readPrevious(jsonPath);
+    const previousMd = await readPrevious(mdPath);
+    try {
+      await writeTaskFile(jsonPath, `${JSON.stringify(material, null, 2)}\n`);
+      await writeTaskFile(mdPath, renderMarkdown(material));
+    } catch (error) {
+      await restorePrevious(jsonPath, previousJson);
+      await restorePrevious(mdPath, previousMd);
+      throw error;
+    }
     // The meter line doubles as the task-flow event record: every handback,
     // finish, cancel, manual handback, and escalation lands here.
     await recordTaskEvent(repo, taskId, session, request.reason, { auto_verified: request.autoVerified });
@@ -140,6 +154,36 @@ export async function writeHandback(
       material,
     };
   });
+}
+
+/** Prior on-disk state of one handback file, for rollback. */
+interface PreviousFile {
+  existed: boolean;
+  /** null when the prior entry was not a regular file (left untouched). */
+  content: Buffer | null;
+}
+
+async function readPrevious(file: string): Promise<PreviousFile> {
+  let stat;
+  try {
+    stat = await lstat(file);
+  } catch (error) {
+    if (isNotFound(error)) return { existed: false, content: null };
+    throw error;
+  }
+  if (!stat.isFile()) return { existed: true, content: null };
+  return { existed: true, content: await readFile(file) };
+}
+
+async function restorePrevious(file: string, previous: PreviousFile): Promise<void> {
+  if (!previous.existed) {
+    await rm(file, { force: true });
+    return;
+  }
+  if (previous.content === null) return;
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, previous.content);
+  await rename(temporary, file);
 }
 
 async function buildMaterial(
@@ -408,8 +452,7 @@ export async function readHandbackMaterial(repo: string, taskId: string): Promis
   }
 }
 
-async function writeTaskFile(dir: string, name: string, content: string): Promise<void> {
-  const file = path.join(dir, name);
+async function writeTaskFile(file: string, content: string): Promise<void> {
   let stat;
   try {
     stat = await lstat(file);
@@ -417,7 +460,7 @@ async function writeTaskFile(dir: string, name: string, content: string): Promis
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     stat = undefined;
   }
-  if (stat?.isSymbolicLink()) throw new Error(`${name} must not be a symlink`);
+  if (stat?.isSymbolicLink()) throw new Error(`${path.basename(file)} must not be a symlink`);
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, content);
   await rename(temporary, file);

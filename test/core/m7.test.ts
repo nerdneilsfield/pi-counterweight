@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile, lstat, readdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -6,8 +7,10 @@ import { expect, test } from "vitest";
 import { contentSha256 } from "../../src/core/evidence.ts";
 import { EscalateError, escalationWorktreePath, prepareBaseEscalation } from "../../src/core/escalate.ts";
 import { treeHash, worktreePrune } from "../../src/core/gitstate.ts";
-import { readReference } from "../../src/core/task.ts";
+import { createTask, readReference } from "../../src/core/task.ts";
+import { writeHandback } from "../../src/core/handback.ts";
 import { recordTaskEvent, recordUsage } from "../../src/core/meter.ts";
+import type { Contract } from "../../src/core/types.ts";
 
 const taskId = "20260928-lifetime-fix";
 
@@ -118,6 +121,41 @@ test("prepareBaseEscalation：输入缺失、base_commit 不存在与已存在�
   await expect(prepareBaseEscalation({ ...request(), inputs: [], approvedInputHashes: {} }))
     .rejects.toThrow(/已存在/);
   expect(await readFile(await worktreeOf(repo), "utf8")).toBe("occupied");
+});
+
+test("writeHandback 两文件提交语义：md 失败不残留 json，旧 json 保留，无 meter 事件", async () => {
+  const { repo } = await setup();
+  const hbTaskId = "20260101-hbcheck";
+  await createTask(repo, hbTaskId, "g/medium");
+  const contract: Contract = {
+    version: 1, task_id: hbTaskId, tier: "change", deliverable: "code",
+    goal: "g", non_goals: [], acceptance: [], red: [], regression: [], frozen: [],
+    interface: [], baseline_inputs: [], approved_failures: [], budget: undefined,
+  };
+  const request = {
+    repo, taskId: hbTaskId, session: "s1", contract,
+    validator: { cmd: ["/bin/sh", "-c", "true"], timeout_s: 600, env: {} },
+    reason: "manual" as const, questions: [] as string[], autoVerified: false,
+  };
+  const taskDir = path.join(repo, ".cw", "tasks", hbTaskId);
+  const jsonPath = path.join(taskDir, "handback.json");
+  const mdPath = path.join(taskDir, "handback.md");
+
+  // Case A：md 目标是目录 → rename 失败 → 本次 json 被撤除，无事件。
+  await mkdir(mdPath);
+  await expect(writeHandback(request)).rejects.toThrow();
+  expect(existsSync(jsonPath)).toBe(false);
+  expect((await readdir(taskDir)).sort()).toEqual(["handback.md", "meter.jsonl", "runs", "state.json"].sort());
+  const meter = (await readFile(path.join(taskDir, "meter.jsonl"), "utf8"))
+    .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  expect(meter.map((line) => line.event)).not.toContain("manual");
+
+  // Case B：更早的 handback.json 在失败后被原样保留。
+  await writeFile(jsonPath, "{\"previous\":true}\n");
+  await expect(writeHandback(request)).rejects.toThrow();
+  expect(await readFile(jsonPath, "utf8")).toBe("{\"previous\":true}\n");
+  // 目录形态的 md 未被破坏。
+  expect((await lstat(mdPath)).isDirectory()).toBe(true);
 });
 
 test("meter：usage 行带 kind，task 事件行可解析；事件写入失败不抛出", async () => {

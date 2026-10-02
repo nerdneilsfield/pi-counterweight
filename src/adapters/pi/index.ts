@@ -176,7 +176,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       const active = task;
       if (active === null || signal.aborted) return undefined;
       if (Object.keys(active.approval.frozen_blobs).length === 0) return undefined;
-      const outcome = await checkFrozen(active.root, active.taskId, active.session, active.approval.frozen_blobs);
+      // Ledger is authoritative for conflict records; the files are hashed
+      // in the working tree (they differ only in an escalation worktree).
+      const outcome = await checkFrozen(
+        active.ledger, active.taskId, active.session, active.approval.frozen_blobs, active.root);
       if (outcome.newConflicts.length === 0) return undefined;
       // Only new conflicts (path + expected + actual not already recorded)
       // get a line; a standing conflict is not re-reported on every result.

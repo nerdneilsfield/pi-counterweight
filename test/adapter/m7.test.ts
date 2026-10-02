@@ -24,7 +24,7 @@ type Handler = (event: any, ctx: any) => any;
 
 interface PiCall { method: string; phase: number }
 
-function fakePi(): {
+function fakePi(options: { setModelFn?: (model: { provider: string; id: string }) => boolean } = {}): {
   pi: ExtensionAPI;
   handlers: Map<string, Handler[]>;
   commands: Map<string, { description?: string; handler: Handler }>;
@@ -52,7 +52,7 @@ function fakePi(): {
     },
     setModel: async (model: { provider: string; id: string }) => {
       setModels.push(model);
-      return true;
+      return options.setModelFn ? options.setModelFn(model) : true;
     },
   } as unknown as ExtensionAPI;
   return {
@@ -94,6 +94,8 @@ interface CtxOptions {
   hasUI?: boolean;
   confirmResult?: boolean;
   session?: string;
+  /** The session's current model (`ctx.model`), for model-restore assertions. */
+  currentModel?: { provider: string; id: string };
   /** Registry entries that resolve to undefined (model adoption failure). */
   missingModels?: string[];
   /** Make the replaced session's sendMessage throw (late withSession failure). */
@@ -112,6 +114,7 @@ function fakeCtx(repo: string, options: CtxOptions = {}) {
     cwd: repo,
     mode: (options.hasUI ?? false) ? "tui" : "print",
     hasUI: options.hasUI ?? false,
+    model: options.currentModel,
     modelRegistry: registry,
     ui: {
       notify: (message: string, type?: string) => {
@@ -261,8 +264,11 @@ interface = "strong"
   };
 }
 
-async function startAdapter(repo: string, timeouts?: Partial<AdapterTimeouts>) {
-  const fake = fakePi();
+async function startAdapter(
+  repo: string, timeouts?: Partial<AdapterTimeouts>,
+  fakeOptions?: { setModelFn?: (model: { provider: string; id: string }) => boolean },
+) {
+  const fake = fakePi(fakeOptions);
   counterweight(fake.pi, timeouts);
   const context = fakeCtx(repo);
   await fake.call("session_start", { type: "session_start", reason: "startup" }, context.ctx);
@@ -443,13 +449,14 @@ test("escalate --from current 会话替换被取消：任务保持原状，无�
   expect(fake.setModels.filter((model) => model.id === "strong")).toEqual([]);
 }, 20_000);
 
-test("escalate --from current withSession 晚段失败：账本持锁回滚，零材料零事件", async () => {
+test("escalate --from current withSession 晚段失败：账本持锁回滚、模型恢复，零材料零事件", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running", repairs_used: 2, tokens_used: 500 }));
   const { fake } = await startAdapter(s.repo);
   let replaced: ReturnType<typeof fakeCtx> | null = null;
   const context = fakeCtx(s.repo, {
     session: "s1",
+    currentModel: { provider: "g", id: "medium" },
     newSession: async (options) => {
       replaced = fakeCtx(s.repo, { session: "s2", failSendMessage: true });
       if (options.withSession) await options.withSession(replaced.ctx);
@@ -465,11 +472,47 @@ test("escalate --from current withSession 晚段失败：账本持锁回滚，�
   expect(state.sessions).toEqual(["s1"]);
   expect(state.repairs_used).toBe(2);
   expect(state.tokens_used).toBe(500);
+  // 幸存会话的模型也被恢复：setModel 序列 = 接管 medium → 切 strong → 恢复 medium。
+  expect(fake.setModels).toEqual([
+    { provider: "g", id: "medium" },
+    { provider: "g", id: "strong" },
+    { provider: "g", id: "medium" },
+  ]);
+  expect(anyNotify(context.notifications, "会话模型已恢复")).toBe(true);
   // 无假成功材料/事件。
   expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
   expect(await meterEvents(s.repo, taskId)).not.toContain("escalated");
   expect(await meterEvents(s.repo, taskId)).not.toContain("escalate_target");
   expect(replaced!.replacedSent).toEqual([]);
+}, 20_000);
+
+test("escalate --from current 模型恢复失败：明确报告仍为 strong，不宣称原状", async () => {
+  const s = await setup();
+  await s.setState((state) => ({ ...state, status: "running" }));
+  // strong 能切上，但恢复 medium 时 setModel 返回 false（认证缺失）。
+  const { fake } = await startAdapter(s.repo, undefined, {
+    setModelFn: (model) => model.id !== "medium",
+  });
+  const context = fakeCtx(s.repo, {
+    session: "s1",
+    currentModel: { provider: "g", id: "medium" },
+    newSession: async (options) => {
+      const replaced = fakeCtx(s.repo, { session: "s2", failSendMessage: true });
+      if (options.withSession) await options.withSession(replaced.ctx);
+      return { cancelled: false };
+    },
+  });
+  await runCmd(fake, "task escalate --from current", context.ctx);
+  expect(anyNotify(context.notifications, "升级未完成")).toBe(true);
+  // 恢复被尝试过且失败被明确报告，不宣称完全原状。
+  expect(fake.setModels.at(-1)).toEqual({ provider: "g", id: "medium" });
+  expect(anyNotify(context.notifications, "模型恢复未生效")).toBe(true);
+  expect(anyNotify(context.notifications, "仍为 g/strong")).toBe(true);
+  const state = await readState(s.repo, taskId);
+  expect(state.model).toBe("g/medium");
+  expect(state.sessions).toEqual(["s1"]);
+  expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalated");
 }, 20_000);
 
 test("escalate --from current 模型接管失败：账本从未被改，零材料零事件", async () => {
@@ -488,6 +531,7 @@ test("escalate --from current 模型接管失败：账本从未被改，零材�
   await runCmd(fake, "task escalate --from current", context.ctx);
   expect(anyNotify(context.notifications, "升级未完成")).toBe(true);
   expect(anyNotify(context.notifications, "不在模型注册表中")).toBe(true);
+  expect(anyNotify(context.notifications, "会话模型未改动")).toBe(true);
   const state = await readState(s.repo, taskId);
   expect(state.model).toBe("g/medium");
   expect(state.sessions).toEqual(["s1"]);
@@ -589,28 +633,43 @@ test("escalate --from base 锁被其他会话持有：拒绝且清理 worktree�
 
 // ---- ledger sharing across the escalation worktree -------------------------
 
-test("升级 worktree 会话经引用接管同一账本；验证器跑在 worktree，主检出不动", async () => {
-  const s = await setup();
-  await s.setState((state) => ({ ...state, status: "running" }));
+/**
+ * `--from base` escalation followed by a registered session taking over in
+ * the worktree: the shared setup for ledger-sharing and freeze regressions.
+ */
+async function escalateAndTakeover(
+  s: Setup, beforeTakeover?: () => Promise<void>,
+): Promise<{
+  worktree: string;
+  second: ReturnType<typeof fakePi>;
+  secondCtx: ReturnType<typeof fakeCtx>;
+}> {
   const { fake, ctx } = await startAdapter(s.repo);
   await runCmd(fake, "task escalate --from base", ctx);
   const worktree = await worktreeOf(s.repo);
-
-  // 升级后的会话登记进同一账本；验证器改用 touch 模式证明运行目录。
-  const approval = JSON.parse(await readFile(
-    path.join(s.repo, ".cw", "tasks", taskId, "approval.json"), "utf8")) as Approval;
-  approval.validator = { cmd: ["/bin/sh", fixture, "touch"], timeout_s: 600, env: {} };
-  await writeFile(path.join(s.repo, ".cw", "tasks", taskId, "approval.json"),
-    `${JSON.stringify(approval, null, 2)}\n`);
-  const payload = path.join(s.repo, "payload.json");
-  await writeFile(payload, `${report([{ id: "keep", status: "pass" }], "1")}\n`);
+  if (beforeTakeover) await beforeTakeover();
   await updateState(s.repo, taskId, "s2", (state) => ({ ...state, sessions: ["s2"] }));
-
   const second = fakePi();
   counterweight(second.pi);
   const secondCtx = fakeCtx(worktree, { session: "s2" });
   await second.call("session_start", { type: "session_start", reason: "startup" }, secondCtx.ctx);
   expect(lastNotify(secondCtx.notifications)).toContain("已接管任务");
+  return { worktree, second, secondCtx };
+}
+
+test("升级 worktree 会话经引用接管同一账本；验证器跑在 worktree，主检出不动", async () => {
+  const s = await setup();
+  await s.setState((state) => ({ ...state, status: "running" }));
+  const { worktree, second, secondCtx } = await escalateAndTakeover(s, async () => {
+    // 验证器改用 touch 模式证明运行目录。
+    const approval = JSON.parse(await readFile(
+      path.join(s.repo, ".cw", "tasks", taskId, "approval.json"), "utf8")) as Approval;
+    approval.validator = { cmd: ["/bin/sh", fixture, "touch"], timeout_s: 600, env: {} };
+    await writeFile(path.join(s.repo, ".cw", "tasks", taskId, "approval.json"),
+      `${JSON.stringify(approval, null, 2)}\n`);
+    await writeFile(path.join(s.repo, ".cw", "payload.json"),
+      `${report([{ id: "keep", status: "pass" }])}\n`);
+  });
 
   // touch 模式把 x 追加到 cwd 的 tracked.txt：证明验证器运行在 worktree。
   const settle = await second.call("agent_before_settle", settleEvent(), secondCtx.ctx);
@@ -627,6 +686,58 @@ test("升级 worktree 会话经引用接管同一账本；验证器跑在 worktr
 
   await rm(worktree, { recursive: true, force: true });
   await git(s.repo, ["worktree", "prune"]);
+}, 20_000);
+
+test("worktree 会话 tool_result 冻结检查：哈希工作树文件，冲突记入账本，无 ENOENT 降级", async () => {
+  const s = await setup();
+  await s.setState((state) => ({ ...state, status: "running" }));
+  const { worktree, second, secondCtx } = await escalateAndTakeover(s);
+
+  // 冻结文件在【工作树】被改（blob 与批准不一致）。
+  await writeFile(path.join(worktree, "tests", "a.py"), "tampered\n");
+
+  const result = await second.call("tool_result", {
+    type: "tool_result", toolCallId: "t1", toolName: "bash",
+    input: {}, content: [{ type: "text", text: "ok" }], isError: false,
+  }, secondCtx.ctx);
+
+  // 冻结冲突行追加到工具结果，且没有任何"检查未完成"的降级通知。
+  const text = (result as { content: Array<{ type: string; text: string }> }).content
+    .map((item) => item.text).join("\n");
+  expect(text).toContain("冻结文件冲突");
+  expect(text).toContain("tests/a.py");
+  expect(secondCtx.notifications.some((entry) => entry.message.includes("未能"))).toBe(false);
+
+  // 冲突与证据失效落在同一份权威账本（主检出），不在 worktree。
+  const state = await readState(s.repo, taskId);
+  expect(state.conflicts.length).toBeGreaterThan(0);
+  expect(state.last_verified).toBeNull();
+  expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "conflicts", "1.diff"))).toBe(true);
+  expect(existsSync(path.join(worktree, ".cw", "tasks"))).toBe(false);
+
+  await rm(worktree, { recursive: true, force: true });
+  await git(s.repo, ["worktree", "prune"]);
+}, 20_000);
+
+test("base 升级材料 md 写失败：状态回滚、无 json/md/事件残留", async () => {
+  const s = await setup();
+  await s.setState((state) => ({ ...state, status: "running" }));
+  // 预置同名目录，使 handback.md 的 rename 失败（两文件提交语义回滚 json）。
+  await mkdir(path.join(s.repo, ".cw", "tasks", taskId, "handback.md"));
+  const { fake } = await startAdapter(s.repo);
+  const context = fakeCtx(s.repo);
+  await runCmd(fake, "task escalate --from base", context.ctx);
+
+  // 账本回滚到升级前。
+  const state = await readState(s.repo, taskId);
+  expect(state.model).toBe("g/medium");
+  expect(state.sessions).toEqual(["s1"]);
+  // 无 worktree 残留、无半份材料、无升级事件。
+  expect(existsSync(await worktreeOf(s.repo))).toBe(false);
+  expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
+  expect((await meterEvents(s.repo, taskId))).not.toContain("escalate_pending");
+  expect((await meterEvents(s.repo, taskId))).not.toContain("escalate_target");
+  expect(context.notifications.some((entry) => entry.type === "error")).toBe(true);
 }, 20_000);
 
 test("升级 worktree 的 .cw/task.json 引用对模型写入是受保护路径", async () => {
