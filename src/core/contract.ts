@@ -33,7 +33,7 @@ const contractSchema = Type.Object({
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
-export async function readContract(path: string, repo: string): Promise<Contract> {
+export async function readContract(path: string, repo: string, expectedTaskId?: string): Promise<Contract> {
   let parsed: unknown;
   try {
     parsed = parse(await readFile(path, "utf8"));
@@ -42,6 +42,11 @@ export async function readContract(path: string, repo: string): Promise<Contract
   }
   rejectUnknown(contractSchema, parsed, "contract.toml");
   const raw = parsed as Omit<Contract, "non_goals" | "acceptance" | "red" | "regression" | "frozen" | "interface" | "baseline_inputs" | "approved_failures"> & Partial<Contract>;
+  // Approval identity boundary: a contract claiming another task's id must
+  // never be judged or approved under this task's directory.
+  if (expectedTaskId !== undefined && raw.task_id !== expectedTaskId) {
+    throw new Error(`contract.toml: task_id mismatch ${raw.task_id} ≠ ${expectedTaskId}`);
+  }
   const contract: Contract = {
     version: 1,
     task_id: raw.task_id,

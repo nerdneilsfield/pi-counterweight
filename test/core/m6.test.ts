@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -7,7 +7,7 @@ import { renderTaskView } from "../../src/core/approve.ts";
 import { readContract } from "../../src/core/contract.ts";
 import { judgeRedBaseline, runRedCheck, CannotIsolateError } from "../../src/core/redcheck.ts";
 import { treeHash } from "../../src/core/gitstate.ts";
-import { createTask } from "../../src/core/task.ts";
+import { createTask, readState, updateState, writeApproval } from "../../src/core/task.ts";
 import type { Approval } from "../../src/core/task.ts";
 import type { Contract, ValidatorConfig } from "../../src/core/types.ts";
 
@@ -272,6 +272,77 @@ function approvalOf(contract: Contract): Approval {
     approved_at: "2026-10-01T00:00:00.000Z",
   };
 }
+
+test("并发批准：后到者锁内被拒且不覆盖已批准记录任何字段", async () => {
+  const { repo } = await setup();
+  const approvalA = { ...approvalOf(baseContract), approved_at: "winner-A" };
+  const approvalB = { ...approvalOf(baseContract), approved_at: "loser-B" };
+  await writeApproval(repo, taskId, "sA", approvalA);
+
+  // 后到者拿到锁后在状态检查处被拒：approval.json 与会话登记保持胜者原样。
+  await expect(writeApproval(repo, taskId, "sB", approvalB))
+    .rejects.toThrow(/not drafting\/handed_back/);
+  const onDisk = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"));
+  expect(onDisk).toEqual(approvalA);
+  const state = await readState(repo, taskId);
+  expect(state.status).toBe("approved");
+  expect(state.sessions).toEqual(["sA"]);
+
+  // 真并发：锁竞争只产生一个胜者，落盘内容必为胜者负载，败者会话不登记。
+  await updateState(repo, taskId, "sA", (current) => ({ ...current, status: "handed_back" }));
+  const [raceA, raceB] = await Promise.allSettled([
+    writeApproval(repo, taskId, "sA2", { ...approvalA, approved_at: "race-A" }),
+    writeApproval(repo, taskId, "sB2", { ...approvalB, approved_at: "race-B" }),
+  ]);
+  const settled = [raceA, raceB];
+  const fulfilled = settled.filter((item): item is PromiseFulfilledResult<Awaited<ReturnType<typeof writeApproval>>> =>
+    item.status === "fulfilled");
+  expect(fulfilled).toHaveLength(1);
+  const winnerSessions = fulfilled[0]!.value.sessions;
+  const loserSession = winnerSessions.includes("sA2") ? "sB2" : "sA2";
+  const onDisk2 = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"));
+  expect(onDisk2.approved_at).toBe(winnerSessions.includes("sA2") ? "race-A" : "race-B");
+  const state2 = await readState(repo, taskId);
+  expect(state2.sessions).toContain(winnerSessions.at(-1)!);
+  expect(state2.sessions).not.toContain(loserSession);
+});
+
+test("先红覆盖：基线祖先为指向仓库外 canary 的符号链接时写前拒绝，canary 内容不变", async () => {
+  // 仓库外的金丝雀文件：旧实现先写后查会沿基线符号链接把它改写。
+  const canaryDir = await mkdtemp(path.join(tmpdir(), "cw-canary-"));
+  const canary = path.join(canaryDir, "canary.txt");
+  await writeFile(canary, "canary\n");
+  try {
+    const repo = await mkdtemp(path.join(tmpdir(), "cw-m6sym-"));
+    await git(repo, ["init"]);
+    await writeFile(path.join(repo, "tracked.txt"), "base\n");
+    // 基线提交里 tests 是指向仓库外文件的符号链接。
+    await symlink(canary, path.join(repo, "tests"));
+    await git(repo, ["add", "tracked.txt", "tests"]);
+    await git(repo, ["-c", "user.email=cw@example.com", "-c", "user.name=cw", "commit", "-m", "base"]);
+    const base = (await git(repo, ["rev-parse", "HEAD"])).trim();
+    // 当前工作树的“实现”：tests 换成真实目录 + 修改后的验收文件（工作树脏）。
+    await rm(path.join(repo, "tests"));
+    await mkdir(path.join(repo, "tests"), { recursive: true });
+    await writeFile(path.join(repo, "tests", "a.py"), "current\n");
+    await createTask(repo, taskId, "unassigned", base);
+    const contract = contractOf({});
+    const file = path.join(repo, ".cw", "tasks", taskId, "contract.toml");
+    await writeFile(file, contractToml(contract));
+
+    await expect(runRedCheck(redCheckRequest(repo, contract, base, validator("none"))))
+      .rejects.toThrow(/符号链接/);
+
+    // 写前拒绝：canary 保持原样；隔离基线与元数据已清理。
+    expect(await readFile(canary, "utf8")).toBe("canary\n");
+    const text = await git(repo, ["worktree", "list", "--porcelain"]);
+    expect(text.split("worktree ").length - 1).toBe(1);
+  } finally {
+    await rm(canaryDir, { recursive: true, force: true });
+  }
+});
 
 test("任务视图：≤40 行，含目标、先红标记与工具用途；超长列表截断并注明余量", () => {
   const view = renderTaskView(baseContract, approvalOf(baseContract));

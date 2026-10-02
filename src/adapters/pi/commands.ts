@@ -162,7 +162,7 @@ async function taskApprove(
   // mid-approval cannot change what this task runs.
   const project = await readProjectConfig(path.join(repo, ".cw", "project.toml"));
   const validator = project.validator;
-  const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo);
+  const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId);
 
   let red: Awaited<ReturnType<typeof runRedCheck>> | null = null;
   if (contract.deliverable === "code") {
@@ -363,7 +363,7 @@ async function taskStatus(
     `会话：${state.sessions.length === 0 ? "无" : state.sessions.join(", ")}`,
   ];
   try {
-    const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo);
+    const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId);
     const project = await readProjectConfig(path.join(repo, ".cw", "project.toml"));
     const tokensBudget = contract.budget?.tokens ?? project.budget.tokens;
     const wallMinutes = contract.budget?.wall_minutes ?? project.budget.wall_minutes;
@@ -430,7 +430,7 @@ async function taskHandback(
     ctx.ui.notify(`Counterweight: 任务 ${taskId} 状态为 ${state.status}，只有 approved/running 可交还`, "error");
     return;
   }
-  const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo);
+  const contract = await readContract(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId);
   const approval = await readApproval(repo, taskId);
   const material = await writeHandback(repo, taskId, session, {
     contract,
@@ -443,7 +443,11 @@ async function taskHandback(
     || current.status === "running"
     ? { ...current, status: "handed_back" }
     : current);
-  registration.setTask(null);
+  // Only drop the session's protection when the handed-back task is the one
+  // this session manages; an explicit other-task handback must not ungate the
+  // active task.
+  const active = registration.getTask();
+  if (active !== null && active.taskId === taskId) registration.setTask(null);
   ctx.ui.notify(`Counterweight: 任务 ${taskId} 已手动交还。材料：${material.md}`, "info");
 }
 

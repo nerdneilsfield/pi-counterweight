@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { contentSha256, judgeEvidence, type ResultReport } from "./evidence.js";
 import { commitExists, isGitRepo, treeHash, worktreeAdd, worktreePrune } from "./gitstate.js";
-import { pathInside } from "./paths.js";
+import { isNotFound, pathInside } from "./paths.js";
 import { claimRun, runValidatorProcess } from "./runner.js";
 import { writeRunRecord, type RunRecord } from "./runrecord.js";
 import { withTaskLock } from "./task.js";
@@ -117,6 +117,9 @@ function collectRedFailures(contract: Contract, result: ResultReport): RedFailur
  * whole process group terminated before this promise settles.
  */
 export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOutcome> {
+  if (request.contract.task_id !== request.taskId) {
+    throw new CannotIsolateError(`contract: task_id mismatch ${request.contract.task_id} ≠ ${request.taskId}`);
+  }
   if (!await isGitRepo(request.repo)) {
     throw new CannotIsolateError("仓库不是 git 仓库，无法从 base_commit 建立隔离基线");
   }
@@ -140,7 +143,6 @@ export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOut
     try {
       await worktreeAdd(request.repo, baseline, request.baseCommit);
       await overlayInputs(request.repo, baseline, inputs);
-      await checkContainment(baseline, inputs);
       const before = await snapshotBaseline(baseline, inputs, wanted);
       const outcome = await runValidatorProcess({
         cwd: baseline,
@@ -207,33 +209,47 @@ export async function runRedCheck(request: RedCheckRequest): Promise<RedCheckOut
   });
 }
 
-/** Copy the current worktree content of every input into the baseline. */
+/**
+ * Copy the current worktree content of every input into the baseline. All
+ * targets and every ancestor component are validated BEFORE anything is
+ * written: a symlinked ancestor (pointing anywhere, in or out of the
+ * baseline), a non-directory ancestor, an escaping path, or a non-file target
+ * rejects the whole overlay — no partial writes leave the baseline, not even
+ * when the approval is refused afterwards.
+ */
 async function overlayInputs(repo: string, baseline: string, inputs: string[]): Promise<void> {
-  for (const input of inputs) {
-    const target = path.join(baseline, input);
-    let stat;
-    try {
-      stat = await lstat(target);
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      stat = undefined;
-    }
-    if (stat !== undefined && (!stat.isFile() || stat.isSymbolicLink())) {
-      throw new CannotIsolateError(`基线中同名路径不是普通文件，无法覆盖：${input}`);
-    }
-    await mkdir(path.dirname(target), { recursive: true });
-    await writeFile(target, await readFile(path.join(repo, input)));
-  }
-}
-
-/** A written input must resolve inside the baseline, never through a checkout symlink. */
-async function checkContainment(baseline: string, inputs: string[]): Promise<void> {
   const root = await realpath(baseline);
   for (const input of inputs) {
-    const resolved = await realpath(path.join(baseline, input));
-    if (!pathInside(root, resolved)) {
-      throw new CannotIsolateError(`基线输入解析后逃逸隔离目录：${input}`);
+    const parts = input.split("/");
+    for (let index = 1; index <= parts.length; index++) {
+      const prefix = path.join(baseline, ...parts.slice(0, index));
+      let stat;
+      try {
+        stat = await lstat(prefix);
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+        continue; // Missing segment: created below (dirs) or written (target).
+      }
+      const walked = parts.slice(0, index).join("/");
+      if (stat.isSymbolicLink()) {
+        throw new CannotIsolateError(`隔离基线中存在符号链接路径，拒绝覆盖：${input}（${walked}）`);
+      }
+      if (index === parts.length) {
+        if (!stat.isFile()) {
+          throw new CannotIsolateError(`基线中同名路径不是普通文件，无法覆盖：${input}`);
+        }
+      } else if (!stat.isDirectory()) {
+        throw new CannotIsolateError(`基线中祖先不是目录，无法覆盖：${input}（${walked}）`);
+      }
+      if (!pathInside(root, await realpath(prefix))) {
+        throw new CannotIsolateError(`基线输入解析后逃逸隔离目录：${input}（${walked}）`);
+      }
     }
+  }
+  for (const input of inputs) {
+    const target = path.join(baseline, input);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, await readFile(path.join(repo, input)));
   }
 }
 

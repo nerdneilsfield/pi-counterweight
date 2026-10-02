@@ -88,7 +88,7 @@ export interface BlockedReport {
   created_at: string;
 }
 
-const PROPOSAL_STATUSES = ["approved", "rejected", "pending"] as const;
+const PROPOSAL_STATUSES = ["approved", "rejected", "pending", "consumed"] as const;
 
 export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
 
@@ -101,6 +101,10 @@ const proposalSchema = Type.Object({
   status: Type.Union(PROPOSAL_STATUSES.map((value) => Type.Literal(value))),
   session: Type.String({ minLength: 1 }),
   created_at: Type.String({ minLength: 1 }),
+  // Set when a successful (re-)approval consumes an `approved` proposal:
+  // the contract version that incorporated the change, and when.
+  resolved_in_contract_sha256: Type.Optional(hexSha256),
+  resolved_at: Type.Optional(Type.String({ minLength: 1 })),
 }, { additionalProperties: false });
 
 export interface Proposal {
@@ -112,6 +116,8 @@ export interface Proposal {
   status: ProposalStatus;
   session: string;
   created_at: string;
+  resolved_in_contract_sha256?: string;
+  resolved_at?: string;
 }
 
 export class TaskLockError extends Error {
@@ -395,9 +401,14 @@ export async function readApproval(repo: string, taskId: string): Promise<Approv
 
 /**
  * Harness-only write of the approval record plus the `drafting`/`handed_back`
- * → `approved` transition, registering the approving session. Refuses when the
- * task is in any other state; the record is only written after the caller has
- * validated the contract and (for code deliverables) the red check.
+ * → `approved` transition, registering the approving session. Everything
+ * happens inside one task lock, and the state precondition is checked BEFORE
+ * any file is touched: a concurrent approver that already moved the task
+ * forward makes this call fail without overwriting a single field of the
+ * winner. Refuses when the task is in any other state. On success, every
+ * `approved` (user-confirmed) contract-change proposal is atomically consumed
+ * — marked with the contract version that incorporated it — so the gate stops
+ * blocking on it; `pending`, `rejected`, and later proposals are untouched.
  */
 export async function writeApproval(
   repo: string, taskId: string, session: string, approval: Approval,
@@ -405,19 +416,58 @@ export async function writeApproval(
   assertTaskId(taskId);
   return withTaskLock(repo, taskId, session, async () => {
     const dir = await existingTaskDir(repo, taskId);
-    rejectUnknown(approvalSchema, approval, "approval.json");
-    const file = path.join(dir, "approval.json");
-    await rejectUnexpected(file, "approval.json");
-    await atomicWrite(file, `${JSON.stringify(approval, null, 2)}\n`);
     const state = await readState(repo, taskId);
     if (state.status !== "drafting" && state.status !== "handed_back") {
       throw new Error(`approve: task status is ${state.status}, not drafting/handed_back`);
     }
+    rejectUnknown(approvalSchema, approval, "approval.json");
+    const file = path.join(dir, "approval.json");
+    await rejectUnexpected(file, "approval.json");
+    await atomicWrite(file, `${JSON.stringify(approval, null, 2)}\n`);
     const sessions = state.sessions.includes(session) ? state.sessions : [...state.sessions, session];
     const next: TaskState = { ...state, status: "approved", sessions };
     await putState(dir, taskId, next);
+    await consumeApprovedProposals(repo, taskId, approval.contract_sha256);
     return next;
   });
+}
+
+/**
+ * Rewrite each `approved` proposal as `consumed`, bound to the contract
+ * version that resolved it. Runs under the caller's task lock, so the
+ * consumption is atomic with the approval record and state transition.
+ */
+async function consumeApprovedProposals(repo: string, taskId: string, contractSha: string): Promise<void> {
+  const proposals = path.join(await existingTaskDir(repo, taskId), "proposals");
+  let names: string[];
+  try {
+    names = (await readdir(proposals)).sort();
+  } catch (error) {
+    if (isNotFound(error)) return;
+    throw error;
+  }
+  for (const name of names) {
+    if (!/^\d+\.json$/.test(name)) continue;
+    const file = path.join(proposals, name);
+    await rejectUnexpected(file, name);
+    let proposal: Proposal;
+    try {
+      proposal = JSON.parse(await readFile(file, "utf8")) as Proposal;
+      rejectUnknown(proposalSchema, proposal, name);
+    } catch {
+      // A malformed proposal cannot drive the gate and is not ours to fix.
+      continue;
+    }
+    if (proposal.status !== "approved") continue;
+    const consumed: Proposal = {
+      ...proposal,
+      status: "consumed",
+      resolved_in_contract_sha256: contractSha,
+      resolved_at: new Date().toISOString(),
+    };
+    rejectUnknown(proposalSchema, consumed, name);
+    await atomicWrite(file, `${JSON.stringify(consumed, null, 2)}\n`);
+  }
 }
 
 /** All task directories whose state has one of the given statuses, sorted by id. */
@@ -547,7 +597,8 @@ export async function writeProposal(
 /**
  * Highest-numbered proposal that still blocks autonomous work. `pending`
  * waits for a human decision; `approved` waits for the M6 contract
- * regeneration and red-check rerun; only `rejected` lets work continue.
+ * regeneration and red-check rerun (a successful approval consumes it, see
+ * `writeApproval`); `rejected` and `consumed` let work continue.
  */
 export async function findUnresolvedProposal(repo: string, taskId: string): Promise<Proposal | null> {
   const dir = await existingTaskDir(repo, taskId);
@@ -568,7 +619,7 @@ export async function findUnresolvedProposal(repo: string, taskId: string): Prom
       const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
       rejectUnknown(proposalSchema, parsed, name);
       const proposal = parsed as Proposal;
-      if (proposal.status !== "rejected") found.push(proposal);
+      if (proposal.status !== "rejected" && proposal.status !== "consumed") found.push(proposal);
     } catch {
       // A malformed proposal cannot drive the gate; ignore it here.
     }

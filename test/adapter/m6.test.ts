@@ -11,7 +11,7 @@ import { contentSha256 } from "../../src/core/evidence.ts";
 import { blobHash, treeHash } from "../../src/core/gitstate.ts";
 import { readProjectConfig } from "../../src/core/config.ts";
 import { checkFrozen } from "../../src/core/freeze.ts";
-import { readState, updateState } from "../../src/core/task.ts";
+import { createTask, readState, updateState, writeProposal } from "../../src/core/task.ts";
 
 const fixture = path.join(import.meta.dirname, "../fixtures/validators/fake.sh");
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -564,6 +564,133 @@ test("task cancel：终止在途验证并取消任务；其后门禁不动作", 
   expect(second ?? null).toBeNull();
   expect((await readState(repo, taskId)).status).toBe("cancelled");
 }, 40_000);
+
+test("批准的提议：重批前 gate 阻塞交还，重批原子消费后 gate 继续；后来 pending 仍阻塞", async () => {
+  const { repo } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true });
+  const ctx = context.ctx;
+  await runCmd(fake, `task new ${slug}`, ctx);
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({}));
+  await runCmd(fake, "task approve", ctx);
+
+  // 用户经 propose_contract_change 批准的契约变更（status approved）。
+  await writeProposal(repo, taskId, "s1", {
+    field: "goal", new_value: "changed", reason: "契约目标写错", status: "approved",
+  });
+  const runsDir = path.join(repo, ".cw", "tasks", taskId, "runs");
+
+  // 重批前：gate 因未消费提议直接交还，不运行验证；提议细节在交还材料问题中。
+  const settled1 = await fake.call("agent_before_settle", settleEvent(), ctx);
+  const message1 = (settled1?.entries ?? []).map((entry: any) =>
+    typeof entry?.content === "string" ? entry.content : "").join("\n");
+  expect(message1).toContain("原因：blocked");
+  const material1 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "handback.json"), "utf8"));
+  expect(material1.questions.join("\n")).toContain("契约变更提议");
+  expect((await readdir(runsDir)).sort()).toEqual(["1"]);
+  expect((await readState(repo, taskId)).status).toBe("handed_back");
+
+  // 用户修订契约并重新批准：提议被原子消费并绑定新契约版本。
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"),
+    contractToml({ goal: "changed" }));
+  await runCmd(fake, "task approve", ctx);
+  const approval = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"));
+  const proposal = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "proposals", "1.json"), "utf8"));
+  expect(proposal.status).toBe("consumed");
+  expect(proposal.resolved_in_contract_sha256).toBe(approval.contract_sha256);
+  expect(proposal.resolved_at).toBeTruthy();
+
+  // 重批后：提议不再阻塞，gate 实际运行验证器（批准命令下 red1 fail → continue）。
+  const settled2 = await fake.call("agent_before_settle", settleEvent(), ctx);
+  expect(settled2?.continue).toBe(true);
+  const message2 = (settled2?.entries ?? []).map((entry: any) =>
+    typeof entry?.content === "string" ? entry.content : "").join("\n");
+  expect(message2).toContain("验收未通过");
+  expect((await readdir(runsDir)).sort()).toEqual(["1", "2", "3"]);
+
+  // 后来产生的 pending 提议不被清除，继续阻塞；已消费提议保持消费态。
+  await writeProposal(repo, taskId, "s1", {
+    field: "tier", new_value: "script", reason: "任务变小了", status: "pending",
+  });
+  const settled3 = await fake.call("agent_before_settle", settleEvent(), ctx);
+  const message3 = (settled3?.entries ?? []).map((entry: any) =>
+    typeof entry?.content === "string" ? entry.content : "").join("\n");
+  expect(message3).toContain("原因：blocked");
+  const material3 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "handback.json"), "utf8"));
+  expect(material3.questions.join("\n")).toContain("proposals/2.json");
+  const pending = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "proposals", "2.json"), "utf8"));
+  expect(pending.status).toBe("pending");
+  const consumed = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "proposals", "1.json"), "utf8"));
+  expect(consumed.status).toBe("consumed");
+}, 30_000);
+
+test("task handback 其他任务：active 任务保护保留", async () => {
+  const { repo, base } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true });
+  const ctx = context.ctx;
+  await runCmd(fake, `task new ${slug}`, ctx);
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({}));
+  await runCmd(fake, "task approve", ctx);
+
+  // 直接构造第二个已批准任务 B（fixture 方式，不走命令）。
+  const idB = `${ymd()}-second-fix`;
+  await createTask(repo, idB, "unassigned", base);
+  await writeFile(path.join(repo, ".cw", "tasks", idB, "contract.toml"), contractToml({})
+    .replace(`task_id = "${taskId}"`, `task_id = "${idB}"`));
+  await writeFile(path.join(repo, ".cw", "tasks", idB, "approval.json"), `${JSON.stringify({
+    version: 1,
+    contract_sha256: "1".repeat(64),
+    project_config_sha256: "1".repeat(64),
+    validator: { cmd: ["/bin/true"], timeout_s: 600, env: {} },
+    base_commit: base,
+    baseline_inputs_sha256: {},
+    frozen_blobs: {},
+    red_check_run: 0,
+    approved_at: new Date().toISOString(),
+  }, null, 2)}\n`);
+  await updateState(repo, idB, "s1", (current) => ({ ...current, status: "approved" }));
+
+  // 交还 B：A 仍是本会话 active，保护不得解除。
+  await runCmd(fake, `task handback ${idB}`, ctx);
+  expect((await readState(repo, idB)).status).toBe("handed_back");
+  expect((await readState(repo, taskId)).status).toBe("approved");
+  const stillBlocked = await fake.call("tool_call", toolCallEvent("write", {
+    path: `.cw/tasks/${taskId}/contract.toml`, content: "x",
+  }), ctx);
+  expect(stillBlocked).toMatchObject({ block: true });
+
+  // 无参交还命中唯一 approved 的 A：此时才解除本会话保护。
+  await runCmd(fake, "task handback", ctx);
+  expect((await readState(repo, taskId)).status).toBe("handed_back");
+  const unblocked = await fake.call("tool_call", toolCallEvent("write", {
+    path: `.cw/tasks/${taskId}/contract.toml`, content: "x",
+  }), ctx);
+  expect(unblocked ?? null).toBeNull();
+}, 30_000);
+
+test("契约 task_id 与任务目录不一致：approve 明确拒绝", async () => {
+  const { repo } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true });
+  await runCmd(fake, `task new ${slug}`, context.ctx);
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({})
+    .replace(`task_id = "${taskId}"`, 'task_id = "20260101-other-fix"'));
+  await runCmd(fake, "task approve", context.ctx);
+  expect(lastNotify(context.notifications)).toContain("task_id mismatch");
+  await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"))
+    .rejects.toThrow();
+  expect((await readState(repo, taskId)).status).toBe("drafting");
+}, 30_000);
 
 test("task handback：生成材料并置 handed_back；契约修订后可重新批准且 base_commit 不变", async () => {
   const { repo, base } = await setup();

@@ -222,7 +222,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       // external modification after session_start must not be judged against
       // the stale snapshot.
       const contract = await readContract(
-        path.join(active.root, ".cw", "tasks", taskId, "contract.toml"), active.root);
+        path.join(active.root, ".cw", "tasks", taskId, "contract.toml"), active.root, taskId);
       let state = await readState(repo, taskId);
       if (state.status !== "approved" && state.status !== "running") return undefined;
       if (state.status === "approved") {
@@ -399,7 +399,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       if (state.status !== "running" && state.status !== "approved") return undefined;
       // Re-read the authoritative contract; the session snapshot may be stale.
       const contract = await readContract(
-        path.join(active.root, ".cw", "tasks", active.taskId, "contract.toml"), active.root);
+        path.join(active.root, ".cw", "tasks", active.taskId, "contract.toml"), active.root, active.taskId);
       const material = await writeHandback(active.root, active.taskId, active.session, {
         contract,
         validator: active.approval.validator,
@@ -521,7 +521,7 @@ async function locateTask(ctx: ExtensionContext): Promise<ActiveTask | null> {
  */
 export async function loadTask(repo: string, taskId: string, session: string): Promise<ActiveTask> {
   const root = await realpath(repo);
-  const contract = await readContract(path.join(root, ".cw", "tasks", taskId, "contract.toml"), root);
+  const contract = await readContract(path.join(root, ".cw", "tasks", taskId, "contract.toml"), root, taskId);
   const approval = await readApproval(root, taskId);
   const project = await readProjectConfig(path.join(root, ".cw", "project.toml"));
   return { taskId, root, session, contract, approval, project };
