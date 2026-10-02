@@ -11,7 +11,7 @@ import type { Contract, LastVerified, TaskState, ValidatorConfig } from "./types
 import { assertRunRecord, type RunRecord } from "./runrecord.js";
 
 export type HandbackOutcome =
-  | HandbackReason | "finish" | "cancelled" | "manual" | "escalated";
+  | HandbackReason | "finish" | "cancelled" | "manual" | "escalated" | "escalate_pending";
 
 export interface HandbackRequest {
   contract: Contract;
@@ -83,7 +83,8 @@ const REASON_LABELS: Record<HandbackOutcome, string> = {
   finish: "验收通过，任务结束",
   cancelled: "用户取消，验收结果未发布",
   manual: "用户手动交还",
-  escalated: "模型升级，任务移交更强模型的新会话",
+  escalated: "模型升级完成，任务已移交更强模型的新会话",
+  escalate_pending: "模型升级材料已就绪，等待用户在新 worktree 手动交接（启动 Pi 并 resume）",
 };
 
 /**
@@ -294,6 +295,16 @@ async function readNotes(repo: string, taskId: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * The model's live notes (`notes.md`), or null when absent. The escalation
+ * view carries these as the previous model's unverified notes; reading them
+ * directly (instead of through a just-written handback material) lets the
+ * escalation write its material only after the switch actually succeeded.
+ */
+export async function readTaskNotes(repo: string, taskId: string): Promise<string | null> {
+  return readNotes(repo, taskId);
 }
 
 /** Verbatim body of the notes section titled `title`, or "" when absent. */

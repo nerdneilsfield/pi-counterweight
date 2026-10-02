@@ -8,7 +8,7 @@ import { canonicalSha256 } from "../../core/canonical.js";
 import { contentSha256 } from "../../core/evidence.js";
 import { EscalateError, REFERENCE_FILE, prepareBaseEscalation } from "../../core/escalate.js";
 import { blobHash, headCommit, isClean, isLinkedWorktree, worktreePrune } from "../../core/gitstate.js";
-import { writeHandback, readHandbackMaterial } from "../../core/handback.js";
+import { writeHandback, readHandbackMaterial, readTaskNotes } from "../../core/handback.js";
 import { recordTaskEvent } from "../../core/meter.js";
 import { CannotIsolateError, runRedCheck } from "../../core/redcheck.js";
 import { assertTaskId, isNotFound } from "../../core/paths.js";
@@ -414,9 +414,13 @@ async function taskResume(
   // M7 adoption point: this session now runs the task's approved model.
   await applyTaskModel(pi, ctx, task);
   // An escalated task's resumed session carries the previous model's notes
-  // in its first task view (marked unverified), per plan M7.
+  // in its first task view (marked unverified), per plan M7 — both the
+  // completed (`escalated`) and the pending manual handover
+  // (`escalate_pending`) variants.
   const material = await readHandbackMaterial(ledger, arg);
-  const notes = material?.reason === "escalated" ? material.notes : null;
+  const notes = material?.reason === "escalated" || material?.reason === "escalate_pending"
+    ? material.notes
+    : null;
   await appendTaskView(pi, ctx, task.contract, task.approval, notes);
   ctx.ui.notify(`Counterweight: 会话已登记到任务 ${arg}；未重建基线。`, "info");
 }
@@ -570,12 +574,19 @@ const ESCALATE_USAGE = "用法：/cw task escalate [--from base|current]（默�
  * Hand the task to a stronger-model session. Budget counters and repair
  * counts are never reset and the escalation allocates no extra budget.
  *
+ * Failure consistency: the escalation handback material and its meter events
+ * are written ONLY after the handover actually landed. A cancelled or failed
+ * switch rolls the single ledger write back under the task lock and leaves no
+ * material, no event, and no session/model change — nothing that would fake a
+ * successful escalation. `--from base` never claims a completed escalation at
+ * all: its material is `escalate_pending` (manual handover in a new worktree).
+ *
  * `--from base` (default): a detached worktree of the original base_commit
  * receives the approved acceptance inputs and a reference to the one
  * authoritative ledger. Pi 1.0's command context cannot start a session in
  * another working directory (`newSession` has no `cwd`), so this command does
- * NOT claim the upgrade happened — it releases this session's execution
- * right and tells the user to start Pi in the new worktree and resume.
+ * NOT start the session — it releases this session's execution right and
+ * tells the user to start Pi in the new worktree and resume.
  * `--from current`: the session is actually replaced here; the new session is
  * registered on the same ledger and gets the strong model plus a task view
  * that carries the previous model's (unverified) notes.
@@ -605,9 +616,9 @@ async function taskEscalate(
   const ledger = await resolveTaskRepo(ctx, taskId);
   if (ledger === null) return;
   await registration.stopValidation();
-  const state = await readState(ledger, taskId);
-  if (state.status !== "approved" && state.status !== "running") {
-    ctx.ui.notify(`Counterweight: 任务 ${taskId} 状态为 ${state.status}，只有 approved/running 可升级`, "error");
+  const oldState = await readState(ledger, taskId);
+  if (oldState.status !== "approved" && oldState.status !== "running") {
+    ctx.ui.notify(`Counterweight: 任务 ${taskId} 状态为 ${oldState.status}，只有 approved/running 可升级`, "error");
     return;
   }
   const contract = await readContract(path.join(ledger, ".cw", "tasks", taskId, "contract.toml"), ledger, taskId);
@@ -638,24 +649,38 @@ async function taskEscalate(
       }
       throw error;
     }
+    // The ledger transition is the commitment point; the pending-handover
+    // material follows it and, if it fails, everything above is rolled back —
+    // a half-released task with "ready to hand over" material must not exist.
+    try {
+      await updateState(ledger, taskId, session, released);
+    } catch (error) {
+      await rm(worktree, { recursive: true, force: true });
+      await worktreePrune(ledger);
+      throw error;
+    }
     try {
       await writeHandback(ledger, taskId, session, {
         contract,
         validator: approval.validator,
-        reason: "escalated",
+        reason: "escalate_pending",
         questions: [
           `请在升级 worktree ${worktree} 启动新的 pi 会话（加载本扩展），执行 /cw task resume ${taskId}；`
             + `任务模型已切换为 ${strong}。`,
         ],
         autoVerified: false,
       });
-      // Release this session's execution right; the new session takes the
-      // same task lock when it starts working. Counters stay untouched.
-      await updateState(ledger, taskId, session, released);
     } catch (error) {
-      // Never leave a half-registered escalation behind.
+      // Material failure must not leave a released task advertised as ready:
+      // restore the pre-escalation state, remove the worktree, rethrow.
       await rm(worktree, { recursive: true, force: true });
       await worktreePrune(ledger);
+      try {
+        await updateState(ledger, taskId, session, () => oldState);
+      } catch (restoreError) {
+        ctx.ui.notify(`Counterweight: 升级材料生成失败且账本恢复也失败，请人工核对 .cw/tasks/${taskId}/state.json（${
+          restoreError instanceof Error ? restoreError.message : "unknown"}）`, "error");
+      }
       throw error;
     }
     await recordTaskEvent(ledger, taskId, session, "escalate_target", {
@@ -663,7 +688,7 @@ async function taskEscalate(
     });
     if (registration.getTask()?.taskId === taskId) registration.setTask(null);
     ctx.ui.notify(
-      `Counterweight: 任务 ${taskId} 升级材料已就绪。Pi 无法跨目录替你启动新会话（newSession 无 cwd 参数），`
+      `Counterweight: 任务 ${taskId} 升级材料已就绪（待手动交接）。Pi 无法跨目录替你启动新会话（newSession 无 cwd 参数），`
       + `请在 ${worktree} 启动新的 pi 并执行 /cw task resume ${taskId}（模型 ${strong}）。`
       + `原工作树未改动；修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
       "info",
@@ -672,23 +697,32 @@ async function taskEscalate(
   }
 
   // --from current: the session is really replaced; the ledger keeps one
-  // registered session (the new one) and the strong model.
-  const material = await writeHandback(ledger, taskId, session, {
-    contract,
-    validator: approval.validator,
-    reason: "escalated",
-    questions: [],
-    autoVerified: false,
-  });
-  const notes = material.material.notes;
+  // registered session (the new one) and the strong model. The notes for the
+  // first task view are read from notes.md up front, so the handback material
+  // can be written only after the switch has fully landed.
+  const notes = await readTaskNotes(ledger, taskId);
+  const view = renderTaskView(contract, approval, notes);
+  const previousTask = registration.getTask();
   let switched = false;
-  let switchError: string | null = null;
+  let failure: string | null = null;
   let cancelled = false;
+  let rollbackError: string | null = null;
   try {
     const result = await ctx.newSession({
       withSession: async (newCtx) => {
+        const newSession = newCtx.sessionManager.getSessionId();
         try {
-          const newSession = newCtx.sessionManager.getSessionId();
+          // Fallible, non-mutating steps first: the model switch either lands
+          // or the ledger is never touched.
+          const split = strong.indexOf("/");
+          const model = split > 0
+            ? newCtx.modelRegistry?.find(strong.slice(0, split), strong.slice(split + 1))
+            : undefined;
+          if (model === undefined) throw new Error(`模型 ${strong} 不在模型注册表中，未切换`);
+          if (typeof pi.setModel !== "function") throw new Error("宿主未提供 setModel，未切换");
+          if (!(await pi.setModel(model))) {
+            throw new Error(`模型 ${strong} 的 provider 未配置认证，未切换`);
+          }
           await updateState(ledger, taskId, newSession, (current) => {
             const next = released(current);
             return next.sessions.includes(newSession)
@@ -697,8 +731,6 @@ async function taskEscalate(
           });
           const active = await loadTask(repo, ledger, taskId, newSession);
           registration.setTask(active);
-          // Adoption point of the new session: strong model, from state.
-          await applyTaskModel(pi, newCtx, active);
           newCtx.ui.notify(
             `Counterweight: 已切换到升级会话（任务 ${taskId}，模型 ${strong}）；`
             + `修复与预算计数保持不变。材料：.cw/tasks/${taskId}/handback.md`,
@@ -706,32 +738,62 @@ async function taskEscalate(
           );
           await newCtx.sendMessage({
             customType: "counterweight",
-            content: renderTaskView(contract, approval, notes),
+            content: view,
             display: true,
           }, { triggerTurn: false });
           switched = true;
         } catch (error) {
-          switchError = error instanceof Error ? error.message : "unknown";
+          failure = error instanceof Error ? error.message : "unknown";
+          // Roll the single ledger write back so state matches the
+          // pre-escalation task; nothing else was committed.
+          try {
+            await updateState(ledger, taskId, newSession, () => oldState);
+          } catch (restoreIssue) {
+            rollbackError = restoreIssue instanceof Error ? restoreIssue.message : "unknown";
+          }
+          registration.setTask(previousTask);
         }
       },
     });
     cancelled = result.cancelled;
   } catch (error) {
     cancelled = true;
-    switchError = error instanceof Error ? error.message : "unknown";
+    failure = failure ?? (error instanceof Error ? error.message : "unknown");
   }
   if (!switched) {
-    // The old session keeps its registration: nothing was committed.
+    const reasonText = cancelled ? "会话替换被取消" : `切换失败：${failure ?? "unknown"}`;
+    const rollbackText = rollbackError === null
+      ? ""
+      : `；警告：账本恢复失败（${rollbackError}），请人工核对 .cw/tasks/${taskId}/state.json`;
     ctx.ui.notify(
-      `Counterweight: 升级未完成（${cancelled ? "会话替换被取消" : `切换失败：${switchError ?? "unknown"}`}）；`
-      + `任务保持原状，本会话仍是登记会话。`,
+      `Counterweight: 升级未完成（${reasonText}）；未写升级材料与计量事件，任务账本已恢复原状${rollbackText}。`
+      + `若当前会话已被替换，请用 /cw task resume ${taskId} 重新接管。`,
       "error",
     );
     return;
   }
-  await recordTaskEvent(ledger, taskId, session, "escalate_target", {
-    mode, model: strong,
-  });
+  // The switch fully landed: only now does the escalation material (with its
+  // meter event) exist, so a failed switch can never leave success artifacts.
+  let materialWarning: string | null = null;
+  try {
+    await writeHandback(ledger, taskId, session, {
+      contract,
+      validator: approval.validator,
+      reason: "escalated",
+      questions: [],
+      autoVerified: false,
+    });
+  } catch (error) {
+    materialWarning = error instanceof Error ? error.message : "unknown";
+  }
+  await recordTaskEvent(ledger, taskId, session, "escalate_target", { mode, model: strong });
+  if (materialWarning !== null) {
+    ctx.ui.notify(
+      `Counterweight: 会话已切换，但升级交还材料生成失败（${materialWarning}）；`
+      + `账本与模型切换有效，请人工核对并补齐 .cw/tasks/${taskId}/handback.md。`,
+      "warning",
+    );
+  }
 }
 
 // ---- shared helpers --------------------------------------------------------

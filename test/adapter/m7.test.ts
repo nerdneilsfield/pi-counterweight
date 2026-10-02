@@ -94,6 +94,10 @@ interface CtxOptions {
   hasUI?: boolean;
   confirmResult?: boolean;
   session?: string;
+  /** Registry entries that resolve to undefined (model adoption failure). */
+  missingModels?: string[];
+  /** Make the replaced session's sendMessage throw (late withSession failure). */
+  failSendMessage?: boolean;
   newSession?: (options: { withSession?: (c: ExtensionContext) => Promise<void> }) => Promise<{ cancelled: boolean }>;
 }
 
@@ -101,7 +105,8 @@ function fakeCtx(repo: string, options: CtxOptions = {}) {
   const notifications: Array<{ message: string; type?: string }> = [];
   const replacedSent: Array<{ message: { content: string } }> = [];
   const registry = {
-    find: (provider: string, id: string) => ({ provider, id }),
+    find: (provider: string, id: string) =>
+      options.missingModels?.includes(id) ? undefined : { provider, id },
   };
   const ctx = {
     cwd: repo,
@@ -119,6 +124,7 @@ function fakeCtx(repo: string, options: CtxOptions = {}) {
     waitForIdle: async () => undefined,
     newSession: options.newSession,
     sendMessage: (message: any, opts?: any) => {
+      if (options.failSendMessage) throw new Error("sendMessage failed");
       replacedSent.push({ message });
     },
   };
@@ -263,6 +269,19 @@ async function startAdapter(repo: string, timeouts?: Partial<AdapterTimeouts>) {
   return { fake, ...context };
 }
 
+/** Meter events of a task, parsed from meter.jsonl (empty when absent). */
+async function meterEvents(repo: string, id: string): Promise<string[]> {
+  try {
+    const text = await readFile(path.join(repo, ".cw", "tasks", id, "meter.jsonl"), "utf8");
+    return text.trim().split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((line) => line.kind === "task")
+      .map((line) => line.event as string);
+  } catch {
+    return [];
+  }
+}
+
 const worktreeOf = async (repo: string) =>
   escalationWorktreePath(await realpath(repo), taskId);
 
@@ -405,7 +424,7 @@ test("escalate --from current：同账本替换会话，strong 模型，笔记�
   expect(existsSync(await worktreeOf(s.repo))).toBe(false);
 }, 20_000);
 
-test("escalate --from current 会话替换被取消：任务保持原状", async () => {
+test("escalate --from current 会话替换被取消：任务保持原状，无升级材料与事件", async () => {
   const s = await setup();
   const { fake } = await startAdapter(s.repo);
   const context = fakeCtx(s.repo, {
@@ -417,6 +436,66 @@ test("escalate --from current 会话替换被取消：任务保持原状", async
   const state = await readState(s.repo, taskId);
   expect(state.model).toBe("g/medium");
   expect(state.sessions).toEqual(["s1"]);
+  // 取消后不得留下宣称升级成功的材料/事件。
+  expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalated");
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalate_target");
+  expect(fake.setModels.filter((model) => model.id === "strong")).toEqual([]);
+}, 20_000);
+
+test("escalate --from current withSession 晚段失败：账本持锁回滚，零材料零事件", async () => {
+  const s = await setup();
+  await s.setState((state) => ({ ...state, status: "running", repairs_used: 2, tokens_used: 500 }));
+  const { fake } = await startAdapter(s.repo);
+  let replaced: ReturnType<typeof fakeCtx> | null = null;
+  const context = fakeCtx(s.repo, {
+    session: "s1",
+    newSession: async (options) => {
+      replaced = fakeCtx(s.repo, { session: "s2", failSendMessage: true });
+      if (options.withSession) await options.withSession(replaced.ctx);
+      return { cancelled: false };
+    },
+  });
+  await runCmd(fake, "task escalate --from current", context.ctx);
+  expect(anyNotify(context.notifications, "升级未完成")).toBe(true);
+  expect(anyNotify(context.notifications, "sendMessage failed")).toBe(true);
+  // 账本回滚：模型、登记会话、计数全部保持原状。
+  const state = await readState(s.repo, taskId);
+  expect(state.model).toBe("g/medium");
+  expect(state.sessions).toEqual(["s1"]);
+  expect(state.repairs_used).toBe(2);
+  expect(state.tokens_used).toBe(500);
+  // 无假成功材料/事件。
+  expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalated");
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalate_target");
+  expect(replaced!.replacedSent).toEqual([]);
+}, 20_000);
+
+test("escalate --from current 模型接管失败：账本从未被改，零材料零事件", async () => {
+  const s = await setup();
+  await s.setState((state) => ({ ...state, status: "running", repairs_used: 1, tokens_used: 100 }));
+  const { fake } = await startAdapter(s.repo);
+  let replaced: ReturnType<typeof fakeCtx> | null = null;
+  const context = fakeCtx(s.repo, {
+    session: "s1",
+    newSession: async (options) => {
+      replaced = fakeCtx(s.repo, { session: "s2", missingModels: ["strong"] });
+      if (options.withSession) await options.withSession(replaced.ctx);
+      return { cancelled: false };
+    },
+  });
+  await runCmd(fake, "task escalate --from current", context.ctx);
+  expect(anyNotify(context.notifications, "升级未完成")).toBe(true);
+  expect(anyNotify(context.notifications, "不在模型注册表中")).toBe(true);
+  const state = await readState(s.repo, taskId);
+  expect(state.model).toBe("g/medium");
+  expect(state.sessions).toEqual(["s1"]);
+  expect(state.repairs_used).toBe(1);
+  expect(state.tokens_used).toBe(100);
+  expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalated");
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalate_target");
   expect(fake.setModels.filter((model) => model.id === "strong")).toEqual([]);
 }, 20_000);
 
@@ -456,7 +535,8 @@ test("escalate --from base：worktree、账本引用、释放原会话；无 cwd
   expect(existsSync(path.join(worktree, ".cw", "tasks"))).toBe(false);
   const material = JSON.parse(await readFile(
     path.join(s.repo, ".cw", "tasks", taskId, "handback.json"), "utf8"));
-  expect(material.reason).toBe("escalated");
+  // base 降级不宣称升级成功：材料是"待手动交接"。
+  expect(material.reason).toBe("escalate_pending");
   expect(material.questions.join(" ")).toContain(worktree);
   // 报告是明确的操作指引，不宣称升级已完成。
   expect(anyNotify(context.notifications, worktree)).toBe(true);
@@ -467,7 +547,8 @@ test("escalate --from base：worktree、账本引用、释放原会话；无 cwd
   const target = meter.find((line) => line.event === "escalate_target") as
     { detail: { mode: string; worktree: string; model: string } } | undefined;
   expect(target?.detail).toMatchObject({ mode: "base", worktree, model: "g/strong" });
-  expect(meter.map((line) => line.event)).toContain("escalated");
+  expect(meter.map((line) => line.event)).toContain("escalate_pending");
+  expect(meter.map((line) => line.event)).not.toContain("escalated");
   // 基础升级不会在本进程切模型（没有新会话可设）。
   expect(fake.setModels.filter((model) => model.id === "strong")).toEqual([]);
 
@@ -499,6 +580,10 @@ test("escalate --from base 锁被其他会话持有：拒绝且清理 worktree�
   const state = await readState(s.repo, taskId);
   expect(state.sessions).toEqual(["s1"]);
   expect(state.model).toBe("g/medium");
+  // 账本未变：无交接材料、无升级事件。
+  expect(existsSync(path.join(s.repo, ".cw", "tasks", taskId, "handback.json"))).toBe(false);
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalate_pending");
+  expect(await meterEvents(s.repo, taskId)).not.toContain("escalate_target");
   await release();
 }, 20_000);
 

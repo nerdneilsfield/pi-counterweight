@@ -46,10 +46,10 @@ npm run build
 /cw task escalate [--from base|current]   # 默认 base
 ```
 
-升级把任务交给 `strong` 模型的新会话；修复次数与已用预算不清零，也不追加预算。升级前先生成交还材料（`.cw/tasks/<id>/handback.md`，原因 `escalated`）。
+升级把任务交给 `strong` 模型的新会话；修复次数与已用预算不清零，也不追加预算。升级材料与计量事件只在交接真正落地后写入：切换被取消、失败或模型未能接管时，账本持锁回滚，不留下任何宣称升级成功的材料或事件。
 
-- `--from base`（默认）：在 `<仓库>/../<仓库名>-cw-<任务id>-esc` 建立基于原始 `base_commit` 的 worktree，只覆盖批准的验收输入（与批准哈希逐一核对，不一致即拒绝并清理），并写入指向唯一权威账本的引用 `<worktree>/.cw/task.json`。**Pi 1.0 的命令上下文无法跨工作目录启动新会话（`newSession` 没有 `cwd` 参数）**，因此该命令不伪造"升级完成"：它释放原会话的执行权、把 `state.model` 切到 strong，并提示你手动在新 worktree 启动 Pi（加载本扩展）后执行 `/cw task resume <id>`。原工作树代码不变，可写账本不复制。
-- `--from current`：在当前工作树用 `ctx.newSession` 真正替换会话；新会话登记进同一账本、采用 strong 模型，并把任务视图连同"前一模型的笔记，未经验证"一并追加。
+- `--from base`（默认）：在 `<仓库>/../<仓库名>-cw-<任务id>-esc` 建立基于原始 `base_commit` 的 worktree，只覆盖批准的验收输入（与批准哈希逐一核对，不一致即拒绝并清理），并写入指向唯一权威账本的引用 `<worktree>/.cw/task.json`。**Pi 1.0 的命令上下文无法跨工作目录启动新会话（`newSession` 没有 `cwd` 参数）**，因此该命令不冒充升级完成：它释放原会话的执行权、把 `state.model` 切到 strong，写入原因 `escalate_pending` 的交接材料（明确待手动交接），并提示你手动在新 worktree 启动 Pi（加载本扩展）后执行 `/cw task resume <id>`。原工作树代码不变，可写账本不复制。
+- `--from current`：在当前工作树用 `ctx.newSession` 真正替换会话；先落模型、再提交账本、最后追加视图，任一步失败即恢复原账本。切换成功后才写原因 `escalated` 的材料；新会话登记进同一账本、采用 strong 模型，任务视图连同"前一模型的笔记，未经验证"一并追加。
 - 升级 worktree 内的会话通过 `.cw/task.json` 引用找到同一份权威账本；该引用是受保护路径，模型不可直接写入。未登记的会话不会自动接管；`resume` 接管升级任务时，任务视图附带前一模型的笔记（标注未经验证）。
 
 探针要求显式设置 `CW_GATEWAY_URL`（完整 Chat Completions 地址）、`CW_GATEWAY_API_KEY`、`CW_GATEWAY_MODEL`，然后运行 `npm run probe-cache`。两次长请求会产生费用；只有首个请求的 prompt token 超过 2000 且第二个请求报告缓存读取时，结果才为 `supported`，否则为 `unconfirmed`。`unconfirmed` 不代表网关不支持缓存。
