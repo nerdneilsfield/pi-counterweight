@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "test": "vitest run",
-    "probe-cache": "node --experimental-strip-types src/cli/probe-cache.ts"
+    "probe-cache": "node --experimental-strip-types src/cli/probe-cache.ts",
+    "observe": "node dist/src/cli/observe.js"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.0.0",

@@ -1,6 +1,6 @@
 # pi-counterweight
 
-Counterweight 的 Pi 扩展工程。当前实现 M0–M7：版本命令、网关缓存探针、`project.toml` / `contract.toml` 校验、任务目录与 Git 树快照、验证器运行与验收证据判定、冻结文件保护、门禁决策与交还材料、Pi 事件适配层（门禁接线、工具注册、计量），`/cw` 命令流程与契约先红批准，以及按任务选模型、任务升级与缓存纪律。
+Counterweight 的 Pi 扩展工程。当前实现 M0–M7：版本命令、网关缓存探针、`project.toml` / `contract.toml` 校验、任务目录与 Git 树快照、验证器运行与验收证据判定、冻结文件保护、门禁决策与交还材料、Pi 事件适配层（门禁接线、工具注册、计量），`/cw` 命令流程与契约先红批准，以及按任务选模型、任务升级与缓存纪律。另有 M9 的 `cw observe` 观测命令与 `eval/` 评估脚手架（见下文）。
 
 需要 Node.js `>=22.19.0`。Pi 固定为 `1.0.0`。
 
@@ -53,3 +53,40 @@ npm run build
 - 升级 worktree 内的会话通过 `.cw/task.json` 引用找到同一份权威账本；该引用是受保护路径，模型不可直接写入。未登记的会话不会自动接管；`resume` 接管升级任务时，任务视图附带前一模型的笔记（标注未经验证）。
 
 探针要求显式设置 `CW_GATEWAY_URL`（完整 Chat Completions 地址）、`CW_GATEWAY_API_KEY`、`CW_GATEWAY_MODEL`，然后运行 `npm run probe-cache`。两次长请求会产生费用；只有首个请求的 prompt token 超过 2000 且第二个请求报告缓存读取时，结果才为 `supported`，否则为 `unconfirmed`。`unconfirmed` 不代表网关不支持缓存。
+
+## 观测命令（cw observe）
+
+```sh
+npm run build
+npm run observe -- [--note <文字>] -- <cmd> [args...]
+```
+
+在当前目录运行一条命令，并把现场记录到 `./.cw/observations/<UTC时间戳>/`（同一秒冲突时追加 `-n`）：
+
+- `observation.json`：命令 argv 原样数组（不经 shell 拼接）、工作目录、`--note` 备注、退出码、终止信号、超时/取消标记、git 仓库根/提交/树哈希（非 git 仓库记 `supported: false`，不绑定）、OS 摘要、以及 `.cw/project.toml` 可选 `[observe] versions = ["node", ...]` 指定的各命令 `--version` 探测结果；
+- `stdout-tail.txt` / `stderr-tail.txt`：两条流的尾部各 200 行（总量超约 1 MiB 时截断并注明，只保留尾部）。
+
+命令失败、被 Ctrl+C（SIGINT/SIGTERM 会终止整个子进程组）都不影响记录完整性：`observation.json` 在命令启动前先落盘、结束后更新。观察者只记录，不做任何分析；环境摘要只含 OS 与工具版本，环境变量不入记录。observe 自身的退出码镜像被观测命令的退出码（spawn 失败为 127，用法错误为 2）。
+
+## 评估脚手架（eval/）
+
+```sh
+npm run build
+cp eval/tasks.example.toml my-tasks.toml   # 按注释填写仓库、基线提交、任务与契约
+node dist/eval/run.js my-tasks.toml [--repeat <n>] [--out <dir>]
+```
+
+对每个任务按四种条件各运行一次，每次都从基线提交的全新 detached worktree 开始：
+
+1. `native`：原生 pi，不加载 Counterweight；
+2. `gate`：pi + 门禁（契约来自任务文件；不运行先红检查，不冻结文件）；
+3. `contract`：上一条 + 契约保护（frozen 冻结）与先红检查（先红不成立时该次运行为 `red_check_failed`）；
+4. `escalate`：上一条 + `[models].cheap` 便宜模型先试，终态不是 `verified` 就换任务模型在全新 worktree 重来（`escalated = true`）。
+
+输出（默认 `eval/out/<时间戳>/`，已 gitignore）：
+
+- `results.csv`：每次运行一行，列为 `task, condition, repeat, final_state, verdict, wall_seconds, tokens, cache_read, cache_write, cost, repairs, escalated`。`final_state` 取 pi 结束原因或门禁账本状态；`verdict` 来自任务 `verify_cmd` 独立验证（结果不回灌）；token/缓存/费用取自 pi `--mode json` 事件的 usage 求和；
+- `judging/index.md` 与 `judging/j-<n>.md`：打乱顺序、**不含条件标签**的人工评判清单（任务描述、验收说明、评判标准、结果 diff 截 400 行）；
+- `key.csv`：key → 条件映射，供评判完成后揭晓对照，不与清单一起阅读。
+
+门禁条件会在被评估仓库的 worktree 里自动写入 `.cw/project.toml` 与任务账本（任务 id 为 `<UTC日期>-<id>`），并以 `/cw task resume` 作为第一条消息登记会话。此脚手架只用伪任务自测过，尚未在真实模型上执行；`/cw task resume` 在 print/json 模式下的命令分发属待实测项。

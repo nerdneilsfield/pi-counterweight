@@ -17,6 +17,15 @@ async function workTree(repo: string): Promise<string | null> {
   return result.stdout.trim();
 }
 
+/**
+ * The worktree root containing `dir`, or null when git has none. Unlike
+ * `isGitRepo` this accepts any directory inside a repository; callers that
+ * need "the repo this cwd belongs to" (observe) use this.
+ */
+export async function repoToplevel(dir: string): Promise<string | null> {
+  return workTree(dir);
+}
+
 export async function isClean(repo: string): Promise<GitValue<boolean>> {
   if (!await isGitRepo(repo)) return { supported: false };
   const result = await git(repo, ["status", "--porcelain", "--", ".", ":(exclude).cw"]);

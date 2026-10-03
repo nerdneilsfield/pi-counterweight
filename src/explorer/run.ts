@@ -152,13 +152,15 @@ interface ParsedEvents {
   usage: UsageSample[];
 }
 
+export type { ParsedEvents };
+
 /**
  * Parse the JSONL event stream. Unparseable lines (e.g. the leading session
  * header) are skipped; the last assistant `message_end` is the final answer,
  * and usage is summed across every assistant `message_end` — an agentic run
- * emits one per turn.
+ * emits one per turn. Shared with the M9 evaluation scaffold.
  */
-function parseEvents(stdout: string): ParsedEvents {
+export function parseEvents(stdout: string): ParsedEvents {
   const usage: UsageSample[] = [];
   let finalAssistant: ParsedEvents["finalAssistant"] = null;
   for (const line of stdout.split("\n")) {

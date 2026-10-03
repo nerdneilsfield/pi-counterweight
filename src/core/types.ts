@@ -26,6 +26,8 @@ export interface ProjectConfig {
   budget: Budget;
   models: { cheap: string; medium: string; strong: string; explorer: string };
   tiers: { script: TierModel; change: TierModel; interface: TierModel };
+  /** Optional `[observe]` section; `versions` names `--version` probes for `cw observe`. */
+  observe: { versions: string[] };
 }
 
 export type TierModel = "cheap" | "medium" | "strong";

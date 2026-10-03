@@ -1,0 +1,50 @@
+# 评估任务定义示例。复制一份填写真实任务；路径解析以本文件所在目录为基准。
+#
+# 每个任务在四种条件下各运行一次，每次都从 base_commit 的全新 detached
+# worktree 开始：
+#   1. native    原生 pi（不加载 Counterweight）
+#   2. gate      pi + 门禁（契约来自任务文件；不运行先红检查，不冻结文件）
+#   3. contract  上一条 + 契约保护（frozen 冻结）与先红检查
+#   4. escalate  上一条 + 便宜模型先试，失败后换任务模型重来
+#
+# 运行：npm run build 后 node dist/eval/run.js <tasks.toml> [--repeat <n>] [--out <dir>]
+
+version = 1
+
+# 门禁条件会把这份模型表写进被评估仓库的 .cw/project.toml。
+[models]
+cheap = "gateway/cheap-model"
+medium = "gateway/medium-model"
+strong = "gateway/strong-model"
+explorer = "gateway/cheap-model"
+
+[tiers]
+script = "cheap"
+change = "medium"
+interface = "strong"
+
+[[tasks]]
+id = "demo-001"                # 实际任务 id 为 <UTC日期>-<id>，须满足 YYYYMMDD-<slug>
+repo = "/absolute/path/to/repo"  # git 仓库；基线提交必须可达
+base_commit = "main"           # 提交 sha 或可解析引用
+tier = "change"
+model = "gateway/medium-model"  # 条件 1–3 与条件 4 的升级目标都使用它
+prompt = "修复 src/util.js 中的边界错误，使 verify.mjs 通过。"        # 任务描述，原样发给 pi
+acceptance = "node verify.mjs 退出码为 0，且未修改 tests/。"          # 验收说明（给评判者的背景）
+judge = "改动是否最小、是否引入无关重构、验证结论是否可信。"           # 人工评判标准
+verify_cmd = ["node", "verify.mjs"]  # 独立验证器：每次运行结束后判定，结果不回灌
+run_timeout_s = 1800           # 单次 pi 运行上限
+
+[tasks.validator]              # 门禁条件的验证器（写入被评估仓库的 .cw/project.toml）
+cmd = ["./validate.sh"]
+timeout_s = 600
+env = {}
+
+[tasks.contract]               # 门禁条件的契约；goal 即 prompt
+deliverable = "code"
+non_goals = []
+acceptance = ["check:verify"]
+red = ["check:verify"]
+regression = []
+frozen = []
+baseline_inputs = []

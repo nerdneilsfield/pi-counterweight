@@ -147,4 +147,5 @@ AGENTS.md
 .opencode/
 .cache/
 .clangd/
+eval/out/
 

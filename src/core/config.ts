@@ -30,6 +30,9 @@ const projectSchema = Type.Object({
     change: TierName,
     interface: TierName,
   }, { additionalProperties: false }),
+  observe: Type.Optional(Type.Object({
+    versions: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
 const DEFAULT_TIMEOUT_S = 600;
@@ -50,6 +53,7 @@ export async function readProjectConfig(path: string): Promise<ProjectConfig> {
     budget?: { tokens?: number; wall_minutes?: number; repairs?: number };
     models: ProjectConfig["models"];
     tiers: ProjectConfig["tiers"];
+    observe?: { versions?: string[] };
   };
   return {
     version: 1,
@@ -65,6 +69,7 @@ export async function readProjectConfig(path: string): Promise<ProjectConfig> {
     },
     models: value.models,
     tiers: value.tiers,
+    observe: { versions: value.observe?.versions ?? [] },
   };
 }
 
