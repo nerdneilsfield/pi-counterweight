@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { finalizeExplorerAnswer } from "../../core/explore.js";
 import { recordTaskEvent, recordUsage } from "../../core/meter.js";
 import { treeHash } from "../../core/gitstate.js";
-import { updateState, writeBlocked, writeProposal } from "../../core/task.js";
+import { readState, updateState, writeBlocked, writeProposal } from "../../core/task.js";
 import { runExplorer } from "../../explorer/run.js";
 import type { ActiveTask } from "./index.js";
 
@@ -116,6 +116,18 @@ async function runExploreForTask(
   task: ActiveTask, question: string, signal: AbortSignal | undefined,
   registration: ToolRegistration,
 ): Promise<string> {
+  // The in-memory registration can be stale: another session may have
+  // cancelled, handed back, or taken the task over since this session
+  // adopted it. The authoritative ledger decides — no subprocess is spawned
+  // unless the task is still in an executable state and this session is
+  // still registered on it.
+  const state = await readState(task.ledger, task.taskId);
+  if (state.status !== "approved" && state.status !== "running") {
+    return `[counterweight] cw_explore 拒绝执行：任务 ${task.taskId} 当前状态为 ${state.status}，不在可执行状态。`;
+  }
+  if (!state.sessions.includes(task.session)) {
+    return `[counterweight] cw_explore 拒绝执行：本会话已不再登记在任务 ${task.taskId} 的会话列表中。`;
+  }
   const model = task.project.models.explorer;
   const before = await treeHash(task.root);
   const run = await runExplorer({

@@ -271,6 +271,97 @@ test("外部取消（宿主信号）同样终止子进程组", async () => {
   }
 }, 30_000);
 
+test("先输出完整回答后挂起：超时判失败，回答不被接受，usage 仍记账", async () => {
+  const pidFile = path.join(tmpdir(), `cw-m8-late-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  process.env.CW_FAKE_PID_FILE = pidFile;
+  const harness = await setup({
+    mode: "answerthenhang",
+    timeoutMs: 300,
+    text: "结论甲 tests/a.py:1",
+    usage: { input: 11, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+  });
+  try {
+    const result = await run(harness, "q");
+    expect(result).toContain("未返回结果");
+    expect(result).toContain("超时");
+    expect(result).not.toContain("结论甲");
+    const pid = Number(await readFile(pidFile, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
+    const usageLines = (await meterLines(harness.repo)).filter((line) => line.kind === "usage");
+    expect(usageLines).toHaveLength(1);
+    expect((await readState(harness.repo, taskId)).tokens_used).toBe(15);
+  } finally {
+    delete process.env.CW_FAKE_PID_FILE;
+    await rm(pidFile, { force: true }).catch(() => undefined);
+    await harness.cleanup();
+  }
+}, 30_000);
+
+test("先输出完整回答后被取消：回答不被接受，usage 仍记账", async () => {
+  const pidFile = path.join(tmpdir(), `cw-m8-late-cancel-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  process.env.CW_FAKE_PID_FILE = pidFile;
+  const harness = await setup({
+    mode: "answerthenhang",
+    timeoutMs: 60_000,
+    text: "结论甲 tests/a.py:1",
+    usage: { input: 6, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 8 },
+  });
+  try {
+    const controller = new AbortController();
+    const pending = run(harness, "q", controller.signal);
+    for (let waited = 0; !existsSync(pidFile) && waited < 5_000; waited += 25) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    controller.abort();
+    const result = await pending;
+    expect(result).toContain("未返回结果");
+    expect(result).toContain("已被取消");
+    expect(result).not.toContain("结论甲");
+    const usageLines = (await meterLines(harness.repo)).filter((line) => line.kind === "usage");
+    expect(usageLines).toHaveLength(1);
+    expect((await readState(harness.repo, taskId)).tokens_used).toBe(8);
+  } finally {
+    delete process.env.CW_FAKE_PID_FILE;
+    await rm(pidFile, { force: true }).catch(() => undefined);
+    await harness.cleanup();
+  }
+}, 30_000);
+
+test("执行前重读权威状态：非 approved/running 或本会话不再登记时拒绝且不派子进程", async () => {
+  const harness = await setup({ mode: "answer", text: "结论甲 tests/a.py:1" });
+  const argvFile = path.join(harness.repo, ".cw", "fake-argv.json");
+  try {
+    // a) another session handed the task back.
+    await updateState(harness.repo, taskId, "s1", (state) => ({ ...state, status: "handed_back" }));
+    let result = await run(harness, "q");
+    expect(result).toContain("拒绝执行");
+    expect(result).toContain("handed_back");
+    expect(existsSync(argvFile)).toBe(false);
+
+    // b) task executable again but this session was removed (cross-session takeover).
+    await updateState(harness.repo, taskId, "s1", (state) => ({ ...state, status: "approved", sessions: ["s2"] }));
+    result = await run(harness, "q");
+    expect(result).toContain("拒绝执行");
+    expect(result).toContain("不再登记");
+    expect(existsSync(argvFile)).toBe(false);
+
+    // c) cancelled outright.
+    await updateState(harness.repo, taskId, "s1", (state) => ({ ...state, sessions: ["s1"], status: "cancelled" }));
+    result = await run(harness, "q");
+    expect(result).toContain("拒绝执行");
+    expect(result).toContain("cancelled");
+    expect(existsSync(argvFile)).toBe(false);
+
+    // d) restored to the recorded executable state → the tool runs again.
+    await updateState(harness.repo, taskId, "s1", (state) => ({ ...state, status: "approved", sessions: ["s1"] }));
+    result = await run(harness, "q");
+    expect(result).toContain("结论甲 tests/a.py:1");
+    expect(existsSync(argvFile)).toBe(true);
+  } finally {
+    await harness.cleanup();
+  }
+}, 20_000);
+
 test("子进程修改文件树时结果被标注为不可信，且改动不被还原", async () => {
   const harness = await setup({ mode: "writetree", text: "结论甲 tests/a.py:1" });
   try {
@@ -380,10 +471,12 @@ test("finalizeExplorerAnswer：引用行号必须落在文件范围内", async (
   try {
     await mkdir(path.join(repo, "tests"), { recursive: true });
     await writeFile(path.join(repo, "tests", "a.py"), "one\ntwo\n");
+    await writeFile(path.join(repo, "tests", "empty.txt"), "");
     const finalized = await finalizeExplorerAnswer(
-      "甲 tests/a.py:2\n乙 tests/a.py:3\n未找到", repo);
-    expect(finalized.text).toBe("甲 tests/a.py:2\n乙 tests/a.py:3 〔引用无效〕\n未找到");
-    expect(finalized.invalidRefs).toEqual(["tests/a.py:3"]);
+      "甲 tests/a.py:2\n乙 tests/a.py:3\n丙 tests/empty.txt:1\n未找到", repo);
+    expect(finalized.text)
+      .toBe("甲 tests/a.py:2\n乙 tests/a.py:3 〔引用无效〕\n丙 tests/empty.txt:1 〔引用无效〕\n未找到");
+    expect(finalized.invalidRefs).toEqual(["tests/a.py:3", "tests/empty.txt:1"]);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

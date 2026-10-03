@@ -35,6 +35,12 @@ if (mode === "answer") {
 } else if (mode === "writetree") {
   writeFileSync("explorer-wrote.txt", "the explorer must not write\n");
   emit(message("stop", text));
+} else if (mode === "answerthenhang") {
+  // Emits a complete final answer first, then hangs: a run killed after the
+  // answer must still be judged failed by the runner.
+  emit(message("stop", text));
+  writeFileSync(process.env.CW_FAKE_PID_FILE ?? "fake-pi.pid", String(process.pid));
+  setInterval(() => {}, 60_000);
 } else if (mode === "hang") {
   writeFileSync(process.env.CW_FAKE_PID_FILE ?? "fake-pi.pid", String(process.pid));
   setInterval(() => {}, 60_000);

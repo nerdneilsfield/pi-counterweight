@@ -76,6 +76,7 @@ async function referenceValid(repo: string, relative: string, lineNo: number): P
   } catch {
     return false;
   }
-  const total = content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
+  // An empty file has zero lines: `empty.txt:1` is invalid.
+  const total = content === "" ? 0 : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
   return lineNo <= total;
 }

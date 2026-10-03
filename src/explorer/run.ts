@@ -127,24 +127,20 @@ export async function runExplorer(request: ExplorerRequest): Promise<ExplorerRun
       return { answer: null, error: `探索者输出不可读：${message(error)}`, usage: [], timedOut: outcome.timedOut, cancelled: outcome.cancelled };
     }
     const events = parseEvents(stdout);
-    if (events.finalAssistant === null) {
-      const reason = outcome.timedOut ? "超时，子进程组已终止"
-        : outcome.cancelled ? "已被取消" : "没有最终回答";
-      return { answer: null, error: reason, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled };
-    }
+    // Post-run verdict discipline mirrors the runner's discard order: a run
+    // that was cancelled or timed out is a failure even when the subprocess
+    // managed to emit a final answer before hanging — the answer of a killed
+    // run is never accepted. Its usage is still returned for accounting.
+    const failure = (reason: string): ExplorerRun =>
+      ({ answer: null, error: reason, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled });
+    if (outcome.cancelled) return failure("已被取消");
+    if (outcome.timedOut) return failure("超时，子进程组已终止");
+    if (events.finalAssistant === null) return failure("没有最终回答");
     const assistant = events.finalAssistant;
     if (assistant.stopReason !== "stop") {
-      return {
-        answer: null,
-        error: `探索者未正常结束（stop reason: ${assistant.stopReason}）`,
-        usage: events.usage,
-        timedOut: outcome.timedOut,
-        cancelled: outcome.cancelled,
-      };
+      return failure(`探索者未正常结束（stop reason: ${assistant.stopReason}）`);
     }
-    if (assistant.text.trim() === "") {
-      return { answer: null, error: "探索者返回空回答", usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled };
-    }
+    if (assistant.text.trim() === "") return failure("探索者返回空回答");
     return { answer: assistant.text, error: null, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled };
   } finally {
     await rm(scratch, { recursive: true, force: true });
