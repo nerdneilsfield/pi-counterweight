@@ -83,6 +83,24 @@ test("observe：尾部输出恰好 200 行", async () => {
   }
 });
 
+test("observe：行数截断时标记保留，恰为 200 行尾部（150000 短行）", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-marker-"));
+  try {
+    const script = "awk 'BEGIN{for(i=1;i<=150000;i++) print \"o\"i}'";
+    await recordObservation({ cwd: dir, command: ["/bin/sh", "-c", script], note: null });
+    const observation = await onlyObservationDir(dir);
+    const lines = (await readFile(path.join(observation, "stdout-tail.txt"), "utf8")).split("\n")
+      .filter((line) => line !== "");
+    // 150000 行远超 200 行上限：标记 + 最后 200 行，标记不得被 slice 丢掉。
+    expect(lines[0]).toBe("[counterweight: 仅保留尾部 200 行]");
+    expect(lines).toHaveLength(201);
+    expect(lines[1]).toBe("o149801");
+    expect(lines[200]).toBe("o150000");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("observe：超大输出时窗口有界并注明截断", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-window-"));
   try {
@@ -328,6 +346,15 @@ test("eval：伪 pi 跑通四条件，CSV 行数正确，评判清单不含条�
       ["contract", "escalate", "gate", "native"]);
     const worktrees = (await git(repo, ["worktree", "list", "--porcelain"])).trim().split("\n\n");
     expect(worktrees).toHaveLength(1);
+    // 无孤儿：评估结束（含红检/验证/清理路径）后不应残留任何伪 pi 进程。
+    const ps = await new Promise<string>((done, reject) => {
+      const child = spawn("ps", ["-eo", "args"]);
+      let out = "";
+      child.stdout.on("data", (chunk) => { out += chunk; });
+      child.once("error", reject);
+      child.once("close", () => done(out));
+    });
+    expect(ps.includes("fixtures/eval/fake-pi")).toBe(false);
   } finally {
     delete process.env.CW_EVAL_ARGV_FILE;
     delete process.env.CW_EVAL_FAIL_MODEL;

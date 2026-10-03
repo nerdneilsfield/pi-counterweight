@@ -128,16 +128,21 @@ export async function recordObservation(options: {
       stderrPath: path.join(scratch, "stderr"),
       signal: options.signal,
     });
-    await writeTail(path.join(scratch, "stdout"), path.join(dir, "stdout-tail.txt"));
-    await writeTail(path.join(scratch, "stderr"), path.join(dir, "stderr-tail.txt"));
-    record.finished_at = new Date().toISOString();
-    record.exit_code = outcome.exitCode;
-    record.signal = outcome.signal;
-    record.timed_out = outcome.timedOut;
-    record.cancelled = outcome.cancelled;
-    record.runner_error = outcome.runnerError;
-    await writeObservationRecord(dir, record);
-    return { dir, record };
+    try {
+      await writeTail(path.join(scratch, "stdout"), path.join(dir, "stdout-tail.txt"));
+      await writeTail(path.join(scratch, "stderr"), path.join(dir, "stderr-tail.txt"));
+      record.finished_at = new Date().toISOString();
+      record.exit_code = outcome.exitCode;
+      record.signal = outcome.signal;
+      record.timed_out = outcome.timedOut;
+      record.cancelled = outcome.cancelled;
+      record.runner_error = outcome.runnerError;
+      await writeObservationRecord(dir, record);
+      return { dir, record };
+    } finally {
+      // 已读完 outcome 字段：释放父信号监听，不再续挂。
+      outcome.dispose();
+    }
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
@@ -238,6 +243,8 @@ function timestampName(date: Date): string {
  * Last `TAIL_LINES` lines of `source`, never more than ~1 MiB: the file is
  * read backwards in chunks until both bounds are met; content beyond the
  * window is dropped behind an explicit marker instead of being kept whole.
+ * The marker is prepended after the last-`TAIL_LINES` slice, so it survives
+ * whenever truncation happened — by line count or by the byte window.
  */
 async function writeTail(source: string, target: string): Promise<void> {
   const handle = await open(source, "r");
@@ -256,16 +263,16 @@ async function writeTail(source: string, target: string): Promise<void> {
         if (byte === 0x0a) newlines++;
       }
     }
-    let text = collected.toString("utf8");
-    if (position > 0) {
-      // 首行不完整（窗口截断）：丢弃并注明，不冒充完整行。
-      const index = text.indexOf("\n");
-      text = index === -1 ? "" : text.slice(index + 1);
-      text = `[counterweight: 仅保留尾部 ${TAIL_LINES} 行]\n${text}`;
-    }
-    const parts = text.split("\n");
+    const parts = collected.toString("utf8").split("\n");
     if (parts[parts.length - 1] === "") parts.pop();
-    const tail = parts.slice(-TAIL_LINES);
+    let tail = parts;
+    if (position > 0) {
+      // 未读到文件头：首个不完整行丢弃；截断标记加在切片之后，不会被丢掉。
+      tail = tail.slice(1).slice(-TAIL_LINES);
+      tail = [`[counterweight: 仅保留尾部 ${TAIL_LINES} 行]`, ...tail];
+    } else {
+      tail = tail.slice(-TAIL_LINES);
+    }
     await writeFile(target, tail.length === 0 ? "" : `${tail.join("\n")}\n`);
   } finally {
     await handle.close();

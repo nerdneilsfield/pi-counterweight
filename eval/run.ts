@@ -430,13 +430,18 @@ async function runPi(dir: string, pi: string, argv: string[], timeoutMs: number)
       stdoutPath: path.join(scratch, "stdout"),
       stderrPath: path.join(scratch, "stderr"),
     });
-    let stdout = "";
     try {
-      stdout = await readFile(path.join(scratch, "stdout"), "utf8");
-    } catch {
-      // 无输出（进程未启动等）：事件为空，final state 会标出失败原因。
+      let stdout = "";
+      try {
+        stdout = await readFile(path.join(scratch, "stdout"), "utf8");
+      } catch {
+        // 无输出（进程未启动等）：事件为空，final state 会标出失败原因。
+      }
+      return { outcome, events: parseEvents(stdout) };
+    } finally {
+      // 字段已读取/随结果返回：释放父信号监听（评估脚手架不发布证据）。
+      outcome.dispose();
     }
-    return { outcome, events: parseEvents(stdout) };
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
@@ -463,8 +468,12 @@ async function runVerifier(dir: string, cmd: string[], timeoutMs: number): Promi
       stdoutPath: path.join(scratch, "stdout"),
       stderrPath: path.join(scratch, "stderr"),
     });
-    if (outcome.timedOut || outcome.cancelled || outcome.runnerError !== null) return "not_run";
-    return outcome.exitCode === 0 ? "pass" : "fail";
+    try {
+      if (outcome.timedOut || outcome.cancelled || outcome.runnerError !== null) return "not_run";
+      return outcome.exitCode === 0 ? "pass" : "fail";
+    } finally {
+      outcome.dispose();
+    }
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
