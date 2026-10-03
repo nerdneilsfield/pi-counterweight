@@ -223,7 +223,7 @@ async function startSession(repo: string, timeouts?: Partial<AdapterTimeouts>) {
 test("工具按声明顺序注册且全部 sequential", async () => {
   const { repo } = await setup();
   const { fake } = await startSession(repo);
-  expect(fake.tools.map((tool) => tool.name)).toEqual(["report_blocked", "propose_contract_change"]);
+  expect(fake.tools.map((tool) => tool.name)).toEqual(["report_blocked", "propose_contract_change", "cw_explore"]);
   expect(fake.tools.every((tool) => tool.executionMode === "sequential")).toBe(true);
   expect(fake.commands.has("cw-version")).toBe(true);
 });

@@ -1,11 +1,19 @@
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { writeBlocked, writeProposal } from "../../core/task.js";
+import { finalizeExplorerAnswer } from "../../core/explore.js";
+import { recordTaskEvent, recordUsage } from "../../core/meter.js";
+import { treeHash } from "../../core/gitstate.js";
+import { updateState, writeBlocked, writeProposal } from "../../core/task.js";
+import { runExplorer } from "../../explorer/run.js";
 import type { ActiveTask } from "./index.js";
 
 export interface ToolRegistration {
   /** Currently managed task, or null when this session manages none. */
   getTask: () => ActiveTask | null;
+  /** Test seam: overrides explorer CLI discovery. */
+  explorerCliPath?: string;
+  /** Test seam: overrides the explorer subprocess budget. */
+  explorerTimeoutMs?: number;
 }
 
 function text(message: string) {
@@ -78,4 +86,106 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
       return text(`[counterweight] 契约变更提议已写入 .cw/tasks/${task.taskId}/proposals/${proposal.n}.json。${note}`);
     },
   });
+
+  pi.registerTool({
+    name: "cw_explore",
+    label: "探索者提问",
+    description:
+      "向只读探索者子代理提问代码库问题。探索者在子进程中运行，只有 read 与 grep 两个工具，"
+      + "不能修改文件；回答有 30 行上限，逐条校验 path:line 引用。用于定位代码事实（实现位置、调用关系、现状），"
+      + "不要用它做需要写入或执行的操作。token 消耗计入当前任务预算。",
+    parameters: Type.Object({
+      question: Type.String({ minLength: 1 }),
+    }, { additionalProperties: false }),
+    executionMode: "sequential",
+    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+      const task = registration.getTask();
+      if (task === null) return text("[counterweight] 当前没有受管任务，cw_explore 不可用。");
+      return text(await runExploreForTask(task, params.question, signal, registration));
+    },
+  });
+}
+
+/**
+ * One explorer round for the managed task: subprocess run with tree
+ * bookkeeping around it, usage into the parent meter and budget, answer
+ * post-processed (30-line cap, `path:line` validation), and an untrusted
+ * marking whenever the tree hash moved across the run.
+ */
+async function runExploreForTask(
+  task: ActiveTask, question: string, signal: AbortSignal | undefined,
+  registration: ToolRegistration,
+): Promise<string> {
+  const model = task.project.models.explorer;
+  const before = await treeHash(task.root);
+  const run = await runExplorer({
+    workRoot: task.root,
+    model,
+    question,
+    signal,
+    cliPath: registration.explorerCliPath,
+    timeoutMs: registration.explorerTimeoutMs,
+  });
+  const after = await treeHash(task.root);
+
+  // Usage is accounted no matter how the run ended: the tokens were spent.
+  let spent = 0;
+  for (const sample of run.usage) {
+    await recordUsage(task.ledger, task.taskId, {
+      time: new Date().toISOString(),
+      session: task.session,
+      model,
+      input: sample.input,
+      output: sample.output,
+      cache_read: sample.cacheRead,
+      cache_write: sample.cacheWrite,
+      cost_total: sample.costTotal,
+    });
+    spent += sample.totalTokens > 0
+      ? sample.totalTokens
+      : sample.input + sample.output + sample.cacheRead + sample.cacheWrite;
+  }
+  if (spent > 0) {
+    await updateState(task.ledger, task.taskId, task.session, (current) => ({
+      ...current,
+      tokens_used: current.tokens_used + spent,
+    }));
+  }
+
+  if (run.error !== null) {
+    await recordTaskEvent(task.ledger, task.taskId, task.session, "explore", {
+      outcome: "failed", error: run.error, tokens: spent,
+      timed_out: run.timedOut, cancelled: run.cancelled,
+    });
+    return `[counterweight] 探索者未返回结果（${run.error}）；本次消耗 ${spent} token。`;
+  }
+
+  const finalized = await finalizeExplorerAnswer(run.answer!, task.root);
+  const untrusted = treeUntrustedReason(before, after);
+  await recordTaskEvent(task.ledger, task.taskId, task.session, "explore", {
+    outcome: "answered",
+    trusted: untrusted === null,
+    truncated: finalized.truncated,
+    invalid_refs: finalized.invalidRefs.length,
+    tokens: spent,
+    timed_out: run.timedOut,
+  });
+  const header = `[counterweight] 探索者回答（模型 ${model}，消耗 ${spent} token）`
+    + (untrusted === null ? "" : `；${untrusted}，本次结果不可信`);
+  return `${header}：\n${finalized.text}`;
+}
+
+/**
+ * The explorer must not write; a tree hash that moved across the run (or a
+ * tree hash that cannot be computed at all) marks the answer untrusted
+ * (plan M8 item 5). The changed files are left as they are.
+ */
+function treeUntrustedReason(
+  before: Awaited<ReturnType<typeof treeHash>>,
+  after: Awaited<ReturnType<typeof treeHash>>,
+): string | null {
+  if (before.supported && after.supported) {
+    return before.value !== after.value ? "探索者运行期间仓库树发生变化" : null;
+  }
+  return "无法核对仓库树哈希";
 }
