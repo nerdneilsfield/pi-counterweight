@@ -162,6 +162,24 @@ versions = ["node"]
   }
 });
 
+test("observe：命令不存在时 runner_error 保留具体原因而非裸退出码", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-enoent-"));
+  try {
+    const { record } = await recordObservation({
+      cwd: dir,
+      command: ["/nonexistent-cw-m9-cmd"],
+      note: null,
+    });
+    expect(record.exit_code).toBeNull();
+    expect(record.runner_error).toContain("ENOENT");
+    const observation = await onlyObservationDir(dir);
+    expect(await readFile(path.join(observation, "stdout-tail.txt"), "utf8")).toBe("");
+    expect(await readFile(path.join(observation, "stderr-tail.txt"), "utf8")).toBe("");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("observe：参数解析要求 -- 并原样保留 argv", () => {
   expect(parseObserveArgv(["--note", "a b", "--", "make", "test"])).toEqual({
     command: ["make", "test"],
@@ -175,17 +193,18 @@ test("observe：参数解析要求 -- 并原样保留 argv", () => {
   expect(() => parseObserveArgv(["--"])).toThrow(UsageError);
 });
 
-test("eval：伪 pi 跑通四条件，CSV 行数正确，评判清单不含条件标签", async () => {
-  const workspace = await mkdtemp(path.join(tmpdir(), "cw-m9-eval-"));
+/** Fixture repo + tasks.toml shared by the eval tests. */
+async function evalWorkspace(prefix: string): Promise<{ workspace: string; repo: string; tasksPath: string }> {
+  const workspace = await mkdtemp(path.join(tmpdir(), prefix));
   const repo = path.join(workspace, "repo");
   await mkdir(repo);
   await git(repo, ["init"]);
   await writeFile(path.join(repo, "verify.mjs"), "process.exit(0);\n");
-  await writeFile(path.join(repo, "validate.sh"),
-    "#!/bin/sh\n" +
-    "printf '%s\\n' '{\"protocol\":1,\"run_id\":\"'\"$CW_RUN_ID\"'\",\"complete\":true," +
-    "\"checks\":[{\"id\":\"t:red\",\"status\":\"fail\",\"message\":\"baseline red\"}],\"build\":{\"required\":false}," +
-    "\"summary\":\"red\",\"logs\":[]}' > \"$CW_RESULT_DIR/result.json\"\n");
+  await writeFile(path.join(repo, "validate.sh"), `#!/bin/sh
+status=fail
+[ "\$CW_EVAL_RED_STATUS" = "pass" ] && status=pass
+printf '%s\\n' '{"protocol":1,"run_id":"'"$CW_RUN_ID"'","complete":true,"checks":[{"id":"t:red","status":"'"$status"'","message":"baseline red"}],"build":{"required":false},"summary":"red","logs":[]}' > "$CW_RESULT_DIR/result.json"
+`);
   await git(repo, ["add", "verify.mjs", "validate.sh"]);
   await git(repo, ["-c", "user.email=cw@example.com", "-c", "user.name=cw", "commit", "-m", "base"]);
   const tasksPath = path.join(workspace, "tasks.toml");
@@ -226,6 +245,16 @@ regression = []
 frozen = []
 baseline_inputs = []
 `);
+  return { workspace, repo, tasksPath };
+}
+
+async function readRows(outDir: string): Promise<string[][]> {
+  const lines = (await readFile(path.join(outDir, "results.csv"), "utf8")).trimEnd().split("\n");
+  return lines.slice(1).map((line) => line.split(","));
+}
+
+test("eval：伪 pi 跑通四条件，CSV 行数正确，评判清单不含条件标签", async () => {
+  const { workspace, repo, tasksPath } = await evalWorkspace("cw-m9-eval-");
   const argvLog = path.join(workspace, "argv.jsonl");
   process.env.CW_EVAL_ARGV_FILE = argvLog;
   process.env.CW_EVAL_FAIL_MODEL = "fake/cheap";
@@ -288,6 +317,8 @@ baseline_inputs = []
     for (const label of ["native", "gate", "contract", "escalate"]) {
       expect(all).not.toContain(label);
     }
+    // .cw/ 是 harness 状态（native 没有、门禁条件有），出现即可反推条件。
+    expect(all).not.toContain(".cw/");
     expect(index).toContain("j-1");
     const keyCsv = await readFile(path.join(outDir, "key.csv"), "utf8");
     const keyLines = keyCsv.trimEnd().split("\n");
@@ -300,6 +331,48 @@ baseline_inputs = []
   } finally {
     delete process.env.CW_EVAL_ARGV_FILE;
     delete process.env.CW_EVAL_FAIL_MODEL;
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("eval：先红拒绝时 contract/escalate 为 red_check_failed，不计升级不启动强模型", async () => {
+  const { workspace, tasksPath } = await evalWorkspace("cw-m9-red-");
+  const argvLog = path.join(workspace, "argv.jsonl");
+  process.env.CW_EVAL_ARGV_FILE = argvLog;
+  process.env.CW_EVAL_RED_STATUS = "pass"; // 先红项在基线通过 → 先红检查拒绝
+  const outDir = path.join(workspace, "out");
+  try {
+    const summary = await runEvaluation({
+      tasksPath,
+      outDir,
+      piPath: resolve("test/fixtures/eval/fake-pi.mjs"),
+    });
+    expect(summary.rows).toHaveLength(4);
+    const rows = await readRows(outDir);
+    const byCondition = new Map(rows.map((row) => [row[1]!, row]));
+    expect(byCondition.get("native")![3]).toBe("completed");
+    expect(byCondition.get("gate")![3]).toBe("approved");
+    expect(byCondition.get("contract")![3]).toBe("red_check_failed");
+    expect(byCondition.get("escalate")![3]).toBe("red_check_failed");
+    expect(byCondition.get("contract")![4]).toBe("not_run");
+    expect(byCondition.get("escalate")![4]).toBe("not_run");
+    expect(byCondition.get("native")![4]).toBe("pass");
+    expect(byCondition.get("gate")![4]).toBe("pass");
+    // contract 与 escalate 的 cheap/strong 都没有进入模型执行：仅 native+gate 两次 pi。
+    const argvLines = (await readFile(argvLog, "utf8")).trimEnd().split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(argvLines).toHaveLength(2);
+    for (const argv of argvLines) {
+      expect(argv[argv.indexOf("--model") + 1]).toBe("fake/strong");
+    }
+    expect(argvLines[0]!.includes("--extension")).toBe(false);
+    expect(argvLines[1]!.includes("--extension")).toBe(true);
+    expect(byCondition.get("escalate")![11]).toBe("false");
+    expect(byCondition.get("escalate")![6]).toBe("0");
+    expect(byCondition.get("escalate")![9]).toBe("");
+  } finally {
+    delete process.env.CW_EVAL_ARGV_FILE;
+    delete process.env.CW_EVAL_RED_STATUS;
     await rm(workspace, { recursive: true, force: true });
   }
 });

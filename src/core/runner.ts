@@ -201,12 +201,13 @@ export async function runValidatorProcess(options: {
   // `cancelled`. The caller releases the listener via `dispose` when it stops
   // reading it.
   abort.cancelTimer();
+  const failure = runnerError ?? watch?.state.spawnError ?? null;
   return {
-    exitCode: runnerError === null ? stop.exitCode : null,
+    exitCode: failure === null ? stop.exitCode : null,
     signal: stop.signal,
     timedOut: abort.timedOut,
     get cancelled() { return abort.cancelled; },
-    runnerError,
+    runnerError: failure,
     dispose: () => abort.dispose(),
   };
 }
@@ -409,20 +410,31 @@ function linkAbort(parent: AbortSignal | undefined, timeoutMs: number): {
 
 interface ChildWatch {
   leader: Promise<number | undefined>;
-  state: { exited: boolean; code: number | null; signal: string | null };
+  state: { exited: boolean; code: number | null; signal: string | null; spawned: boolean; spawnError: string | null };
 }
 
 /**
  * Attach lifecycle listeners synchronously right after spawn. The parent closes
  * the log-file handles before awaiting anything else; a listener attached only
- * inside stopGroup could miss the `spawn` or `exit` event entirely.
+ * inside stopGroup could miss the `spawn` or `exit` event entirely. An `error`
+ * before `spawn` is the async spawn failure (e.g. ENOENT): its message is
+ * captured for the run record instead of degrading to a bare exit code.
  */
 function watchChild(child: ChildProcess): ChildWatch {
-  const state = { exited: false, code: null as number | null, signal: null as string | null };
+  const state = {
+    exited: false, code: null as number | null, signal: null as string | null,
+    spawned: false, spawnError: null as string | null,
+  };
   let resolveLeader!: (pid: number | undefined) => void;
   const leader = new Promise<number | undefined>((resolve) => { resolveLeader = resolve; });
-  child.once("spawn", () => resolveLeader(child.pid));
-  child.once("error", () => resolveLeader(undefined));
+  child.once("spawn", () => {
+    state.spawned = true;
+    resolveLeader(child.pid);
+  });
+  child.once("error", (error: Error) => {
+    if (!state.spawned) state.spawnError = error.message;
+    resolveLeader(child.pid);
+  });
   child.once("exit", (code, signal) => {
     state.exited = true;
     state.code = code;

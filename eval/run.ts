@@ -268,9 +268,11 @@ async function runCondition(input: ConditionInput): Promise<{ row: EvalRow; entr
       finalState = attempt.state;
     } else {
       // 便宜模型先试；终态不是 verified 就换任务模型在全新 worktree 重来。
+      // 但先红拒绝（red_check_failed）发生在任何模型运行之前，换模型必然
+      // 再次被拒：按失败终态记录，不计升级、不启动强模型。
       const cheap = await runIn(input.config.models.cheap, { redCheck: true, protectFrozen: true });
       finalState = cheap.state;
-      if (cheap.state !== "verified") {
+      if (cheap.state !== "verified" && cheap.state !== "red_check_failed") {
         escalated = true;
         const strong = await runIn(input.task.model, { redCheck: true, protectFrozen: true });
         finalState = strong.state;
@@ -493,9 +495,10 @@ async function resolveCommit(repo: string, ref: string): Promise<string> {
 
 const DIFF_MAX_LINES = 400;
 
+/** Judging material must not expose harness state: `.cw` is excluded from both views. */
 async function captureDiff(dir: string, base: string): Promise<string> {
-  const status = await gitCapture(dir, ["status", "--porcelain"]);
-  const diff = status.ok ? await gitCapture(dir, ["diff", base, "--"]) : { ok: false, stdout: "" };
+  const status = await gitCapture(dir, ["status", "--porcelain", "--", ":(exclude).cw"]);
+  const diff = status.ok ? await gitCapture(dir, ["diff", base, "--", ":(exclude).cw"]) : { ok: false, stdout: "" };
   const text = [
     `$ git status --porcelain\n${status.stdout}`,
     `$ git diff ${base}\n${diff.stdout}`,
@@ -549,7 +552,7 @@ const CSV_HEADER =
   "task,condition,repeat,final_state,verdict,wall_seconds,tokens,cache_read,cache_write,cost,repairs,escalated";
 
 function csvCell(value: string | number | boolean | null): string {
-  const text = value === null ? "" : String(value);
+  const text = value === null ? "" : String(value).replace(/\r\n?/g, "\n");
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
