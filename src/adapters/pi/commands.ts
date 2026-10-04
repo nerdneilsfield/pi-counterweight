@@ -371,9 +371,13 @@ function renderRedConfirmation(
   return lines.join("\n");
 }
 
-/** Append the ≤40-line task view when the session is idle; never mid-turn.
- *  `notes` (escalation resume) rides along as the previous model's unverified
- *  notes, truncated inside the same cap. */
+/**
+ * Append the ≤40-line task view when the session is idle and start the first
+ * agent turn on it (Pi 1.0: idle + `triggerTurn: true` appends the message and
+ * runs a new LLM turn — approve/resume must actually start the task, not just
+ * decorate the transcript). `notes` (escalation resume) rides along as the
+ * previous model's unverified notes, truncated inside the same cap.
+ */
 async function appendTaskView(
   pi: ExtensionAPI, ctx: ExtensionCommandContext, contract: Awaited<ReturnType<typeof readContract>>,
   approval: Approval, notes: string | null = null,
@@ -383,7 +387,7 @@ async function appendTaskView(
     customType: "counterweight",
     content: renderTaskView(contract, approval, notes),
     display: true,
-  }, { triggerTurn: false });
+  }, { triggerTurn: true });
 }
 
 // ---- /cw task resume -------------------------------------------------------

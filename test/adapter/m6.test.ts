@@ -290,11 +290,11 @@ test("task approve：脏工作树下先红用原始基线；确认后写 approva
   expect((await treeHash(repo)).value).toBe(treeBefore);
   expect(await readFile(path.join(repo, "tracked.txt"), "utf8")).toBe(trackedBefore);
 
-  // 任务视图：空闲后追加一条 ≤40 行消息，不触发轮次。
+  // 任务视图：空闲后追加一条 ≤40 行消息，并触发首轮 agent（Pi 1.0 triggerTurn）。
   expect(fake.sent).toHaveLength(1);
   expect(fake.sent[0]!.message.customType).toBe("counterweight");
   expect(fake.sent[0]!.message.display).toBe(true);
-  expect(fake.sent[0]!.options).toEqual({ triggerTurn: false });
+  expect(fake.sent[0]!.options).toEqual({ triggerTurn: true });
   const view = fake.sent[0]!.message.content as string;
   expect(view.split("\n").length).toBeLessThanOrEqual(40);
   expect(view).toContain("fix lifetime issue");
@@ -480,7 +480,7 @@ test("task resume：登记会话、不重建基线、任务视图追加、保护
   expect(state.tokens_used).toBe(1234);
   expect(state.last_verified).toBe(stateBefore.last_verified);
   expect(fake.sent.length).toBe(sentBefore + 1);
-  expect(fake.sent.at(-1)!.options).toEqual({ triggerTurn: false });
+  expect(fake.sent.at(-1)!.options).toEqual({ triggerTurn: true });
   const blocked = await fake.call("tool_call", toolCallEvent("edit", {
     path: `.cw/tasks/${taskId}/contract.toml`, edits: [],
   }), second.ctx);
