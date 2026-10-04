@@ -23,7 +23,7 @@ import { writeHandback } from "../../core/handback.js";
 import { recordUsage } from "../../core/meter.js";
 import { readProjectConfig } from "../../core/config.js";
 import { isNotFound, resolveSymlinkInRepo } from "../../core/paths.js";
-import { runValidator, type RunOutcome } from "../../core/runner.js";
+import { runValidator, revokeRunVerification, type RunOutcome } from "../../core/runner.js";
 import {
   clearBlocked,
   findSessionTasks,
@@ -32,6 +32,7 @@ import {
   readBlocked,
   readState,
   updateState,
+  withTaskLock,
   type Approval,
 } from "../../core/task.js";import type { Contract, ProjectConfig } from "../../core/types.js";
 import { registerCommands } from "./commands.js";
@@ -314,42 +315,57 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
           };
         }
         case "finish": {
-          // Publication is coordinated with cancellation: no handback material
-          // or verified status may be produced once the user has cancelled,
-          // and a cancel landing during the writes revokes this run's
-          // verification instead of reporting success.
+          // Publication is coordinated with cancellation: the verified status
+          // is written by a status-guarded transition that re-checks the cancel
+          // inside the same task lock. A cancel that already flipped the state
+          // is never overwritten with `verified`; a cancel landing after the
+          // transition cannot rewrite it either (the cancel transition itself
+          // only applies to drafting/approved/running).
           if (controller.signal.aborted) return undefined;
-          let material = await writeHandback(repo, taskId, session, {
+          const material = await writeHandback(repo, taskId, session, {
             contract,
             validator: active.approval.validator,
             reason: "finish",
             questions: [],
             autoVerified: decision.autoVerified,
           });
-          if (!controller.signal.aborted) {
-            await updateState(repo, taskId, session, (current) => ({ ...current, status: "verified" }));
-          }
-          if (controller.signal.aborted) {
-            await updateState(repo, taskId, session, (current) => ({
-              ...current,
-              status: current.status === "verified" ? "running" : current.status,
-              ...(outcome !== null && current.last_verified !== null
-                && current.last_verified.run === outcome.run
-                ? { last_verified: null, evidence_invalid_reason: "cancelled" }
-                : {}),
-            }));
-            material = await writeHandback(repo, taskId, session, {
-              contract,
-              validator: active.approval.validator,
-              reason: "cancelled",
-              questions: ["用户在验收结果发布期间取消任务"],
-              autoVerified: false,
-            });
+          const published = await updateState(repo, taskId, session, (current) => {
+            if (current.status !== "running" && current.status !== "approved") return current;
+            if (controller.signal.aborted) return current;
+            return { ...current, status: "verified" };
+          });
+          if (published.status !== "verified") {
+            if (controller.signal.aborted) {
+              // The run-level evidence may already be recorded; a cancelled
+              // flow must not leave it standing. Scoped to exactly this run.
+              if (outcome !== null) {
+                await withTaskLock(repo, taskId, session, () =>
+                  revokeRunVerification(repo, taskId, session, outcome!.run));
+              }
+              const cancelledMaterial = await writeHandback(repo, taskId, session, {
+                contract,
+                validator: active.approval.validator,
+                reason: "cancelled",
+                questions: ["用户在验收结果发布期间取消任务"],
+                autoVerified: false,
+              });
+              return {
+                entries: [...event.entries, {
+                  type: "custom_message" as const,
+                  customType: "counterweight",
+                  content: `[counterweight] 用户取消，验收结果未发布。材料：${cancelledMaterial.md}`,
+                  display: true,
+                }],
+              };
+            }
+            // Another session's decision (cancel, handback, escalation) won
+            // the race: report it instead of claiming a finished task.
             return {
               entries: [...event.entries, {
                 type: "custom_message" as const,
                 customType: "counterweight",
-                content: `[counterweight] 用户取消，验收结果未发布。材料：${material.md}`,
+                content: `[counterweight] 验收通过，但任务状态已变为 ${published.status}，结果未发布`
+                  + `。材料：${material.md}`,
                 display: true,
               }],
             };
@@ -375,7 +391,12 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
             questions,
             autoVerified: false,
           });
-          await updateState(repo, taskId, session, (current) => ({ ...current, status: "handed_back" }));
+          // Status-guarded like the verified publication: a cancel that
+          // already flipped the state is never overwritten with handed_back.
+          await updateState(repo, taskId, session, (current) => current.status === "approved"
+            || current.status === "running"
+            ? { ...current, status: "handed_back" }
+            : current);
           if (blocked !== null) await clearBlocked(repo, taskId, session);
           return {
             entries: [...event.entries, {
