@@ -423,7 +423,7 @@ test("非 code 交付物：跳过先红直接批准，red_check_run 0，无 UI �
   expect(fake.sent).toHaveLength(1);
 }, 30_000);
 
-test("批准后修改 project.toml 验证命令：门禁仍使用批准时的命令", async () => {
+test("批准后 project.toml 漂移：门禁 fail-safe 交还（不验证、不用新命令），恢复后可继续", async () => {
   const { repo } = await setup();
   const fake = fakePi();
   counterweight(fake.pi);
@@ -432,7 +432,7 @@ test("批准后修改 project.toml 验证命令：门禁仍使用批准时的命
   await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({}));
   await runCmd(fake, "task approve", context.ctx);
 
-  // 换掉 project.toml 的验证命令（全通过 + 不同载荷）。
+  // 换掉 project.toml 的验证命令（全通过 + 不同载荷）：批准快照不再与配置一致。
   const otherPayload = JSON.stringify({
     protocol: 1, run_id: "@RUN@", complete: true,
     checks: [
@@ -442,20 +442,87 @@ test("批准后修改 project.toml 验证命令：门禁仍使用批准时的命
   });
   await writeFile(path.join(repo, ".cw", "project.toml"), projectToml(validatorArgv("reportrun", otherPayload)));
 
+  const settled = await fake.call("agent_before_settle", settleEvent(), context.ctx);
+  const message = (settled?.entries ?? []).map((entry: any) =>
+    typeof entry?.content === "string" ? entry.content : "").join("\n");
+  expect(message).toContain("原因：blocked");
+  // 漂移进入交还材料的问题清单，且没有任何验证运行（批准命令与新命令都未执行）。
+  const material = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "handback.json"), "utf8"));
+  expect(material.questions.join("\n")).toContain("project.toml 与批准版本不一致");
+  expect((await readdir(path.join(repo, ".cw", "tasks", taskId, "runs"))).sort()).toEqual(["1"]);
+  expect((await readState(repo, taskId)).status).toBe("handed_back");
+
+  // 恢复配置为批准时内容后重新批准，门禁按批准快照继续运行验证。
+  await writeFile(path.join(repo, ".cw", "project.toml"),
+    projectToml(validatorArgv("reportrun", redOkPayload)));
+  await runCmd(fake, "task approve", context.ctx);
   const settling = fake.call("agent_before_settle", settleEvent(), context.ctx);
   const result = await settling;
-  // 门禁运行的是批准时的命令（red1 fail）→ continue，而不是新命令的 pass。
+  // 门禁运行的是批准时的命令（red1 fail）→ continue。
   expect(result?.continue).toBe(true);
-  const message = (result?.entries ?? []).map((entry: any) =>
-    typeof entry?.content === "string" ? entry.content : "").join("\n");
-  expect(message).toContain("验收未通过");
+  expect((result?.entries ?? []).map((entry: any) =>
+    typeof entry?.content === "string" ? entry.content : "").join("\n")).toContain("验收未通过");
   const state = await readState(repo, taskId);
   expect(state.repairs_used).toBe(1);
   expect(state.status).toBe("running");
-  const run2 = JSON.parse(await readFile(
-    path.join(repo, ".cw", "tasks", taskId, "runs", "2", "result.json"), "utf8"));
-  expect(run2.checks.map((item: any) => item.id)).toContain("red1");
-  expect(run2.checks.find((item: any) => item.id === "red1").status).toBe("fail");
+  // runs：1 = 首次先红，2 = 重批先红，3 = 门禁按批准命令运行的验证（red1 fail）。
+  expect((await readdir(path.join(repo, ".cw", "tasks", taskId, "runs"))).sort()).toEqual(["1", "2", "3"]);
+  const run3 = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "runs", "3", "result.json"), "utf8"));
+  expect(run3.checks.find((item: any) => item.id === "red1").status).toBe("fail");
+}, 30_000);
+
+test("批准冻结验证器脚本：.cw/validate.sh 篡改后门禁判无法判定，不发布 verified", async () => {
+  const { repo } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true });
+  const ctx = context.ctx;
+  const script = path.join(repo, ".cw", "validate.sh");
+  const resultLine = (red1: string, summary: string) =>
+    `{"protocol":1,"run_id":"$CW_RUN_ID","complete":true,"checks":[{"id":"red1","status":"${red1}",` +
+    `"message":"boom"},{"id":"keep","status":"pass"},{"id":"reg1","status":"pass"}],` +
+    `"build":{"required":false},"summary":"${summary}","logs":[]}`;
+  const scriptBody = (red1: string, summary: string) => `#!/bin/sh
+cat > "$CW_RESULT_DIR/result.json" <<EOF
+${resultLine(red1, summary)}
+EOF
+`;
+  // 先红脚本 v1 属于 base_commit：隔离基线天然携带它，无需进入 baseline_inputs，
+  // 因此篡改只能被批准的验证器输入哈希抓住（树哈希排除 .cw，基线输入不含它）。
+  await writeFile(script, scriptBody("fail", "v1"));
+  await git(repo, ["add", ".cw/validate.sh"]);
+  await git(repo, ["-c", "user.email=cw@example.com", "-c", "user.name=cw", "commit", "-m", "validator"]);
+  await writeFile(path.join(repo, ".cw", "project.toml"), projectToml('["/bin/sh", ".cw/validate.sh"]'));
+
+  await runCmd(fake, `task new ${slug}`, ctx);
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({
+    frozen: [],
+  }));
+  await runCmd(fake, "task approve", ctx);
+  const approval = JSON.parse(
+    await readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8"));
+  expect(approval.validator_inputs_sha256).toEqual({
+    ".cw/validate.sh": await contentSha256(repo, ".cw/validate.sh"),
+  });
+
+  // 模型篡改脚本（v2 全通过）：若冻结失效，门禁将读到通过报告并发布 verified。
+  await writeFile(script, scriptBody("pass", "v2"));
+  const settled = await fake.call("agent_before_settle", settleEvent(), ctx);
+  const message = (settled?.entries ?? []).map((entry: any) =>
+    typeof entry?.content === "string" ? entry.content : "").join("\n");
+  expect(message).toContain("原因：undetermined");
+  expect((await readState(repo, taskId)).status).toBe("handed_back");
+  const material = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "handback.json"), "utf8"));
+  expect(material.reason).toBe("undetermined");
+  expect(material.auto_verified).toBe(false);
+  const record = JSON.parse(await readFile(
+    path.join(repo, ".cw", "tasks", taskId, "runs", "2", "run.json"), "utf8"));
+  expect(record.result_discarded).toBe(false);
+  expect(record.input_hashes_before[".cw/validate.sh"])
+    .not.toBe(approval.validator_inputs_sha256[".cw/validate.sh"]);
 }, 30_000);
 
 test("task resume：登记会话、不重建基线、任务视图追加、保护生效；非 approved/running 拒绝", async () => {

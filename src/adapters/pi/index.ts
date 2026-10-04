@@ -13,7 +13,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
-import { lstat, realpath } from "node:fs/promises";import { contractSha256, readContract } from "../../core/contract.js";
+import { lstat, realpath } from "node:fs/promises";import { canonicalSha256 } from "../../core/canonical.js";
+import { contractSha256, readContract } from "../../core/contract.js";
 import { readReference } from "../../core/task.js";
 import { REFERENCE_FILE } from "../../core/escalate.js";
 import { recheckArtifacts } from "../../core/evidence.js";
@@ -250,11 +251,17 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       const contractDrift = contractSha256(contract) !== active.approval.contract_sha256
         ? `契约文件与批准版本不一致（.cw/tasks/${taskId}/contract.toml）`
         : null;
+      // The approved project config is re-hashed every settle: validator and
+      // budget semantics were frozen at approval, so any drift (including a
+      // file that no longer parses) is visible and fails safe instead of
+      // silently changing what the gate enforces.
+      const configDrift = await projectConfigDrift(active);
       // A contract that drifted from the verified version invalidates the
       // recorded evidence before anything else reads it.
       await recheckContract(active.ledger, taskId, session, contract);
       const blockedReport = blocked?.reason
         ?? contractDrift
+        ?? configDrift
         ?? (proposal === null ? null : unresolvedProposalReason(taskId, proposal.n, proposal.field));
 
       const tokensBudget = contract.budget?.tokens ?? active.project.budget.tokens;
@@ -383,6 +390,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         case "handback": {
           const questions = [...(blocked?.questions ?? [])];
           if (contractDrift !== null) questions.push(contractDrift);
+          if (configDrift !== null) questions.push(configDrift);
           if (proposal !== null && blockedReport !== null) questions.push(blockedReport);
           const material = await writeHandback(repo, taskId, session, {
             contract,
@@ -619,6 +627,21 @@ export async function applyTaskModel(pi: ExtensionAPI, ctx: ExtensionContext, ta
 function unresolvedProposalReason(taskId: string, n: number, field: string): string {
   return `存在未落定的契约变更提议 .cw/tasks/${taskId}/proposals/${n}.json（字段 ${field}），`
     + "需要生成新契约版本并重跑先红检查后才能继续";
+}
+
+/**
+ * Why the current `.cw/project.toml` may not drive this task anymore: the
+ * canonical hash differs from the approved one, or the file no longer parses.
+ * Null when it matches the approval. Fail-safe: unreadable counts as drift.
+ */
+async function projectConfigDrift(active: ActiveTask): Promise<string | null> {
+  try {
+    const current = await readProjectConfig(path.join(active.ledger, ".cw", "project.toml"));
+    if (canonicalSha256(current) === active.approval.project_config_sha256) return null;
+  } catch {
+    return "project.toml 不可读或非法（.cw/project.toml），与批准版本不一致，需恢复或重新批准";
+  }
+  return "project.toml 与批准版本不一致（.cw/project.toml）；验证器与预算以批准快照为准，需恢复或重新批准";
 }
 
 const PROTECTED_REASON = (relative: string) => `[counterweight] ${relative} 是受保护路径（契约或任务文件）。`
