@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "test": "vitest run",
+    "test:serial": "vitest run --no-file-parallelism",
     "probe-cache": "node --experimental-strip-types src/cli/probe-cache.ts",
     "observe": "node dist/src/cli/observe.js"
   },

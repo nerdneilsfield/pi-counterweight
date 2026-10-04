@@ -316,10 +316,12 @@ test("eval：伪 pi 跑通四条件，CSV 行数正确，评判清单不含条�
     expect(argvLines).toHaveLength(5);
     const extension = resolve("src/adapters/pi/index.ts");
     expect(argvLines[0]!.includes("--extension")).toBe(false);
+    // 任务 id 前缀取 eval 生成时的 UTC 日期（与 eval/run.ts 的 ymd() 同源）。
+    const utcYmd = new Date().toISOString().slice(0, 10).replaceAll("-", "");
     for (const argv of argvLines.slice(1)) {
       expect(argv.includes("--extension")).toBe(true);
       expect(argv[argv.indexOf("--extension") + 1]).toBe(extension);
-      expect(argv[argv.lastIndexOf("--") + 1]).toBe("/cw task resume 20261003-demo");
+      expect(argv[argv.lastIndexOf("--") + 1]).toBe(`/cw task resume ${utcYmd}-demo`);
     }
     expect(argvLines[3]![argvLines[3]!.indexOf("--model") + 1]).toBe("fake/cheap");
     expect(argvLines[4]![argvLines[4]!.indexOf("--model") + 1]).toBe("fake/strong");
