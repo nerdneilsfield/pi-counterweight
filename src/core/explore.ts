@@ -14,6 +14,8 @@ export interface FinalizedAnswer {
   truncated: boolean;
   /** `path:line` references judged invalid (also annotated inline). */
   invalidRefs: string[];
+  /** Conclusion lines lacking a trailing `path:line` reference (also annotated inline). */
+  missingRefs: string[];
 }
 
 /**
@@ -26,10 +28,12 @@ const TRAILING_REF = /(^|\s)([^\s:]*[./][^\s:]*):(\d{1,9})\s*$/;
 
 /**
  * Post-process one explorer answer (plan M8 item 3): cut anything past 30
- * lines and note the cut, then check every trailing `path:line` reference —
- * the path must exist inside the repository and the line number must fall
- * within the file. Invalid references are annotated with 〔引用无效〕 inline,
- * never removed.
+ * lines and note the cut, then check every line's trailing `path:line`
+ * reference — the path must exist inside the repository and the line number
+ * must fall within the file. Invalid references are annotated with
+ * 〔引用无效〕; conclusion lines without a reference are annotated with
+ * 〔缺少引用〕 (the bare `未找到` answer is exempt). Annotations are never
+ * removed.
  */
 export async function finalizeExplorerAnswer(answer: string, repo: string): Promise<FinalizedAnswer> {
   const lines = answer.split("\n");
@@ -39,11 +43,17 @@ export async function finalizeExplorerAnswer(answer: string, repo: string): Prom
     lines.length = EXPLORER_MAX_LINES;
   }
   const invalidRefs: string[] = [];
+  const missingRefs: string[] = [];
   const checked: string[] = [];
   for (const line of lines) {
+    if (line.trim() === "" || line.trim() === "未找到") {
+      checked.push(line);
+      continue;
+    }
     const match = TRAILING_REF.exec(line);
     if (match === null) {
-      checked.push(line);
+      missingRefs.push(line);
+      checked.push(`${line.trimEnd()} 〔缺少引用〕`);
       continue;
     }
     const relative = match[2]!;
@@ -57,7 +67,7 @@ export async function finalizeExplorerAnswer(answer: string, repo: string): Prom
   }
   const text = checked.join("\n")
     + (truncated ? `\n〔counterweight 输出超过 ${EXPLORER_MAX_LINES} 行，已截断〕` : "");
-  return { text, truncated, invalidRefs };
+  return { text, truncated, invalidRefs, missingRefs };
 }
 
 async function referenceValid(repo: string, relative: string, lineNo: number): Promise<boolean> {

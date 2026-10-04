@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -97,6 +97,7 @@ baseline_inputs = ["tests/a.py"]
     validator: { cmd: ["/bin/sh", "-c", "true"], timeout_s: 600, env: {} },
     base_commit: base,
     baseline_inputs_sha256: { "tests/a.py": (await contentSha256(repo, "tests/a.py"))! },
+    validator_inputs_sha256: {},
     frozen_blobs: { "tests/a.py": (await blobHash(repo, "tests/a.py")).value! },
     red_check_run: 1,
     approved_at: new Date().toISOString(),
@@ -199,13 +200,14 @@ test("输出超过 30 行时被截断并注明", async () => {
   }
 }, 20_000);
 
-test("无效引用被标注〔引用无效〕，有效引用保持原样，且不删除内容", async () => {
+test("无效引用被标注〔引用无效〕，缺出处的结论被标注〔缺少引用〕，均不删除内容", async () => {
   const answer = [
     "结论甲 tests/a.py:1",
     "结论乙 missing-dir/missing.py:3",
     "结论丙 tests/a.py:999",
     "结论丁 ../outside.py:1",
     "结论戊 .cw/tasks/x.toml:1",
+    "结论己没有出处",
     "比例 3:1 不是引用",
   ].join("\n");
   const harness = await setup({ mode: "answer", text: answer });
@@ -217,8 +219,63 @@ test("无效引用被标注〔引用无效〕，有效引用保持原样，且�
     expect(result).toContain("结论丙 tests/a.py:999 〔引用无效〕");
     expect(result).toContain("结论丁 ../outside.py:1 〔引用无效〕");
     expect(result).toContain("结论戊 .cw/tasks/x.toml:1 〔引用无效〕");
-    expect(result).toContain("比例 3:1 不是引用");
+    expect(result).toContain("结论己没有出处 〔缺少引用〕");
+    expect(result).toContain("比例 3:1 不是引用 〔缺少引用〕");
     expect(result.match(/〔引用无效〕/g)).toHaveLength(4);
+    expect(result.match(/〔缺少引用〕/g)).toHaveLength(2);
+  } finally {
+    await harness.cleanup();
+  }
+}, 20_000);
+
+test("探索者读取工作树之外的路径：回答不予采信，usage 仍记账", async () => {
+  const harness = await setup({
+    mode: "readoutside",
+    text: "结论甲 /etc/hosts:1",
+    usage: { input: 9, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 12 },
+  });
+  try {
+    const result = await run(harness, "q");
+    expect(result).toContain("未返回结果");
+    expect(result).toContain("读取了工作树之外的路径");
+    expect(result).toContain("/etc/hosts");
+    expect(result).toContain("../outside");
+    expect(result).not.toContain("结论甲");
+    const state = await readState(harness.repo, taskId);
+    expect(state.tokens_used).toBe(12);
+    const events = (await meterLines(harness.repo)).filter((line) => line.kind === "task"
+      && line.event === "explore");
+    expect(events.at(-1)!.detail).toMatchObject({ outcome: "failed", escaped_reads: 2 });
+  } finally {
+    await harness.cleanup();
+  }
+}, 20_000);
+
+test("仓内符号链接指向仓外同样是读路径逃逸", async () => {
+  const harness = await setup({
+    mode: "readlink",
+    text: "结论甲 link.py:1",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+  });
+  try {
+    await symlink("/etc/hosts", path.join(harness.repo, "link.py"));
+    const result = await run(harness, "q");
+    expect(result).toContain("未返回结果");
+    expect(result).toContain("符号链接指向工作树之外");
+    expect(result).toContain("link.py");
+    expect(result).not.toContain("结论甲");
+  } finally {
+    await rm(path.join(harness.repo, "link.py"), { force: true });
+    await harness.cleanup();
+  }
+}, 20_000);
+
+test("读取全部落在工作树内：回答照常返回", async () => {
+  const harness = await setup({ mode: "readinside", text: "结论甲 tests/a.py:1" });
+  try {
+    const result = await run(harness, "q");
+    expect(result).toContain("结论甲 tests/a.py:1");
+    expect(result).not.toContain("未返回结果");
   } finally {
     await harness.cleanup();
   }
@@ -477,6 +534,19 @@ test("finalizeExplorerAnswer：引用行号必须落在文件范围内", async (
     expect(finalized.text)
       .toBe("甲 tests/a.py:2\n乙 tests/a.py:3 〔引用无效〕\n丙 tests/empty.txt:1 〔引用无效〕\n未找到");
     expect(finalized.invalidRefs).toEqual(["tests/a.py:3", "tests/empty.txt:1"]);
+    expect(finalized.missingRefs).toEqual([]);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("finalizeExplorerAnswer：缺出处的结论标注〔缺少引用〕；未找到与空行豁免", async () => {
+  const repo = await realpath(await mkdtemp(path.join(tmpdir(), "cw-m8-unit3-")));
+  try {
+    const finalized = await finalizeExplorerAnswer("结论甲无出处\n\n未找到", repo);
+    expect(finalized.text).toBe("结论甲无出处 〔缺少引用〕\n\n未找到");
+    expect(finalized.missingRefs).toEqual(["结论甲无出处"]);
+    expect(finalized.invalidRefs).toEqual([]);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

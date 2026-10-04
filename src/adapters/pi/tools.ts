@@ -168,10 +168,10 @@ async function runExploreForTask(
     await recordTaskEvent(task.ledger, task.taskId, task.session, "explore", {
       outcome: "failed", error: run.error, tokens: spent,
       timed_out: run.timedOut, cancelled: run.cancelled,
+      escaped_reads: run.escapedReads.length,
     });
     return `[counterweight] 探索者未返回结果（${run.error}）；本次消耗 ${spent} token。`;
   }
-
   const finalized = await finalizeExplorerAnswer(run.answer!, task.root);
   const untrusted = treeUntrustedReason(before, after);
   await recordTaskEvent(task.ledger, task.taskId, task.session, "explore", {
@@ -179,6 +179,7 @@ async function runExploreForTask(
     trusted: untrusted === null,
     truncated: finalized.truncated,
     invalid_refs: finalized.invalidRefs.length,
+    missing_refs: finalized.missingRefs.length,
     tokens: spent,
     timed_out: run.timedOut,
   });

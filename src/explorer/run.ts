@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pathInside } from "../core/paths.js";
 import { runValidatorProcess } from "../core/runner.js";
 
 /** Plan M8: the explorer subprocess is killed after 180 seconds. */
@@ -49,6 +50,12 @@ export interface ExplorerRun {
   usage: UsageSample[];
   timedOut: boolean;
   cancelled: boolean;
+  /**
+   * Read/grep path arguments that resolved outside the working tree (absolute
+   * paths, `..` escapes, or in-repo symlinks pointing out). Non-empty means
+   * the answer read material the harness cannot vouch for and is withheld.
+   */
+  escapedReads: string[];
 }
 
 export interface ExplorerRequest {
@@ -89,10 +96,10 @@ export interface ExplorerRequest {
 export async function runExplorer(request: ExplorerRequest): Promise<ExplorerRun> {
   const cli = request.cliPath ?? findPiCli();
   if (cli === null) {
-    return { answer: null, error: "找不到 pi CLI（node_modules/@earendil-works/pi-coding-agent）", usage: [], timedOut: false, cancelled: false };
+    return { answer: null, error: "找不到 pi CLI（node_modules/@earendil-works/pi-coding-agent）", usage: [], timedOut: false, cancelled: false, escapedReads: [] };
   }
   if (!request.model.includes("/")) {
-    return { answer: null, error: `explorer 模型不是 provider/model 形式：${request.model}`, usage: [], timedOut: false, cancelled: false };
+    return { answer: null, error: `explorer 模型不是 provider/model 形式：${request.model}`, usage: [], timedOut: false, cancelled: false, escapedReads: [] };
   }
   const argv = [
     "--mode", "json",
@@ -125,7 +132,7 @@ export async function runExplorer(request: ExplorerRequest): Promise<ExplorerRun
       try {
         stdout = await readFile(path.join(scratch, "stdout.jsonl"), "utf8");
       } catch (error) {
-        return { answer: null, error: `探索者输出不可读：${message(error)}`, usage: [], timedOut: outcome.timedOut, cancelled: outcome.cancelled };
+        return { answer: null, error: `探索者输出不可读：${message(error)}`, usage: [], timedOut: outcome.timedOut, cancelled: outcome.cancelled, escapedReads: [] };
       }
       const events = parseEvents(stdout);
       // Post-run verdict discipline mirrors the runner's discard order: a run
@@ -133,16 +140,24 @@ export async function runExplorer(request: ExplorerRequest): Promise<ExplorerRun
       // managed to emit a final answer before hanging — the answer of a killed
       // run is never accepted. Its usage is still returned for accounting.
       const failure = (reason: string): ExplorerRun =>
-        ({ answer: null, error: reason, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled });
+        ({ answer: null, error: reason, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled, escapedReads: [] });
       if (outcome.cancelled) return failure("已被取消");
       if (outcome.timedOut) return failure("超时，子进程组已终止");
+      // The allowlist confines which tools run, not which paths they accept:
+      // every read/grep path argument is audited against the working tree and
+      // an escape (absolute path, `..`, or a symlink pointing out) withholds
+      // the whole answer.
+      const escapedReads = await readEscapes(request.workRoot, events.toolCalls);
+      if (escapedReads.length > 0) {
+        return { answer: null, error: `读取了工作树之外的路径：${escapedReads.join("、")}`, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled, escapedReads };
+      }
       if (events.finalAssistant === null) return failure("没有最终回答");
       const assistant = events.finalAssistant;
       if (assistant.stopReason !== "stop") {
         return failure(`探索者未正常结束（stop reason: ${assistant.stopReason}）`);
       }
       if (assistant.text.trim() === "") return failure("探索者返回空回答");
-      return { answer: assistant.text, error: null, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled };
+      return { answer: assistant.text, error: null, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled, escapedReads };
     } finally {
       // 判定与记账已读取完毕：释放父信号监听（进程组终止语义不变）。
       outcome.dispose();
@@ -155,6 +170,8 @@ export async function runExplorer(request: ExplorerRequest): Promise<ExplorerRun
 interface ParsedEvents {
   finalAssistant: { text: string; stopReason: string } | null;
   usage: UsageSample[];
+  /** `tool_execution_start` calls reported by the subprocess, in order. */
+  toolCalls: Array<{ toolName: string; args: unknown }>;
 }
 
 export type { ParsedEvents };
@@ -162,11 +179,13 @@ export type { ParsedEvents };
 /**
  * Parse the JSONL event stream. Unparseable lines (e.g. the leading session
  * header) are skipped; the last assistant `message_end` is the final answer,
- * and usage is summed across every assistant `message_end` — an agentic run
- * emits one per turn. Shared with the M9 evaluation scaffold.
+ * usage is summed across every assistant `message_end` — an agentic run
+ * emits one per turn — and every `tool_execution_start` is kept for the
+ * read-path audit. Shared with the M9 evaluation scaffold.
  */
 export function parseEvents(stdout: string): ParsedEvents {
   const usage: UsageSample[] = [];
+  const toolCalls: ParsedEvents["toolCalls"] = [];
   let finalAssistant: ParsedEvents["finalAssistant"] = null;
   for (const line of stdout.split("\n")) {
     if (line.trim() === "") continue;
@@ -177,6 +196,13 @@ export function parseEvents(stdout: string): ParsedEvents {
       continue;
     }
     if (event === null || typeof event !== "object") continue;
+    if ((event as { type?: unknown }).type === "tool_execution_start") {
+      const record = event as { toolName?: unknown; args?: unknown };
+      if (typeof record.toolName === "string") {
+        toolCalls.push({ toolName: record.toolName, args: record.args });
+      }
+      continue;
+    }
     if ((event as { type?: unknown }).type !== "message_end") continue;
     const message = (event as { message?: unknown }).message;
     if (message === null || typeof message !== "object") continue;
@@ -192,7 +218,45 @@ export function parseEvents(stdout: string): ParsedEvents {
     const text = textBlocks(record.content);
     finalAssistant = { text, stopReason: record.stopReason };
   }
-  return { finalAssistant, usage };
+  return { finalAssistant, usage, toolCalls };
+}
+
+/**
+ * The read paths of an explorer run that resolve outside `root`: absolute
+ * paths outside the tree, relative `..` escapes, and in-repo symlinks whose
+ * target escapes. Missing targets never read anything and are not escapes;
+ * the audit is fail-closed over what actually executed.
+ */
+async function readEscapes(
+  root: string, toolCalls: ParsedEvents["toolCalls"],
+): Promise<string[]> {
+  const escaped: string[] = [];
+  for (const call of toolCalls) {
+    if (call.toolName !== "read" && call.toolName !== "grep") continue;
+    const value = (call.args as { path?: unknown } | null)?.path;
+    if (typeof value !== "string" || value === "") continue;
+    try {
+      await assertReadInside(root, value);
+    } catch (error) {
+      escaped.push(error instanceof Error && error.message !== "" ? `${value}（${error.message}）` : value);
+    }
+  }
+  return escaped;
+}
+
+async function assertReadInside(root: string, raw: string): Promise<void> {
+  const absolute = path.isAbsolute(raw) ? raw : path.resolve(root, raw);
+  const relative = path.relative(root, absolute);
+  if (relative !== "" && (relative.startsWith("..") || path.isAbsolute(relative))) {
+    throw new Error("路径在工作树之外");
+  }
+  let real: string;
+  try {
+    real = await realpath(absolute);
+  } catch {
+    return; // Missing target: nothing was read.
+  }
+  if (!pathInside(root, real)) throw new Error("符号链接指向工作树之外");
 }
 
 function textBlocks(content: unknown): string {

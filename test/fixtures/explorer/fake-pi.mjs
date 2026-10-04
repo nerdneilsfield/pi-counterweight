@@ -32,6 +32,20 @@ if (mode === "answer") {
 } else if (mode === "long") {
   const lines = Array.from({ length: 40 }, (_, i) => `行${i + 1} tests/a.py:1`);
   emit(message("stop", lines.join("\n")));
+} else if (mode === "readoutside") {
+  // Real tool_execution_start events: two escapes (absolute, ..) plus an
+  // in-tree read that must not trigger anything.
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "/etc/hosts" } })}\n`);
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r2", toolName: "grep", args: { pattern: "x", path: "../outside" } })}\n`);
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r3", toolName: "read", args: { path: "tests/a.py" } })}\n`);
+  emit(message("stop", text));
+} else if (mode === "readlink") {
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "link.py" } })}\n`);
+  emit(message("stop", text));
+} else if (mode === "readinside") {
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "tests/a.py" } })}\n`);
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r2", toolName: "grep", args: { pattern: "x" } })}\n`);
+  emit(message("stop", text));
 } else if (mode === "writetree") {
   writeFileSync("explorer-wrote.txt", "the explorer must not write\n");
   emit(message("stop", text));
