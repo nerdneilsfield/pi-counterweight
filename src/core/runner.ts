@@ -3,7 +3,7 @@ import { mkdir, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { contractSha256 } from "./contract.js";
 import type { GateFailure } from "./gate.js";
-import { contentSha256, judgeEvidence, type ResultReport, type Verdict } from "./evidence.js";
+import { contentSha256, judgeEvidence, validatorInputFiles, type ResultReport, type Verdict } from "./evidence.js";
 import { treeHash } from "./gitstate.js";
 import { isNotFound } from "./paths.js";
 import { assertRunRecord, writeRunRecord, type RunRecord } from "./runrecord.js";
@@ -28,6 +28,12 @@ export interface RunRequest {
   contract: Contract;
   validator: ValidatorConfig;
   approvedInputHashes: Record<string, string>;
+  /**
+   * Approved content hashes of the repo files the validator cmd references
+   * (`approval.validator_inputs_sha256`). Snapshotted before/after every run
+   * next to the baseline inputs; drift discards the result.
+   */
+  approvedValidatorInputs: Record<string, string>;
   signal?: AbortSignal;
 }
 
@@ -48,7 +54,13 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
     const run = Number(path.basename(dir));
     const started = new Date().toISOString();
     await recordTaskEvent(request.repo, request.taskId, request.session, "validation_started", { run });
-    const before = await snapshot(work, request.contract.baseline_inputs);
+    // The approved input set covers the contract's baseline inputs plus the
+    // repo files the validator cmd references (its script, often under `.cw/`
+    // where the tree hash cannot see drift).
+    const validatorInputs = await validatorInputFiles(work, request.validator.cmd);
+    const inputFiles = [...new Set([...request.contract.baseline_inputs, ...validatorInputs])];
+    const approvedInputs = { ...request.approvedInputHashes, ...request.approvedValidatorInputs };
+    const before = await snapshot(work, inputFiles);
     const outcome = await runValidatorProcess({
       cwd: work,
       cmd: request.validator.cmd,
@@ -66,7 +78,7 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       signal: request.signal,
     });
     try {
-      const after = await snapshot(work, request.contract.baseline_inputs);
+      const after = await snapshot(work, inputFiles);
       const discard = discardReason(outcome);
       const artifacts = discard !== null ? { hashes: emptyHashes(), error: null } : await artifactHashes(work, dir);
       const recordError = [before.error, after.error, artifacts.error]
@@ -96,7 +108,7 @@ export async function runValidator(request: RunRequest): Promise<RunOutcome> {
       if (discard !== null) {
         verdict = { conclusion: "undetermined", reasons: [discard] };
       } else {
-        verdict = await judgeEvidence(work, dir, request.contract, request.approvedInputHashes);
+        verdict = await judgeEvidence(work, dir, request.contract, approvedInputs, inputFiles);
       }
       // A cancel that arrives while the verdict is being judged still discards
       // the result: no last_verified may be published after cancellation.

@@ -520,6 +520,47 @@ test("task status：显示状态、预算、最后验证与冲突", async () => 
   expect(text).toContain("tests/a.py");
 }, 30_000);
 
+test("验证发布后再取消：verified 状态不被迟到取消改写", async () => {
+  const { repo } = await setup();
+  const fake = fakePi();
+  counterweight(fake.pi);
+  const context = fakeCtx(repo, { hasUI: true, confirmResult: true });
+  const ctx = context.ctx;
+  // 判定载荷放在仓库文件里（m7 模式）：批准时先红失败，批准后换成全通过，
+  // 门禁按批准快照读到通过结论发布 verified。
+  const payloadFile = path.join(repo, ".cw", "payload.json");
+  const checks = (red1: string) => JSON.stringify({
+    protocol: 1, run_id: "@RUN@", complete: true,
+    checks: [
+      { id: "red1", status: red1 }, { id: "keep", status: "pass" }, { id: "reg1", status: "pass" },
+    ],
+    build: { required: false }, summary: "x", logs: [],
+  });
+  await runCmd(fake, `task new ${slug}`, ctx);
+  await writeFile(path.join(repo, ".cw", "tasks", taskId, "contract.toml"), contractToml({}));
+  await writeFile(path.join(repo, ".cw", "project.toml"),
+    projectToml(JSON.stringify(["/bin/sh", fixture, "reportfile", payloadFile])));
+  await writeFile(payloadFile, checks("fail"));
+  await runCmd(fake, "task approve", ctx);
+
+  await writeFile(payloadFile, checks("pass"));
+  const settled = await fake.call("agent_before_settle", settleEvent(), ctx);
+  const message = (settled?.entries ?? []).map((entry: any) =>
+    typeof entry?.content === "string" ? entry.content : "").join("\n");
+  expect(message).toContain("验收通过");
+  expect((await readState(repo, taskId)).status).toBe("verified");
+
+  // 迟到的取消按状态拒绝：已发布的 verified 不被改写。
+  await runCmd(fake, `task cancel ${taskId}`, ctx);
+  expect(lastNotify(context.notifications)).toContain("此命令需要");
+  expect((await readState(repo, taskId)).status).toBe("verified");
+
+  // 门禁对 verified 任务不再动作。
+  const second = await fake.call("agent_before_settle", settleEvent(), ctx);
+  expect(second ?? null).toBeNull();
+  expect((await readState(repo, taskId)).status).toBe("verified");
+}, 30_000);
+
 test("task cancel：终止在途验证并取消任务；其后门禁不动作", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -669,6 +710,7 @@ test("task handback 其他任务：active 任务保护保留", async () => {
     validator: { cmd: ["/bin/true"], timeout_s: 600, env: {} },
     base_commit: base,
     baseline_inputs_sha256: {},
+    validator_inputs_sha256: {},
     frozen_blobs: {},
     red_check_run: 0,
     approved_at: new Date().toISOString(),

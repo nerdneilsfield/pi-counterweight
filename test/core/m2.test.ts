@@ -325,6 +325,56 @@ baseline_inputs = ["tests/a.py", "__proto__"]
   expect((await readState(root, taskId)).last_verified).toBeNull();
 });
 
+test("验证器引用的仓库脚本按批准哈希冻结：漂移判无法判定", async () => {
+  const root = await gitRepo();
+  const { contract, hashes } = await prepared(root);
+  // 仓库内相对验证脚本（不进 tree 哈希排除的 .cw 之外也成立；此处用普通路径）。
+  const script = "valscript.sh";
+  const scriptBody = `#!/bin/sh
+cat > "$CW_RESULT_DIR/result.json" <<EOF
+{"protocol":1,"run_id":"$CW_RUN_ID","complete":true,"checks":[{"id":"keep","status":"pass"},{"id":"reg","status":"pass"}],"build":{"required":false},"summary":"x","logs":[]}
+EOF
+`;
+  const writeScript = (body: string) => writeFile(path.join(root, script), body);
+  await writeScript(scriptBody);
+  const approvedScript = createHash("sha256").update(scriptBody).digest("hex");
+  const validator = (extra: Record<string, string> = {}): ValidatorConfig => ({
+    cmd: ["/bin/sh", script], timeout_s: 30, env: { CW_REPO: root },
+    ...extra,
+  });
+
+  // 批准哈希与内容一致：通过。
+  const ok = await runValidator({
+    repo: root, taskId, session: "s", contract,
+    approvedInputHashes: hashes, approvedValidatorInputs: { [script]: approvedScript },
+    validator: validator(),
+  });
+  expect(ok.verdict.conclusion).toBe("pass");
+  expect((await readState(root, taskId)).last_verified).toMatchObject({ run: 1 });
+
+  // 脚本在批准后被修改（before 快照即不一致）：无法判定，本次不发布验证。
+  await writeScript(`${scriptBody}# drifted\n`);
+  const drifted = await runValidator({
+    repo: root, taskId, session: "s", contract,
+    approvedInputHashes: hashes, approvedValidatorInputs: { [script]: approvedScript },
+    validator: validator(),
+  });
+  expect(drifted.verdict.conclusion).toBe("undetermined");
+  expect(drifted.verdict.reasons[0]).toContain("validator input changed valscript.sh");
+  expect(drifted.record.input_hashes_before[script]).not.toBe(approvedScript);
+  expect(drifted.lastVerified).toBeNull();
+  await writeScript(scriptBody);
+
+  // 未冻结（批准哈希缺失）：fail-closed，同判无法判定。
+  const unfrozen = await runValidator({
+    repo: root, taskId, session: "s", contract,
+    approvedInputHashes: hashes, approvedValidatorInputs: {},
+    validator: validator(),
+  });
+  expect(unfrozen.verdict.conclusion).toBe("undetermined");
+  expect(unfrozen.verdict.reasons[0]).toBe("approved input set mismatch");
+}, 20_000);
+
 test("取消覆盖发布全程：判定阶段取消不写已验证", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);

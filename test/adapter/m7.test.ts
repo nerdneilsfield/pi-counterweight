@@ -6,6 +6,8 @@ import path from "node:path";
 import { expect, test } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import counterweight, { type AdapterTimeouts } from "../../src/adapters/pi/index.ts";
+import { canonicalSha256 } from "../../src/core/canonical.ts";
+import { readProjectConfig } from "../../src/core/config.ts";
 import { contractSha256, readContract } from "../../src/core/contract.ts";
 import { contentSha256 } from "../../src/core/evidence.ts";
 import { escalationWorktreePath } from "../../src/core/escalate.ts";
@@ -246,10 +248,12 @@ interface = "strong"
     version: 1,
     contract_sha256: contractSha256(await readContract(
       path.join(repo, ".cw", "tasks", taskId, "contract.toml"), repo, taskId)),
-    project_config_sha256: "0".repeat(64),
+    project_config_sha256: canonicalSha256(
+      await readProjectConfig(path.join(repo, ".cw", "project.toml"))),
     validator: { cmd: ["/bin/sh", fixture, "reportfile", payloadFile], timeout_s: 600, env: {} },
     base_commit: base,
     baseline_inputs_sha256: { "tests/a.py": (await contentSha256(repo, "tests/a.py"))! },
+    validator_inputs_sha256: {},
     frozen_blobs: { "tests/a.py": (await blobHash(repo, "tests/a.py")).value! },
     red_check_run: 1,
     approved_at: new Date().toISOString(),

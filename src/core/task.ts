@@ -54,6 +54,8 @@ const approvalSchema = Type.Object({
   }, { additionalProperties: false }),
   base_commit: gitObjectId,
   baseline_inputs_sha256: Type.Record(Type.String({ minLength: 1 }), hexSha256),
+  /** Content hashes of the repo files the validator cmd references (frozen at approval). */
+  validator_inputs_sha256: Type.Record(Type.String({ minLength: 1 }), hexSha256),
   frozen_blobs: Type.Record(Type.String({ minLength: 1 }), gitObjectId),
   red_check_run: Type.Integer({ minimum: 0 }),
   approved_at: Type.String({ minLength: 1 }),
@@ -67,6 +69,7 @@ export interface Approval {
   validator: { cmd: string[]; timeout_s: number; env: Record<string, string> };
   base_commit: string;
   baseline_inputs_sha256: Record<string, string>;
+  validator_inputs_sha256: Record<string, string>;
   frozen_blobs: Record<string, string>;
   /** Run number of the approving red-check run; 0 when the deliverable skips it. */
   red_check_run: number;

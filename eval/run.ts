@@ -16,7 +16,7 @@ import { parse, stringify } from "smol-toml";
 import { canonicalSha256 } from "../src/core/canonical.js";
 import { contractSha256, readContract } from "../src/core/contract.js";
 import { readProjectConfig } from "../src/core/config.js";
-import { contentSha256 } from "../src/core/evidence.js";
+import { contentSha256, validatorInputFiles } from "../src/core/evidence.js";
 import { blobHash, worktreeAdd, worktreePrune } from "../src/core/gitstate.js";
 import { runRedCheck } from "../src/core/redcheck.js";
 import { runValidatorProcess } from "../src/core/runner.js";
@@ -381,6 +381,12 @@ async function bootstrapGate(
       frozenBlobs[file] = blob.value;
     }
   }
+  const validatorInputs: Record<string, string> = {};
+  for (const file of await validatorInputFiles(worktree, validator.cmd)) {
+    const hash = await contentSha256(worktree, file);
+    if (hash === null) throw new Error(`验证器引用的仓库文件缺失：${file}`);
+    validatorInputs[file] = hash;
+  }
   const approval: Approval = {
     version: 1,
     contract_sha256: contractSha256(contract),
@@ -388,6 +394,7 @@ async function bootstrapGate(
     validator,
     base_commit: input.base,
     baseline_inputs_sha256: inputHashes,
+    validator_inputs_sha256: validatorInputs,
     frozen_blobs: frozenBlobs,
     red_check_run: red !== null ? red.run : 0,
     approved_at: new Date().toISOString(),

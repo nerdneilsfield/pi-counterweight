@@ -65,6 +65,7 @@ export async function judgeEvidence(
   runDir: string,
   contract: Contract,
   approvedInputHashes: Record<string, string>,
+  expectedInputs: readonly string[] = contract.baseline_inputs,
 ): Promise<Verdict> {
   let record: RunRecord;
   try {
@@ -72,7 +73,7 @@ export async function judgeEvidence(
   } catch (error) {
     return undetermined(`run.json unreadable: ${errorMessage(error)}`);
   }
-  if (record.result_discarded) return judgeRecord(repo, record, null, contract, approvedInputHashes);
+  if (record.result_discarded) return judgeRecord(repo, record, null, contract, approvedInputHashes, expectedInputs);
   let text: string;
   try {
     text = await readFile(path.join(runDir, "result.json"), "utf8");
@@ -80,7 +81,7 @@ export async function judgeEvidence(
     if (isNotFound(error)) return undetermined("result.json missing");
     return undetermined(`result.json unreadable: ${errorMessage(error)}`);
   }
-  return judgeRecord(repo, record, text, contract, approvedInputHashes);
+  return judgeRecord(repo, record, text, contract, approvedInputHashes, expectedInputs);
 }
 
 export async function judgeRecord(
@@ -89,6 +90,7 @@ export async function judgeRecord(
   resultText: string | null,
   contract: Contract,
   approvedInputHashes: Record<string, string>,
+  expectedInputs: readonly string[] = contract.baseline_inputs,
 ): Promise<Verdict> {
   if (record.cancelled) return undetermined("cancelled");
   if (record.timed_out) return undetermined("timed out");
@@ -116,7 +118,8 @@ export async function judgeRecord(
     if (record.tree_before === null || record.tree_after === null) return undetermined("git tree missing");
     if (record.tree_before !== record.tree_after) return undetermined("worktree changed during validation");
   }
-  const input = inputMismatch(contract, approvedInputHashes, record);
+  const input = inputMismatch(expectedInputs, approvedInputHashes, record,
+    expectedInputs.filter((file) => !new Set(contract.baseline_inputs).has(file)));
   if (input) return undetermined(input);
   if (result.complete !== true) return undetermined("complete is not true");
 
@@ -182,6 +185,31 @@ export async function contentSha256(repo: string, relative: string): Promise<str
   return createHash("sha256").update(await readFile(file)).digest("hex");
 }
 
+/**
+ * The elements of a validator cmd argv that reference an existing regular file
+ * inside `repo` (repo-relative only; `..`, absolute paths, and symlink escapes
+ * are never returned). These are the validator's script and direct inputs —
+ * frozen by approval and re-checked around every validation run, because the
+ * tree hash cannot see drift under `.cw/`, where the recommended script lives.
+ */
+export async function validatorInputFiles(repo: string, cmd: readonly string[]): Promise<string[]> {
+  const found: string[] = [];
+  const seen = new Set<string>();
+  for (const element of cmd) {
+    if (seen.has(element)) continue;
+    seen.add(element);
+    try {
+      // Only elements that resolve to an existing regular file inside the
+      // repo are frozen inputs; anything else (executables, flags, report
+      // payloads) is not a path probe result and is skipped, errors included.
+      if (await contentSha256(repo, element) !== null) found.push(element);
+    } catch {
+      // Not a usable repo path (e.g. a long payload string): skip.
+    }
+  }
+  return found;
+}
+
 async function buildProof(repo: string, result: ResultReport): Promise<string | null> {
   const artifacts = result.artifacts ?? [];
   if (!result.build.required) {
@@ -208,8 +236,10 @@ async function buildProof(repo: string, result: ResultReport): Promise<string | 
   return null;
 }
 
-function inputMismatch(contract: Contract, approved: Record<string, string>, record: RunRecord): string | null {
-  const expected = contract.baseline_inputs;
+function inputMismatch(
+  expected: readonly string[], approved: Record<string, string>, record: RunRecord,
+  validatorFiles: readonly string[],
+): string | null {
   const approvedKeys = Object.keys(approved).sort();
   if (approvedKeys.join("\0") !== [...expected].sort().join("\0")) return "approved input set mismatch";
   const changed: string[] = [];
@@ -220,7 +250,11 @@ function inputMismatch(contract: Contract, approved: Record<string, string>, rec
   const extra = [...new Set([...Object.keys(record.input_hashes_before), ...Object.keys(record.input_hashes_after)])]
     .filter((file) => !expected.includes(file));
   if (extra.length > 0) return `unexpected input hash ${extra.join(", ")}`;
-  return changed.length === 0 ? null : `acceptance input changed ${changed.join(", ")}`;
+  if (changed.length === 0) return null;
+  const validatorSet = new Set(validatorFiles);
+  return changed
+    .map((file) => validatorSet.has(file) ? `validator input changed ${file}` : `acceptance input changed ${file}`)
+    .join("; ");
 }
 
 function duplicateId(checks: CheckReport[]): string | null {

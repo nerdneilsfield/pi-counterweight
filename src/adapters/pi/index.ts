@@ -284,6 +284,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
           contract,
           validator: active.approval.validator,
           approvedInputHashes: active.approval.baseline_inputs_sha256,
+          approvedValidatorInputs: active.approval.validator_inputs_sha256,
           signal: controller.signal,
         });
         setValidation({ controller, done: run.then(() => undefined, () => undefined) });

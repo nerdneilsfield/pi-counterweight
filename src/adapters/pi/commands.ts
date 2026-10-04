@@ -5,7 +5,7 @@ import { renderTaskView } from "../../core/approve.js";
 import { readProjectConfig, tierModel } from "../../core/config.js";
 import { contractSha256, readContract } from "../../core/contract.js";
 import { canonicalSha256 } from "../../core/canonical.js";
-import { contentSha256 } from "../../core/evidence.js";
+import { contentSha256, validatorInputFiles } from "../../core/evidence.js";
 import { EscalateError, REFERENCE_FILE, prepareBaseEscalation } from "../../core/escalate.js";
 import { blobHash, headCommit, isClean, isLinkedWorktree, worktreePrune } from "../../core/gitstate.js";
 import { writeHandback, readHandbackMaterial, readTaskNotes } from "../../core/handback.js";
@@ -274,6 +274,18 @@ async function taskApprove(
       }
       inputHashes[input] = hash;
     }
+    // Freeze the validator's own repo-referenced inputs (its script, often
+    // `.cw/validate.sh`): the tree hash never sees drift under `.cw/`, so each
+    // later validation re-checks these contents against the approved hashes.
+    const validatorInputs: Record<string, string> = {};
+    for (const input of await validatorInputFiles(repo, validator.cmd)) {
+      const hash = await contentSha256(repo, input);
+      if (hash === null) {
+        ctx.ui.notify(`Counterweight: 验证器引用的仓库文件缺失，拒绝批准：${input}`, "error");
+        return;
+      }
+      validatorInputs[input] = hash;
+    }
     const frozenBlobs: Record<string, string> = {};
     for (const file of contract.frozen) {
       const blob = await blobHash(repo, file);
@@ -298,6 +310,7 @@ async function taskApprove(
       validator,
       base_commit: state.base_commit,
       baseline_inputs_sha256: inputHashes,
+      validator_inputs_sha256: validatorInputs,
       frozen_blobs: frozenBlobs,
       red_check_run: red !== null ? red.run : 0,
       approved_at: new Date().toISOString(),
