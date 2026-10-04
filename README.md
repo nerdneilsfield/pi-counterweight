@@ -1,24 +1,72 @@
 # pi-counterweight
 
-Counterweight 的 Pi 扩展工程。当前实现 M0–M10：版本命令、网关缓存探针、`project.toml` / `contract.toml` 校验、任务目录与 Git 树快照、验证器运行与验收证据判定、冻结文件保护、门禁决策与交还材料、Pi 事件适配层（门禁接线、工具注册、计量），`/cw` 命令流程与契约先红批准，按任务选模型、任务升级与缓存纪律，只读探索者子代理（`cw_explore`），`cw observe` 观测命令与 `eval/` 评估脚手架。
+🧱 **Counterweight** 是 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 的门禁扩展：在你的仓库里给模型的编码任务加上契约、验证器验收与预算计量，让"改完了"变成有证据的结论。
 
-需要 Node.js `>=22.19.0`。Pi 固定为 `1.0.0`。
+- 📋 任务有契约：目标、验收项、先红项、回归项、冻结文件，批准后不再漂移
+- ✅ 结束有证据：由你的验证器判定 pass/fail，先红必须真的红过，产物哈希可核对
+- 💰 过程有计量：token、验证次数、墙钟时间逐条入账，超预算或受阻即交还
+- 🔍 疑问有出口：模型可调用只读探索者 `cw_explore` 与 `report_blocked`、`propose_contract_change`
 
-## 安装
+## ⚠️ 先读边界
+
+用之前请确认你能接受以下事实：
+
+- **这不是沙箱。** 冻结文件与账本靠文件系统权限与进程内检查实现，防的是门禁下模型的越权修改与证据漂移，不能抵抗同账户下的恶意进程或模型直接伪造文件。
+- **需要 Git。** `task new` / `task approve`、基线快照、冻结 blob 都要求 git 仓库；非 git 仓库只降级为报告，不宣称有基线证据。
+- **code 任务的批准需要交互界面。** 先红确认对话框只在 TUI 或 RPC 模式可用；print/json 单发模式下 `/cw task approve` 对 code 任务直接拒绝。
+- **只读 ≠ 隔离。** `cw_explore` 子进程只有 read/grep 两个工具，但工具白名单不构成对文件系统或扩展的安全隔离。
+- **真实网关、真实模型与真实评估未在本仓库测试中执行。** `npm test` 用真实 Pi RPC 但不需要模型凭据；网关缓存探针与 `eval/` 脚手架均未在付费真实模型上跑过。
+
+## ⬇️ Requirements
+
+- Node.js `>=22.19.0`
+- Git（任务与证据绑定）
+- pi `1.0.0`（本仓库固定依赖 `@earendil-works/pi-coding-agent@1.0.0`；其他版本未测）
+
+## 📦 Installation
+
+扩展从本仓库的 TypeScript 源码入口加载（`src/adapters/pi/index.ts`）。不要指向 `dist/` 下的构建产物——探索者的提示词资源不随 `tsc` 复制，从 dist 加载会缺失。本包未发布到 npm。
+
+**方式 A：克隆加载（已验证路径）**
 
 ```sh
-npm ci
-npm run typecheck
-npm test
-npm run build
-./node_modules/.bin/pi --extension ./src/adapters/pi/index.ts
+git clone <本仓库地址> ~/pi-counterweight
+cd ~/pi-counterweight
+npm ci && npm run typecheck && npm test
 ```
 
-在 Pi 中执行 `/cw-version`，预期通知为 `Counterweight: pi 1.0.0`。`npm test` 使用真实 Pi RPC 验证该命令，不需要模型凭据；缓存探针测试只访问本机伪网关。
+> 全套测试的稳定入口是 `npm run test:serial`。并行 `npm test` 在个别性能用例上可能因 CPU/IO 竞争偶发失败，重跑即可；测试阈值未放宽。
 
-## 配置（.cw/project.toml）
+然后在你自己的项目里启动 pi 时挂载：
 
-扩展读取被管理项目 `.cw/` 下的 `project.toml`。`.cw/` 应加入该项目的 `.gitignore`；`project.toml` 本身可以由你选择提交。示例：
+```sh
+cd /path/to/your-project
+pi --extension ~/pi-counterweight/src/adapters/pi/index.ts
+```
+
+**方式 B：作为依赖安装到你的项目**
+
+```sh
+cd /path/to/your-project
+npm install <本仓库的 git 地址或本地路径>
+pi --extension node_modules/pi-counterweight/src/adapters/pi/index.ts
+```
+
+## 🚀 Quick start
+
+1. 挂载扩展后，在 pi 里执行 `/cw-version`，预期通知：`Counterweight: pi 1.0.0`。
+2. 在你的项目准备 `.cw/project.toml` 与一个可运行的验证器（下文两节）。
+3. 确认工作树干净（只有 `git add` 不算，忽略 `.cw/` 本身），然后：
+
+```sh
+/cw task new fix-binding --tier change
+```
+
+按提示编辑生成的 `.cw/tasks/<id>/contract.toml`，再 `/cw task approve`。批准后门禁即接管当前会话。
+
+## ⚙️ 配置被管理项目（.cw/project.toml）
+
+扩展读取你项目 `.cw/` 下的 `project.toml`。`.cw/` 应加入该项目的 `.gitignore`；`project.toml` 本身可提交可不提交。示例：
 
 ```toml
 version = 1
@@ -50,14 +98,50 @@ versions = ["node"]
 
 未知字段报错；`timeout_s`、`repairs`、`tokens`、`wall_minutes`、`env` 缺省取上表默认值。
 
-## 验证器
+## 🏃 跑一个任务（/cw 命令）
 
-验证器是普通可执行程序，由 harness 在仓库根目录调用，环境里除你的 `env` 外另有：
+```sh
+/cw task new <slug> [--tier script|change|interface]  # 工作树必须干净（忽略 .cw/）
+# 编辑 .cw/tasks/<id>/contract.toml 后：
+/cw task approve        # 校验契约；code 任务先跑先红检查，需交互界面确认失败原因
+/cw task status         # 查看状态、预算、最后验证与冻结冲突
+/cw task resume <id>    # 把当前会话登记到任务（不重建基线；任务视图会启动首轮）
+/cw task cancel         # 取消任务（先终止在途验证）
+/cw task handback       # 手动生成交还材料并结束
+```
+
+- `task new` 记录 `base_commit`，按 `--tier` 与 `[tiers]`→`[models]` 选定任务模型，并生成契约模板。在 git worktree（非主检出）中不能创建或批准任务。
+- `task approve` 对 code 任务从 `base_commit` 建立隔离基线（只覆盖 `baseline_inputs`），先红项必须实际失败且其余验收/回归通过；`undetermined` 一律拒绝。批准后一段 ≤40 行的任务视图追加到会话并立即启动首轮模型回合，会话即刻采用任务模型。批准同时冻结三样东西：验证器命令（此后改 `project.toml` 不影响本任务）、命令引用的仓内脚本哈希（如 `.cw/validate.sh`）、`project.toml` 快照。
+- `handed_back` 的任务修订契约后可重新 `task approve`（重跑先红，`base_commit` 不变）。
+
+**门禁接管后**（状态 `approved`/`running` 且登记了当前会话的任务）：
+
+- 内置 `edit`/`write` 修改受保护路径（契约冻结与接口文件、`.cw/project.toml`、任务账本）直接 block，提示改用 `propose_contract_change`；每次 `tool_result` 后重查冻结文件，新冲突在工具结果末尾追加一行事实说明，不还原文件；
+- `agent_before_settle` 运行批准的验证器并判定验收证据：通过即结束，失败按剩余修复次数续跑，受阻或环境问题交还（材料在 `.cw/tasks/<id>/handback.md`）。每次结算前核对批准快照：`project.toml` 与批准版本漂移（含文件不可读）即交还，验证器与预算始终按批准语义执行；验证器脚本哈希在每次验证运行前后各核对一次，漂移的运行结果作废（`undetermined`）；
+- 工具 `report_blocked` 与 `propose_contract_change` 供模型上报受阻与提议契约变更；
+- 每条 assistant 消息的 usage 与任务事件记入 `.cw/tasks/<id>/meter.jsonl`，累计 `state.tokens_used`；
+- 任务只在接管时刻设置一次模型（会话启动接管、批准、恢复、升级），首轮之后适配层不再调用任何改变模型、thinking level、工具集或系统提示的 pi 方法。
+
+### 任务升级（/cw task escalate）
+
+```sh
+/cw task escalate [--from base|current]   # 默认 base
+```
+
+升级把任务交给 `strong` 模型的新会话；修复次数与已用预算不清零，也不追加预算。
+
+- `--from base`（默认）：在 `<仓库>/../<仓库名>-cw-<任务id>-esc` 建立基于原始 `base_commit` 的 worktree，只覆盖批准的验收输入（与批准哈希逐一核对）。**Pi 1.0 的命令上下文无法跨工作目录启动新会话（`newSession` 没有 `cwd` 参数）**，因此该命令不冒充升级完成：它释放原会话执行权、把 `state.model` 切到 strong、写入 `escalate_pending` 的交接材料，并提示你手动在新 worktree 启动 pi（加载本扩展）后执行 `/cw task resume <id>`。
+- `--from current`：在当前工作树用 `ctx.newSession` 真正替换会话；切换成功后才写 `escalated` 材料，任一步失败即回滚原账本与模型设置。注意与 approve/resume 不同：切换后的任务视图**不会自动启动模型回合**，首轮可能需要你手动发起。
+- 升级 worktree 内的会话通过受保护引用 `<worktree>/.cw/task.json` 找到同一份权威账本；`resume` 接管升级任务时，任务视图附带前一模型的笔记（标注未经验证），并像批准一样启动首轮。
+
+## ✅ 验证器协议
+
+验证器是普通可执行程序，由 harness 在你仓库根目录调用。环境变量：
 
 | 变量 | 含义 |
 | --- | --- |
 | `CW_TASK_ID` | 任务 ID |
-| `CW_RESULT_DIR` | 本次运行的全新空目录（绝对路径），结果写在这里 |
+| `CW_RESULT_DIR` | 本次运行的独立目录（绝对路径），结果写在这里；启动验证器前已预创建 `stdout.log` / `stderr.log`，不是空目录 |
 | `CW_RUN_ID` | 本次运行编号 |
 | `CW_REQUIRED_IDS` | 换行分隔的验收项 + 回归项 ID |
 
@@ -80,89 +164,40 @@ versions = ["node"]
 要点：
 
 - `checks` 必须覆盖 `CW_REQUIRED_IDS` 的全部 ID；`status` 只能是 `pass` / `fail` / `skip` / `error`。工具没有报告的必查 ID 应显式写成 `error`，不要省略。
-- 验证器**总结束时退出 0**：退出码非 0 表示验证器自身崩溃（harness 会把结果降级为 `undetermined`）；用例失败与否由 `checks` 状态表达。
+- 验证器**总结束时退出 0**：退出码非 0 表示验证器自身崩溃（harness 把结果降级为 `undetermined`）；用例失败与否由 `checks` 状态表达。
 - 需要构建产物证据时写 `build.required = true` 并给出 `fresh`、`load_verified` 与 `artifacts`（含 sha256 与 `loaded_by`）；不需要时 `build.required = false` 且不要带其余字段。harness 会核对产物存在与哈希。
-- 契约 ID 约定由你决定，两个可用的起点见 `validators/examples/`：
+- 契约 ID 约定由你决定，两个现成起点见 `validators/examples/`：
   - `validators/examples/python-pytest.sh`：契约 ID = pytest nodeid（如 `tests/test_binding.py::test_owner_outlives_view`）；
   - `validators/examples/node-vitest.sh`：契约 ID = `<测试文件相对路径>::<vitest 全名>`（全名是套件名与用例名以空格连接）。
 
-把示例复制进你的项目（如 `.cw/validate.sh`）后按上面 `project.toml` 的方式引用。示例不带构建产物证据，需要时再按协议补充。
+把示例复制进你的项目（如 `.cw/validate.sh`）后按 `project.toml` 的 `[validator]` 引用。示例不带构建产物证据，需要时再按协议补充。
 
-## 一次完整任务
+## 🔍 cw_explore
 
-```sh
-# 0. 准备：项目里已有 .cw/project.toml 与可运行的验证器；工作树干净（仅 git add 不算）
-# 1. 创建任务（记录 base_commit，按档位选定任务模型，生成契约模板）
-/cw task new fix-binding --tier change
-# 2. 编辑 .cw/tasks/<id>/contract.toml：goal、acceptance、red、regression、frozen、baseline_inputs
-# 3. 批准：code 任务先在原始基线上跑先红检查，确认对话框认可先红失败原因后写入批准记录
-/cw task approve
-# 4. 模型在门禁下修复：每次验证后按结果续跑，直至 verified、预算耗尽或受阻交还
-#    （受阻材料在 .cw/tasks/<id>/handback.md；模型可调用 report_blocked、
-#     propose_contract_change、cw_explore）
-# 5. 随时查看状态
-/cw task status
-# 6. 结束：verified 即完成；受阻可 /cw task handback 手动交还，或 /cw task cancel 取消
-```
+模型可在任务中调用 `cw_explore({ question })` 向只读探索者子代理提问：
 
-换会话或升级会话用 `/cw task resume <id>` 重新接管；`handed_back` 的任务修订契约后可重新 `task approve`（重跑先红，`base_commit` 不变）。
+- 子进程 pi 只有 `read` / `grep` 两个工具，超时 180 秒；
+- 每次实际执行的 read/grep 路径参数都对照工作树审计：出现越树路径（绝对路径、`..` 逃逸、外指符号链接）时，**整个回答不采信**，只返回错误；token 用量无论成败都计入任务预算；
+- 回答 ≤30 行，每条结论须带 `仓库相对路径:行号` 引用：引用无效标〔引用无效〕，缺引用标〔缺少引用〕（`未找到` 除外）；
+- 只读是工具白名单意义上的限制，**不是安全隔离**（见先读边界）。
 
-扩展加载后，对状态为 `approved`/`running` 且登记了当前会话 ID 的任务（`.cw/tasks/<id>/state.json`）生效：
+## 📊 cw observe 与 eval
 
-- 对内置 `edit` / `write` 修改受保护路径（契约冻结与接口文件、`.cw/project.toml`、任务账本）直接 block，提示改用 `propose_contract_change`；
-- 每次 `tool_result` 后重查冻结文件，有新冲突时在该工具结果末尾追加一行事实说明，不发送额外消息，不还原文件；
-- `agent_before_settle` 运行门禁：批准的验证器、验收证据三态判定、预算与修复次数，通过即结束、失败按剩余次数续跑、受阻或环境问题交还（材料在 `.cw/tasks/<id>/handback.md`）；
-- `report_blocked` 与 `propose_contract_change` 两个顺序执行的工具供模型上报受阻与提议契约变更；
-- `cw_explore({ question })` 向只读探索者子代理提问：子进程 pi 只有 read/grep 两个工具，回答 ≤30 行且逐条校验 `path:line` 引用，token 计入任务预算；
-- 每条 assistant 消息的 usage 追加到 `.cw/tasks/<id>/meter.jsonl` 并累计 `state.tokens_used`；任务创建、批准（含确认等待时长）、每次验证起止、交还与结束也记入同一文件（`kind: "usage"` / `kind: "task"` 两类行）；
-- 任务在会话中只在其接管的时刻设置一次模型（会话启动接管、批准、恢复、升级）；首轮之后适配层不再调用任何改变模型、thinking level、工具集或系统提示的 Pi 方法。
-
-## 任务流程（/cw 命令）
-
-```sh
-/cw task new <slug> [--tier script|change|interface]  # 工作树必须干净（忽略 .cw/）
-# 编辑 .cw/tasks/<id>/contract.toml 后：
-/cw task approve        # 校验契约；code 任务先在原始基线上跑先红检查，需交互界面确认失败原因
-/cw task status         # 查看状态、预算、最后验证与冻结冲突
-/cw task resume <id>    # 把当前会话登记到任务（不重建基线）
-/cw task cancel         # 取消任务（先终止在途验证）
-/cw task handback       # 手动生成交还材料并结束
-```
-
-- `task new` 记录 `base_commit`，按 `--tier` 与 `project.toml` 的 `[tiers]`→`[models]` 选定任务模型（写入 `state.model`）并生成契约模板；不干净时先提交或保存改动，仅 `git add` 不算干净。在 git worktree（非主检出）中不能创建或批准任务。
-- `task approve` 对 code 任务从 `base_commit` 建立隔离基线（只覆盖 `baseline_inputs`），先红项必须实际失败且其余验收/回归通过；`undetermined` 一律拒绝。确认对话框展示每个先红项的失败原因与覆盖文件；无 UI（print 模式）时拒绝批准。批准后一段 ≤40 行的任务视图会追加到会话，会话即刻采用任务模型。
-- 批准后验证器配置随之冻结：修改 `project.toml` 不影响本任务，执行始终使用批准时的命令。
-- 批准/恢复登记的会话才受门禁接管；`handed_back` 的任务修订契约后可重新 `task approve`（重跑先红，`base_commit` 不变）。
-
-### 任务升级（/cw task escalate）
-
-```sh
-/cw task escalate [--from base|current]   # 默认 base
-```
-
-升级把任务交给 `strong` 模型的新会话；修复次数与已用预算不清零，也不追加预算。升级材料与计量事件只在交接真正落地后写入：切换被取消、失败或模型未能接管时，账本持锁回滚、幸存会话的模型恢复为升级前设置（无法恢复时明确报告），不留下任何宣称升级成功的材料或事件。
-
-- `--from base`（默认）：在 `<仓库>/../<仓库名>-cw-<任务id>-esc` 建立基于原始 `base_commit` 的 worktree，只覆盖批准的验收输入（与批准哈希逐一核对，不一致即拒绝并清理），并写入指向唯一权威账本的引用 `<worktree>/.cw/task.json`。**Pi 1.0 的命令上下文无法跨工作目录启动新会话（`newSession` 没有 `cwd` 参数）**，因此该命令不冒充升级完成：它释放原会话的执行权、把 `state.model` 切到 strong，写入原因 `escalate_pending` 的交接材料（明确待手动交接），并提示你手动在新 worktree 启动 Pi（加载本扩展）后执行 `/cw task resume <id>`。原工作树代码不变，可写账本不复制。
-- `--from current`：在当前工作树用 `ctx.newSession` 真正替换会话；先落模型、再提交账本、最后追加视图，任一步失败即恢复原账本。切换成功后才写原因 `escalated` 的材料；新会话登记进同一账本、采用 strong 模型，任务视图连同"前一模型的笔记，未经验证"一并追加。
-- 升级 worktree 内的会话通过 `.cw/task.json` 引用找到同一份权威账本；该引用是受保护路径，模型不可直接写入。未登记的会话不会自动接管；`resume` 接管升级任务时，任务视图附带前一模型的笔记（标注未经验证）。
-
-探针要求显式设置 `CW_GATEWAY_URL`（完整 Chat Completions 地址）、`CW_GATEWAY_API_KEY`、`CW_GATEWAY_MODEL`，然后运行 `npm run probe-cache`。两次长请求会产生费用；只有首个请求的 prompt token 超过 2000 且第二个请求报告缓存读取时，结果才为 `supported`，否则为 `unconfirmed`。`unconfirmed` 不代表网关不支持缓存。
-
-## 观测命令（cw observe）
+### cw observe
 
 ```sh
 npm run build
 npm run observe -- [--note <文字>] -- <cmd> [args...]
 ```
 
-在当前目录运行一条命令，并把现场记录到 `./.cw/observations/<UTC时间戳>/`（同一秒冲突时追加 `-n`）：
+在当前目录运行一条命令并把现场记录到 `./.cw/observations/<UTC时间戳>/`（同一秒冲突时追加 `-n`）：
 
-- `observation.json`：命令 argv 原样数组（不经 shell 拼接）、工作目录、`--note` 备注、退出码、终止信号、超时/取消标记、git 仓库根/提交/树哈希（非 git 仓库记 `supported: false`，不绑定）、OS 摘要、以及 `.cw/project.toml` 可选 `[observe] versions = ["node", ...]` 指定的各命令 `--version` 探测结果；
-- `stdout-tail.txt` / `stderr-tail.txt`：两条流的尾部各 200 行（总量超约 1 MiB 时截断并注明，只保留尾部）。
+- `observation.json`：命令 argv 原样数组、工作目录、`--note`、退出码、终止信号、超时/取消标记、git 仓库根/提交/树哈希（非 git 仓库记 `supported: false`）、OS 摘要、`[observe] versions` 指定的各命令 `--version` 探测结果；
+- `stdout-tail.txt` / `stderr-tail.txt`：两条流尾部各 200 行（超约 1 MiB 截断并注明，只留尾部）。
 
-命令失败、被 Ctrl+C（SIGINT/SIGTERM 会终止整个子进程组）都不影响记录完整性：`observation.json` 在命令启动前先落盘、结束后更新。观察者只记录，不做任何分析；环境摘要只含 OS 与工具版本，环境变量不入记录。observe 自身的退出码镜像被观测命令的退出码（spawn 失败为 127，用法错误为 2）。
+命令失败或被 Ctrl+C 都不影响记录完整性（`observation.json` 在启动前先落盘、结束后更新）。观察者只记录不分析，环境变量不入记录。退出码镜像被观测命令（spawn 失败 127，用法错误 2）。
 
-## 评估脚手架（eval/）
+### eval 脚手架
 
 ```sh
 npm run build
@@ -179,16 +214,51 @@ node dist/eval/run.js my-tasks.toml [--repeat <n>] [--out <dir>]
 
 输出（默认 `eval/out/<时间戳>/`，已 gitignore）：
 
-- `results.csv`：每次运行一行，列为 `task, condition, repeat, final_state, verdict, wall_seconds, tokens, cache_read, cache_write, cost, repairs, escalated`。`final_state` 取 pi 结束原因或门禁账本状态；`verdict` 来自任务 `verify_cmd` 独立验证（结果不回灌）；token/缓存/费用取自 pi `--mode json` 事件的 usage 求和；
-- `judging/index.md` 与 `judging/j-<n>.md`：打乱顺序、**不含条件标签**的人工评判清单（任务描述、验收说明、评判标准、结果 diff 截 400 行）；
-- `key.csv`：key → 条件映射，供评判完成后揭晓对照，不与清单一起阅读。
+- `results.csv`：每次运行一行，列 `task, condition, repeat, final_state, verdict, wall_seconds, tokens, cache_read, cache_write, cost, repairs, escalated`；`verdict` 来自任务 `verify_cmd` 独立验证（结果不回灌）；token/缓存/费用取自 pi `--mode json` 事件 usage 求和；
+- `judging/index.md` 与 `judging/j-<n>.md`：打乱顺序、**不含条件标签**的人工评判清单；
+- `key.csv`：key → 条件映射，供评判完成后揭晓对照。
 
-门禁条件会在被评估仓库的 worktree 里自动写入 `.cw/project.toml` 与任务账本（任务 id 为 `<UTC日期>-<id>`），并以 `/cw task resume` 作为第一条消息登记会话。此脚手架只用伪任务自测过，尚未在真实模型上执行；`/cw task resume` 在 print/json 模式下的命令分发已实测可用（见仓库开发记录），真实模型 run 仍待执行。
+门禁条件会在被评估仓库的 worktree 里自动写入 `.cw/project.toml` 与任务账本（任务 id 为 `<UTC日期>-<id>`），并以 `/cw task resume` 作为第一条消息登记会话。**此脚手架只用伪任务自测过，尚未在真实模型上执行。**
 
-## 已知限制
+### 网关缓存探针（可选）
 
-- **同账户下不是强安全边界**。冻结文件、任务账本与验证器协议依赖文件系统权限与进程内互斥，不能抵抗同账户下的恶意进程或模型伪造（例如直接改写 `.cw/` 下未被保护检查覆盖的文件）。它防的是门禁下模型的越权修改与证据漂移，不是沙箱。
-- **非 git 仓库不绑定证据**。`task new`/`approve`、树快照、冻结 blob 都要求 git；非 git 仓库只降级为报告（`supported: false`），不宣称有基线证据。
-- **无 UI 模式不能批准契约**。print/json 单发模式下 `/cw task approve` 对 code 任务因无法弹先红确认对话框而拒绝；交互模式指 TUI 或 RPC。非 code 交付物（repro/measurement/diagnosis）不需要确认对话框，print 模式可批准。
-- 探针结论保守：`unconfirmed` 只说明证据不足，不判定网关能力；费用字段依赖模型价格元数据，未配置价格时的零值不是真实账单。
-- 工具白名单（如探索者的 `--tools read,grep`）不等于对任意扩展、同账户文件操作的安全沙箱。
+```sh
+export CW_GATEWAY_URL=<完整 chat/completions 地址>
+export CW_GATEWAY_API_KEY=<key>
+export CW_GATEWAY_MODEL=<model>
+npm run probe-cache
+```
+
+两次长请求会产生费用；只有首个请求 prompt token 超过 2000 且第二个请求报告缓存读取时结果才为 `supported`，否则为 `unconfirmed`。`unconfirmed` 不代表网关不支持缓存。
+
+## 🔧 Troubleshooting
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| `task new` / `task approve` 报工作树不干净 | 先提交或保存改动；仅 `git add` 不算干净。`.cw/` 应在 `.gitignore` 里 |
+| 在 git worktree 里无法创建/批准任务 | 设计如此：请在主检出运行 `/cw task new` / `/cw task approve` |
+| `task approve` 提示无 UI 被拒 | code 任务需要先红确认对话框；在 TUI 或 RPC 交互模式执行。print/json 单发模式只可批准非 code 交付物（`repro`/`measurement`/`diagnosis`） |
+| `undetermined` 被拒绝 | 先红或验收结果不确定一律不放行；检查验证器退出码（崩溃即 `undetermined`）与 `result.json` 完整性 |
+| 模型未被切换/未设置模型 | `state.model` 必须是 `provider/model` 形式、在 pi 模型注册表中、且 provider 已配置认证；三者缺一即跳过并通知 |
+| 门禁似乎没接管 | 只有 `approved`/`running` 且登记了当前会话 ID 的任务才生效；换会话用 `/cw task resume <id>` |
+| 冻结文件被改但没还原 | 设计如此：门禁只 block 与追加事实说明，不还原文件；你自己决定回滚 |
+| 探针结果 `unconfirmed` | 证据不足，不判定网关能力；确认 URL 是完整 chat/completions 地址、prompt 足够长 |
+| escalate `--from base` 后没有"自动升级" | Pi 1.0 限制：请手动在升级 worktree 启动 pi（加载本扩展）并执行 `/cw task resume <id>` |
+| `cw observe` 退出码非 0 | 镜像被观测命令的退出码；127 是 spawn 失败，2 是用法错误 |
+
+## 🚧 Known limitations
+
+- **同账户下不是强安全边界。** 冻结文件、任务账本与验证器协议依赖文件系统权限与进程内互斥，不能抵抗同账户下的恶意进程或模型伪造（例如直接改写 `.cw/` 下未被保护检查覆盖的文件）。它防的是门禁下模型的越权修改与证据漂移，不是沙箱。
+- **非 git 仓库不绑定证据。** `task new`/`approve`、树快照、冻结 blob 都要求 git；非 git 仓库只降级为报告（`supported: false`），不宣称有基线证据。
+- **无 UI 模式不能批准 code 契约。** print/json 单发模式下 `/cw task approve` 对 code 任务因无法弹先红确认对话框而拒绝；交互模式指 TUI 或 RPC。非 code 交付物（`repro`/`measurement`/`diagnosis`）不需要确认对话框，print 模式可批准。
+- **探针结论保守。** `unconfirmed` 只说明证据不足，不判定网关能力；费用字段依赖模型价格元数据，未配置价格时的零值不是真实账单。
+- **工具白名单不是沙箱。** 探索者的 `--tools read,grep` 不等于对任意扩展、同账户文件操作的安全隔离。
+- **评估与探针未在真实模型上执行。** `eval/` 与缓存探针未经付费真实模型验证；费用数字来自价格元数据推算，不是账单。
+
+## 💬 反馈
+
+问题与建议请开 [issue](../../issues)。欢迎对验证器协议、契约字段与门禁行为提出使用中的实际摩擦。
+
+## 📖 License
+
+[MIT](./LICENSE) © DengQi
