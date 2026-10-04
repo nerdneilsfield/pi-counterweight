@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -201,9 +201,24 @@ test("并发接管只有一方持锁，计数不回滚", async () => {
   releaseOuter?.();
   await finished;
   await createTask(root, "20260928-other-fix", "gateway/medium");
+  // 陈旧锁（持有进程已死，ESRCH）可安全回收：获取成功并重写锁内容。
   const crashed = path.join(root, ".cw", "tasks", "20260928-other-fix", "lock");
   await writeFile(crashed, `${JSON.stringify({ pid: 2 ** 30, session: "dead", acquired_at: "x" })}\n`);
-  await expect(allocateRun(root, "20260928-other-fix", "session-c")).rejects.toThrow(/dead, not reclaimed/);
+  let releaseDead: (() => void) | undefined;
+  let finishedDead!: Promise<unknown>;
+  const enteredDead = new Promise<void>((done) => {
+    finishedDead = withTaskLock(root, "20260928-other-fix", "session-c", () => new Promise<void>((unlock) => {
+      releaseDead = unlock;
+      done();
+    }));
+  });
+  await enteredDead;
+  expect(JSON.parse(await readFile(crashed, "utf8"))).toMatchObject({
+    pid: process.pid, session: "session-c",
+  });
+  releaseDead?.();
+  await finishedDead;
+  expect(await allocateRun(root, "20260928-other-fix", "session-c")).toBe(1);
   let releaseSecond: (() => void) | undefined;
   let finishedSecond!: Promise<unknown>;
   const entered = new Promise<void>((done) => {
@@ -225,6 +240,46 @@ test("并发接管只有一方持锁，计数不回滚", async () => {
   await expect(createTask(root, "20260928-lifetime-fix", "gateway/medium")).rejects.toThrow(/already exists/);
   expect((await readState(root, "20260928-lifetime-fix")).repairs_used).toBe(1);
 });
+
+test("陈旧锁回收：死 pid 回收，活 pid 与损坏内容继续拒绝", async () => {
+  const root = await repo();
+  await createTask(root, "20260928-lifetime-fix", "gateway/medium");
+  const lockPath = path.join(root, ".cw", "tasks", "20260928-lifetime-fix", "lock");
+
+  // 死 pid（真实退出过的子进程，kill(pid,0) → ESRCH）：回收并接管。
+  const dead = await new Promise<number>((resolve, reject) => {
+    const child = spawn("node", ["-e", "process.exit(0)"]);
+    child.once("close", () => resolve(child.pid!));
+    child.once("error", reject);
+  });
+  const stale = `${JSON.stringify({ pid: dead, session: "ghost", acquired_at: "then" })}\n`;
+  await writeFile(lockPath, stale);
+  let release: (() => void) | undefined;
+  let finished!: Promise<unknown>;
+  const entered = new Promise<void>((done) => {
+    finished = withTaskLock(root, "20260928-lifetime-fix", "session-a", () =>
+      new Promise<void>((unlock) => { release = unlock; done(); }));
+  });
+  await entered;
+  expect(JSON.parse(await readFile(lockPath, "utf8"))).toMatchObject({
+    pid: process.pid, session: "session-a",
+  });
+  release?.();
+  await finished;
+
+  // 活 pid（本进程）+ 其他会话：拒绝且锁内容原样保留。
+  const live = `${JSON.stringify({ pid: process.pid, session: "other", acquired_at: "now" })}\n`;
+  await writeFile(lockPath, live);
+  await expect(withTaskLock(root, "20260928-lifetime-fix", "session-a", async () => undefined))
+    .rejects.toBeInstanceOf(TaskLockError);
+  expect(await readFile(lockPath, "utf8")).toBe(live);
+
+  // 损坏的锁内容：无法证明持有者已死，不回收，拒绝。
+  await writeFile(lockPath, "not-json\n");
+  await expect(withTaskLock(root, "20260928-lifetime-fix", "session-a", async () => undefined))
+    .rejects.toBeInstanceOf(TaskLockError);
+  await rm(lockPath, { force: true });
+}, 20_000);
 
 test("路径规范化、symlink 禁区与已跟踪 .cw 不进入 tree", async () => {
   const root = await repo();

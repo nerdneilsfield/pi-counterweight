@@ -263,10 +263,22 @@ export async function acquireLock(repo: string, taskId: string, session: string)
   const dir = await existingTaskDir(repo, taskId);
   const lockPath = path.join(dir, "lock");
   const holder: LockHolder = { pid: process.pid, session, acquired_at: new Date().toISOString() };
-  const handle = await open(lockPath, lockFlags).catch(async (error: NodeJS.ErrnoException) => {
+  const openLock = () => open(lockPath, lockFlags);
+  const handle = await openLock().catch(async (error: NodeJS.ErrnoException) => {
     if (error.code === "ELOOP") throw new Error("task lock must not be a symlink");
     if (error.code !== "EEXIST") throw error;
     await rejectUnexpected(lockPath, "task lock");
+    // A lock whose holder process is provably dead (kill(pid,0) → ESRCH) and
+    // whose file content is unchanged between two reads is safely reclaimable;
+    // live pids and unresolvable pids (EPERM) keep refusing.
+    if (await reclaimDeadLock(lockPath)) {
+      return openLock().catch(async (retry: NodeJS.ErrnoException) => {
+        if (retry.code === "ELOOP") throw new Error("task lock must not be a symlink");
+        if (retry.code !== "EEXIST") throw retry;
+        await rejectUnexpected(lockPath, "task lock");
+        throw new TaskLockError(await readHolder(lockPath));
+      });
+    }
     throw new TaskLockError(await readHolder(lockPath));
   });
   try {
@@ -302,19 +314,41 @@ async function assertHeld(dir: string, session: string): Promise<void> {
 }
 
 async function readHolder(lockPath: string): Promise<LockHolder> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readFile(lockPath, "utf8"));
-    rejectUnknown(lockSchema, parsed, "task lock");
-  } catch (error) {
-    if (error instanceof TaskLockError) throw error;
+  const holder = await readRawHolder(lockPath);
+  if (holder === null) {
     throw new TaskLockError({ pid: 0, session: "unreadable", acquired_at: "" });
   }
-  const holder = parsed as LockHolder;
   if (!(await holderAlive(holder.pid))) {
     throw new TaskLockError({ ...holder, session: `${holder.session} (dead, not reclaimed)` });
   }
   return holder;
+}
+
+/** Parsed lock content, or null when the file is gone or malformed. */
+async function readRawHolder(lockPath: string): Promise<LockHolder | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(lockPath, "utf8"));
+    rejectUnknown(lockSchema, parsed, "task lock");
+  } catch {
+    return null;
+  }
+  return parsed as LockHolder;
+}
+
+/**
+ * Remove the lock file when its recorded process is provably dead. The content
+ * is read twice and must be identical both times, so a lock that another
+ * process re-acquired in between (different content) is never removed; any
+ * read or parse failure leaves the file untouched.
+ */
+async function reclaimDeadLock(lockPath: string): Promise<boolean> {
+  const stale = await readRawHolder(lockPath);
+  if (stale === null || (await holderAlive(stale.pid))) return false;
+  const current = await readRawHolder(lockPath);
+  if (current === null || JSON.stringify(current) !== JSON.stringify(stale)) return false;
+  await rm(lockPath, { force: true });
+  return true;
 }
 
 async function holderAlive(pid: number): Promise<boolean> {
