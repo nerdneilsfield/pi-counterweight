@@ -1,3 +1,12 @@
+/**
+ * M6 里程碑端到端测试：在临时 git 仓库中走通 `/cw task new|approve|resume|status|cancel|handback`
+ * 全流程，每个用例都以磁盘账本（state/approval/run/handback）为断言依据。
+ *
+ * M6 milestone suite: drives the whole `/cw task ...` lifecycle against a
+ * throwaway git repository and asserts on the on-disk task ledger rather than
+ * on returned values. Race cases pin the approve-vs-cancel/shutdown semantics
+ * and the direction the gate fails in.
+ */
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,9 +22,15 @@ import { readProjectConfig } from "../../src/core/config.ts";
 import { checkFrozen } from "../../src/core/freeze.ts";
 import { createTask, readState, updateState, writeProposal } from "../../src/core/task.ts";
 
+// 假验证器 fixture：首个参数 mode 决定写出的报告（reportrun/reportfile/none/hang 等）。
+// Fake validator fixture; its first argument decides which report it writes.
 const fixture = path.join(import.meta.dirname, "../fixtures/validators/fake.sh");
+// 短睡眠，用于轮询在途状态（子进程 PID、竞态窗口），不带重试语义。
+// Short sleep used to poll for in-flight state (child pid, race windows).
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 任务 id 口径 `YYYYMMDD-<slug>`，必须与 core 的生成规则一致，否则读不到任务目录。
+// Task id format (`YYYYMMDD-<slug>`) mirroring the core layer's naming rule.
 const slug = "lifetime-fix";
 const ymd = () => {
   const now = new Date();
@@ -23,8 +38,19 @@ const ymd = () => {
 };
 const taskId = `${ymd()}-${slug}`;
 
+// 宽松的事件/命令签名，让 fake 不依赖 pi 的事件类型定义。
+// Loose signature so the fakes avoid depending on pi's event types.
 type Handler = (event: any, ctx: any) => any;
 
+/**
+ * 构造内存版 ExtensionAPI：记录事件 handler、注册的命令与 sendMessage 载荷，
+ * 不接触真实 pi 运行时；`call` 调用同名事件最后注册的 handler。
+ *
+ * Builds an in-memory ExtensionAPI that records handlers, commands and sent
+ * messages. `call` invokes the last handler registered for an event, matching
+ * the adapter registering exactly one handler per event; it throws when the
+ * event has no handler, so a typo fails loudly instead of silently passing.
+ */
 function fakePi(): {
   pi: ExtensionAPI;
   handlers: Map<string, Handler[]>;
@@ -63,6 +89,15 @@ function fakePi(): {
   };
 }
 
+/**
+ * 构造内存版 ExtensionContext：`hasUI`/`confirmResult` 决定 UI 形态与确认结果，
+ * `confirmGate` 可让 confirm 挂起，用于制造批准与取消/关闭的竞态窗口。
+ *
+ * In-memory ExtensionContext. `hasUI` and `confirmResult` shape the UI surface,
+ * while `confirmGate` keeps `confirm` pending so a test can interleave cancel
+ * or shutdown with a waiting approval. Notification/confirm calls and the
+ * `waitForIdle` count are recorded for assertions.
+ */
 function fakeCtx(
   repo: string,
   options: { hasUI?: boolean; confirmResult?: boolean; session?: string; confirmGate?: Promise<void> } = {},
@@ -98,6 +133,13 @@ function fakeCtx(
   };
 }
 
+/**
+ * 在 `cwd` 下执行一次 git 子进程并返回 stdout；退出码非 0 时 reject。
+ *
+ * Runs one git child process in `cwd` and resolves with its stdout. A non-zero
+ * exit code rejects instead of returning partial output, so a broken fixture
+ * fails at setup time rather than corrupting later assertions.
+ */
 async function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd });
@@ -108,6 +150,8 @@ async function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+// 先红基准报告：red1 失败、keep/reg1 通过；@RUN@ 由验证器按 run id 替换。
+// Baseline red report: red1 fails, keep/reg1 pass; the validator substitutes @RUN@ per run.
 const redOkPayload = JSON.stringify({
   protocol: 1, run_id: "@RUN@", complete: true,
   checks: [
@@ -118,9 +162,13 @@ const redOkPayload = JSON.stringify({
   build: { required: false }, summary: "x", logs: [],
 });
 
+// 把验证器命令编码成 project.toml 里的 JSON argv 字符串（fake.sh + mode/payload/退出码）。
+// Renders the validator command as the JSON argv string stored in project.toml.
 const validatorArgv = (mode: string, payload: string, code = "0") =>
   `["/bin/sh", "${fixture}", "${mode}", ${JSON.stringify(payload)}, "${code}"]`;
 
+// 项目配置模板：四档模型与 tier→模型映射，validator.cmd 由调用方按用例注入。
+// Project config template: model tiers plus the validator command injected per case.
 const projectToml = (validatorArgvText: string) => `version = 1
 
 [validator]
@@ -139,6 +187,10 @@ change = "medium"
 interface = "strong"
 `;
 
+// 契约模板：task_id 取当前用例的 id、tier 固定 change；列表字段与 goal 可用 overrides 覆盖，
+// approved_failures 只在显式给出时才写进 TOML。
+// Contract template: current task id and tier "change" by default; every list field
+// can be overridden, and approved_failures is emitted only when supplied.
 const contractToml = (overrides: {
   deliverable?: string; acceptance?: string[]; red?: string[]; regression?: string[];
   frozen?: string[]; baselineInputs?: string[]; approvedFailures?: string; goal?: string;
@@ -155,6 +207,14 @@ baseline_inputs = [${(overrides.baselineInputs ?? ["tests/a.py"]).map((id) => `"
 ${overrides.approvedFailures ? `approved_failures = [${overrides.approvedFailures}]` : ""}
 `;
 
+/**
+ * 建一个临时 git 仓库：一个 base 提交（tracked.txt、tests/a.py）加最薄 `.cw/project.toml`。
+ *
+ * Creates a throwaway git repo with a single base commit and a minimal
+ * `.cw/project.toml` whose validator reports the baseline red result. Returns
+ * the repo path plus the base commit, which doubles as the immutable baseline
+ * for every red check in the file.
+ */
 async function setup(): Promise<{ repo: string; base: string }> {
   const repo = await mkdtemp(path.join(tmpdir(), "cw-m6-"));
   await git(repo, ["init"]);
@@ -170,6 +230,13 @@ async function setup(): Promise<{ repo: string; base: string }> {
   return { repo, base };
 }
 
+/**
+ * 注册扩展并触发一次 `session_start`，返回 fake、它的记录容器与已解析的任务上下文。
+ *
+ * Registers the extension and fires `session_start` so the adapter locates the
+ * repo's task before any command runs; `timeouts` can shrink the adapter's
+ * internal budgets for slow-machine tolerance.
+ */
 async function startAdapter(repo: string, timeouts?: Partial<AdapterTimeouts>) {
   const fake = fakePi();
   counterweight(fake.pi, timeouts);
@@ -178,15 +245,25 @@ async function startAdapter(repo: string, timeouts?: Partial<AdapterTimeouts>) {
   return { fake, ...context };
 }
 
+/**
+ * 把原始参数文本交给注册的 `cw` 命令 handler，等价于用户敲 `/cw <args>`。
+ *
+ * Feeds raw argument text to the registered `cw` command, i.e. what the user
+ * would type after `/cw`; throws when the command was never registered.
+ */
 async function runCmd(fake: ReturnType<typeof fakePi>, args: string, ctx: ExtensionContext): Promise<void> {
   const command = fake.commands.get("cw");
   if (command === undefined) throw new Error("/cw not registered");
   await command.handler(args, ctx);
 }
 
+// 取最后一条通知文本（无通知时为空串），便于对命令输出做子串断言。
+// Last notification text, or "" when none was sent; used for substring assertions.
 const lastNotify = (notifications: Array<{ message: string; type?: string }>) =>
   notifications.at(-1)?.message ?? "";
 
+// agent_before_settle 的最小载荷：一个已完成且可继续的回合，门禁在这里做结算判定。
+// Minimal settle event — a completed, continuable turn; the gate decides here.
 const settleEvent = () => ({
   type: "agent_before_settle",
   entries: [],
@@ -195,10 +272,13 @@ const settleEvent = () => ({
   context: { canContinue: true },
 });
 
+// 构造 tool_call 事件（固定 toolCallId），用于探针式验证门禁对受保护路径的 block。
+// Builds a tool_call event to probe whether the gate blocks a protected target.
 const toolCallEvent = (toolName: string, input: Record<string, unknown>) => ({
   type: "tool_call", toolCallId: "t1", toolName, input,
 });
 
+// 契约：仅干净树建档并记 base_commit；各拒绝路径不落盘 / Only a clean tree persists a task; rejections store nothing.
 test("task new：干净树创建 drafting 任务与契约模板并记录 base_commit；脏树拒绝且不改工作树", async () => {
   const { repo, base } = await setup();
   const { fake, ctx, notifications } = await startAdapter(repo);
@@ -232,6 +312,8 @@ test("task new：干净树创建 drafting 任务与契约模板并记录 base_co
   expect(lastNotify(notifications)).toContain("--tier");
 }, 20_000);
 
+// approve：脏树上先红跑隔离基线；快照冻结契约/验证器/blob，工作树不被触碰。
+// Approve: red runs on an isolated baseline; snapshot freezes inputs; tree untouched.
 test("task approve：脏工作树下先红用原始基线；确认后写 approval、状态 approved、任务视图追加、工作树不变", async () => {
   const { repo, base } = await setup();
   const fake = fakePi();
@@ -317,6 +399,8 @@ test("task approve：脏工作树下先红用原始基线；确认后写 approva
   expect(worktrees.split("worktree ").length - 1).toBe(1);
 }, 30_000);
 
+// 先红语义：红项必须"失败且仅一次"，其余验收/回归项必须通过；仅 approved_failures 可豁免。
+// Red: each red item must fail exactly once; only approved_failures may excuse known failures.
 test("task approve：red 通过/缺失/重复/跳过、非先红验收失败、回归失败均拒绝；存量失败豁免回归后可批准", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -377,6 +461,8 @@ test("task approve：red 通过/缺失/重复/跳过、非先红验收失败、�
   expect((await readState(repo, taskId)).status).toBe("approved");
 }, 30_000);
 
+// 失败语义：无报告=undetermined 绝不判 pass；无 UI 或用户拒确认都停在 drafting。
+// Fail-safe: no report stays undetermined; no UI or declined confirm keeps drafting.
 test("task approve：验证器无报告（undetermined）拒绝；无 UI 拒绝并提示交互模式；确认被拒不批准", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -405,6 +491,8 @@ test("task approve：验证器无报告（undetermined）拒绝；无 UI 拒绝�
   await expect(readFile(path.join(repo, ".cw", "tasks", taskId, "approval.json"), "utf8")).rejects.toThrow();
 }, 30_000);
 
+// 边界：非 code 交付物没有先红可跑，跳过红检查（red_check_run 0）且无需交互确认。
+// Boundary: non-code deliverables skip the red check (run 0) and need no confirmation.
 test("非 code 交付物：跳过先红直接批准，red_check_run 0，无 UI 也可批准", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -423,6 +511,8 @@ test("非 code 交付物：跳过先红直接批准，red_check_run 0，无 UI �
   expect(fake.sent).toHaveLength(1);
 }, 30_000);
 
+// 门禁 fail-safe：project.toml 漂移即交还且不执行新命令，恢复后才按批准命令验证。
+// Gate fail-safe: drift hands back without validating; after restore the approved command runs.
 test("批准后 project.toml 漂移：门禁 fail-safe 交还（不验证、不用新命令），恢复后可继续", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -473,6 +563,8 @@ test("批准后 project.toml 漂移：门禁 fail-safe 交还（不验证、不�
   expect(run3.checks.find((item: any) => item.id === "red1").status).toBe("fail");
 }, 30_000);
 
+// 信任边界：验证器脚本被批准哈希冻结，篡改后判 undetermined 交还，绝不发布 verified。
+// Trust boundary: a tampered validator yields undetermined handback, never a pass.
 test("批准冻结验证器脚本：.cw/validate.sh 篡改后门禁判无法判定，不发布 verified", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -525,6 +617,8 @@ EOF
     .not.toBe(approval.validator_inputs_sha256[".cw/validate.sh"]);
 }, 30_000);
 
+// resume：只登记会话与追加任务视图，不重建基线、不动预算；非 approved/running 拒绝。
+// Resume: registers the session, keeps baseline/budgets; non-approved tasks are refused.
 test("task resume：登记会话、不重建基线、任务视图追加、保护生效；非 approved/running 拒绝", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -561,6 +655,8 @@ test("task resume：登记会话、不重建基线、任务视图追加、保护
   expect(lastNotify(second.notifications)).toContain("approved/running");
 }, 30_000);
 
+// status：汇总状态、预算、先红 run 与冻结冲突，全部来自账本记录而非重新扫描。
+// Status: reports state, budget, red run and frozen conflicts read from the ledger.
 test("task status：显示状态、预算、最后验证与冲突", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -587,6 +683,8 @@ test("task status：显示状态、预算、最后验证与冲突", async () => 
   expect(text).toContain("tests/a.py");
 }, 30_000);
 
+// 状态机：verified 是终态，迟到的 cancel 被状态拒绝，门禁对 verified 任务不再动作。
+// State machine: verified is terminal — a late cancel is refused and the gate stays silent.
 test("验证发布后再取消：verified 状态不被迟到取消改写", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -628,6 +726,8 @@ test("验证发布后再取消：verified 状态不被迟到取消改写", async
   expect((await readState(repo, taskId)).status).toBe("verified");
 }, 30_000);
 
+// cancel：先中止在途验证（子进程被杀）再置 cancelled；其后门禁不再动作。
+// Cancel aborts the in-flight validator, marks cancelled, then the gate stays silent.
 test("task cancel：终止在途验证并取消任务；其后门禁不动作", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -677,6 +777,8 @@ test("task cancel：终止在途验证并取消任务；其后门禁不动作", 
   expect((await readState(repo, taskId)).status).toBe("cancelled");
 }, 40_000);
 
+// 提议：未消费的 approved 提议阻塞交还；重批时原子消费并绑定契约哈希，之后不再阻塞。
+// Proposals: unconsumed approved ones block; re-approval consumes them and binds the contract hash.
 test("批准的提议：重批前 gate 阻塞交还，重批原子消费后 gate 继续；后来 pending 仍阻塞", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -755,6 +857,8 @@ test("批准的提议：重批前 gate 阻塞交还，重批原子消费后 gate
   expect(consumed.status).toBe("consumed");
 }, 30_000);
 
+// 保护范围：交还任务 B 不影响本会话 active 任务 A 的保护，只有 A 自己交还才解除。
+// Protection: handing back B keeps A protected; only A's own handback releases it.
 test("task handback 其他任务：active 任务保护保留", async () => {
   const { repo, base } = await setup();
   const fake = fakePi();
@@ -802,6 +906,8 @@ test("task handback 其他任务：active 任务保护保留", async () => {
   expect(unblocked ?? null).toBeNull();
 }, 30_000);
 
+// 契约身份：contract.toml 的 task_id 必须与任务目录一致，不一致即拒批且不写 approval。
+// Identity: contract task_id must match the directory; a mismatch refuses approval.
 test("契约 task_id 与任务目录不一致：approve 明确拒绝", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -817,6 +923,8 @@ test("契约 task_id 与任务目录不一致：approve 明确拒绝", async () 
   expect((await readState(repo, taskId)).status).toBe("drafting");
 }, 30_000);
 
+// handback：生成材料置 handed_back 并解除本会话保护；契约修订后重批先红重跑、base_commit 不变。
+// Handback releases protection; re-approval re-runs red with the same base_commit.
 test("task handback：生成材料并置 handed_back；契约修订后可重新批准且 base_commit 不变", async () => {
   const { repo, base } = await setup();
   const fake = fakePi();
@@ -853,6 +961,8 @@ test("task handback：生成材料并置 handed_back；契约修订后可重新�
   expect(blocked).toMatchObject({ block: true });
 }, 30_000);
 
+// 竞态：确认框挂起时 cancel 同步中止批准 controller，批准收敛且不写记录、不留 worktree。
+// Race: cancel during a waiting confirm aborts approval; nothing is written, no worktree leaks.
 test("批准期间取消：确认对话框等待时 /cw task cancel → 批准拒绝且不写任何记录", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -887,6 +997,8 @@ test("批准期间取消：确认对话框等待时 /cw task cancel → 批准�
   expect(worktrees.split("worktree ").length - 1).toBe(1);
 }, 30_000);
 
+// 竞态：确认放行后、锁定写入前的哈希窗口内 cancel，仍能中止批准且不落 approval。
+// Race: cancel inside the post-confirm hashing window aborts approval before the lock write.
 test("批准期间取消：哈希窗口内取消中止批准，锁定写入前被拦截", async () => {
   const { repo } = await setup();
   const fake = fakePi();
@@ -926,6 +1038,8 @@ test("批准期间取消：哈希窗口内取消中止批准，锁定写入前�
   expect(worktrees.split("worktree ").length - 1).toBe(1);
 }, 60_000);
 
+// 竞态：确认悬挂时 session_shutdown 中止 controller 让批准收敛，迟到的确认结果不作数。
+// Race: shutdown while a confirm hangs aborts approval; a late confirm answer must not count.
 test("确认悬挂时 session_shutdown：批准流程收敛，迟到的确认结果不作数", async () => {
   const { repo } = await setup();
   const fake = fakePi();

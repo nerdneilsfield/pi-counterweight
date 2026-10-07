@@ -1,8 +1,32 @@
+/**
+ * 网关前缀缓存探针：对同一超长前缀连发两次完全相同的请求，用第二次响应的 usage 判断前缀缓存是否生效；独立脚本，直接 `node` 运行。
+ *
+ * A gateway prefix-cache probe: sends the same oversized request twice and uses
+ * the second response's usage to decide whether the prefix cache works.
+ * Standalone script — run it directly; it imports nothing from the project.
+ */
 // 独立 OpenAI Chat Completions 探针；不读取 Pi 或用户的凭据文件。
 const endpoint = process.env.CW_GATEWAY_URL;
 const apiKey = process.env.CW_GATEWAY_API_KEY;
 const model = process.env.CW_GATEWAY_MODEL;
 
+/**
+ * 向网关连发两次完全相同的长请求，用第二次响应的 usage 判断前缀缓存是否生效。
+ *
+ * Sends the same long request twice and compares usage: the verdict is
+ * `supported` only when the first response counts more than 2000 prompt tokens
+ * and the second reports a non-zero cache read; anything else stays
+ * `unconfirmed`, which never claims caching is unsupported. Progress and the
+ * verdict are printed as JSON lines to stdout.
+ *
+ * @remarks
+ * 凭据只从 `CW_GATEWAY_URL`、`CW_GATEWAY_API_KEY`、`CW_GATEWAY_MODEL` 三个环境变量读取，不碰 Pi 或用户的凭据文件；
+ * 强制 HTTPS（本机回环可用 HTTP），重定向一律拒绝，HTTP 错误时不输出响应正文，避免凭据泄漏。
+ *
+ * Credentials come only from those three environment variables. The endpoint
+ * must be HTTPS (loopback may use HTTP), redirects are denied, and error
+ * response bodies are suppressed, so a leaked credential is never echoed back.
+ */
 async function main(): Promise<void> {
   if (!endpoint || !apiKey || !model) {
     throw new Error("需要显式设置 CW_GATEWAY_URL、CW_GATEWAY_API_KEY、CW_GATEWAY_MODEL；URL 为完整 chat/completions 地址");

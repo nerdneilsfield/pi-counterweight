@@ -1,3 +1,13 @@
+/**
+ * M2 里程碑测试：runValidator 与 judgeEvidence 的三态判定契约——只有 pass 才发布
+ * last_verified，fail 与 undetermined 一律 fail-closed；并覆盖超时（杀整个进程组）、
+ * 取消（迟到结果丢弃）、产物/验收输入哈希与验证器脚本冻结。
+ *
+ * M2 milestone tests for `runValidator` and `judgeEvidence`: the three-state verdict
+ * contract — only `pass` publishes `last_verified`, while `fail` and `undetermined` fail
+ * closed — plus timeouts (the whole process group is killed), cancellation (late results
+ * are discarded), artifact / acceptance-input hashing, and validator script freezing.
+ */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -11,9 +21,27 @@ import { claimRun, runValidator } from "../../src/core/runner.ts";
 import { createTask, readState } from "../../src/core/task.ts";
 import type { Contract, ValidatorConfig } from "../../src/core/types.ts";
 
+/**
+ * 伪验证器脚本路径：所有用例都以 `/bin/sh <本脚本> <mode> <payload> <exit>` 驱动它，
+ * mode 决定产出哪种结果或故障。
+ *
+ * Path of the fake validator: every case invokes it as
+ * `/bin/sh <script> <mode> <payload> <exit>`, with the mode choosing which result or
+ * failure it produces.
+ */
 const fixture = path.join(import.meta.dirname, "../fixtures/validators/fake.sh");
 const taskId = "20260928-lifetime-fix";
 
+/**
+ * 构造一份合法的 protocol 1 结果报告：`checks` 是 JSON 数组字符串，`extra`（也是 JSON）
+ * 覆盖基准字段，用例借此注入 artifacts / build。默认 run_id 为 "1"，各用例再用
+ * `.replace('"run_id":"1"', ...)` 改成当次 run 号。
+ *
+ * Builds a schema-valid protocol 1 report. `checks` is a JSON array string and `extra`
+ * (also JSON) overrides the base fields, letting a case inject artifacts or build. The
+ * default run_id is "1", which cases rewrite to the current run number with
+ * `.replace('"run_id":"1"', ...)`.
+ */
 function report(checks: string, extra = ""): string {
   return JSON.stringify({
     protocol: 1, run_id: "1", complete: true,
@@ -24,8 +52,22 @@ function report(checks: string, extra = ""): string {
   });
 }
 
+/**
+ * 基准 checks 片段：契约要求的验收 keep 与回归 reg 全通过。
+ *
+ * Baseline `checks` fragment: the contract-required acceptance `keep` and regression
+ * `reg` checks all pass.
+ */
 const passChecks = `[{"id":"keep","status":"pass"},{"id":"reg","status":"pass"}]`;
 
+/**
+ * 建一个临时 git 仓库（提交 tracked.txt 与 tests/a.py）并创建任务，返回仓库根。
+ * 有提交才有 tree 哈希，工作树漂移类用例依赖这一点。
+ *
+ * Creates a temp git repo with `tracked.txt` and `tests/a.py` committed, then the task,
+ * returning the repo root. The commit matters: only a committed tree yields a tree hash,
+ * which the worktree-drift cases depend on.
+ */
 async function gitRepo(): Promise<string> {
   const root = await mkdtemp(path.join(tmpdir(), "cw-m2-"));
   await git(root, ["init"]);
@@ -38,6 +80,14 @@ async function gitRepo(): Promise<string> {
   return root;
 }
 
+/**
+ * 写出最小 contract.toml（change / code、验收 keep、回归 reg、baseline tests/a.py），
+ * `body` 作为额外 TOML 片段追加；返回解析后的契约，以及按磁盘文件算出的批准输入哈希。
+ *
+ * Writes a minimal contract.toml (change / code, acceptance `keep`, regression `reg`,
+ * baseline input `tests/a.py`), appending `body` as extra TOML, and returns the parsed
+ * contract plus the approved input hash computed from the on-disk file.
+ */
 async function prepared(root: string, body = ""): Promise<{ contract: Contract; hashes: Record<string, string> }> {
   const file = path.join(root, "contract.toml");
   await writeFile(file, `version = 1
@@ -55,10 +105,25 @@ ${body}`);
   return { contract, hashes };
 }
 
+/**
+ * 造一个 ValidatorConfig：以 `/bin/sh <fake.sh> <mode> <payload> <code>` 执行，
+ * `timeout_s` 交给 runner 计时，CW_REPO 指向被测仓库。
+ *
+ * Builds a ValidatorConfig that runs `/bin/sh <fake.sh> <mode> <payload> <code>`, passes
+ * `timeout_s` to the runner, and points CW_REPO at the repo under test.
+ */
 function validator(root: string, timeout_s: number, mode: string, payload = "", code = "0"): ValidatorConfig {
   return { cmd: ["/bin/sh", fixture, mode, payload, code], timeout_s, env: { CW_REPO: root } };
 }
 
+/**
+ * 契约判定的优先级链：required 的 fail / skip / 缺 ID 都判 fail，approved_failures 里的 ID
+ * 被豁免（哪怕上报 error）；报告通过但退出码非 0、或批准失败未上报才判 undetermined。
+ *
+ * Contract precedence: failed, skipped or missing required checks are `fail`, while ids in
+ * `approved_failures` are exempt even when reported `error`; only a passing report with a
+ * non-zero exit code, or an unreported approved failure, is `undetermined`.
+ */
 test("验收失败、缺 ID、skip、批准失败与退出码矛盾", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root, `[[approved_failures]]\nid = "legacy"\nreason = "known"\n`);
@@ -109,6 +174,14 @@ test("验收失败、缺 ID、skip、批准失败与退出码矛盾", async () =
   expect(exemptError.verdict).toEqual({ conclusion: "pass", reasons: [] });
 });
 
+/**
+ * 证据只看本次 run 目录：预置的 run 0 旧 result.json 不能顶替本次缺失的结果；run_id 与 run
+ * 号、check id 唯一性、status 枚举、git 快照任一不符都判 undetermined。
+ *
+ * Evidence is read only from the current run dir — a pre-seeded run 0 result cannot stand
+ * in for the missing one; a run_id other than the run number, a duplicate check id, an
+ * out-of-enum status, or a worktree change during validation all yield `undetermined`.
+ */
 test("旧结果、错误 run_id、工作树变化、空输出与非法报告", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -151,6 +224,13 @@ test("旧结果、错误 run_id、工作树变化、空输出与非法报告", a
   expect(badStatus.verdict.reasons[0]).toContain("result.json invalid");
 });
 
+/**
+ * 超时先 SIGTERM 再 SIGKILL 整个进程组，孙进程必须随 leader 一起死；取消则连终止途中写出的
+ * 通过结果也一并丢弃。
+ *
+ * A timeout SIGTERMs then SIGKILLs the whole process group, so the grandchild dies with the
+ * leader; a cancel discards even a passing result written while the group is being stopped.
+ */
 test("超时杀掉孙进程，取消丢弃迟到成功结果", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -178,6 +258,14 @@ test("超时杀掉孙进程，取消丢弃迟到成功结果", async () => {
   expect((await readState(root, taskId)).last_verified).toBeNull();
 }, 20_000);
 
+/**
+ * 构建证明按内容哈希核对：报告里的 sha256 与磁盘不符判 undetermined；通过之后产物再被改写，
+ * recheckArtifacts 必须让这次已验证失效。
+ *
+ * Build proof is checked by content hash: a reported sha256 that disagrees with disk is
+ * `undetermined`, and overwriting the artifact afterwards must invalidate the published
+ * verification via recheckArtifacts.
+ */
 test("构建产物不符为无法判定，事后改动使已验证失效", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -210,6 +298,14 @@ test("构建产物不符为无法判定，事后改动使已验证失效", async
   expect(mismatch.verdict.reasons[0]).toContain("artifact hash mismatch");
 });
 
+/**
+ * claimRun 取现有数字 run 目录的最大值 +1，绝不复用已占用的目录；非 git 仓库即使判定通过也
+ * 不发布 last_verified——没有 tree 哈希可绑定。
+ *
+ * claimRun takes max(numeric run dirs) + 1 and never reuses an occupied directory; a non-git
+ * repo yields a `pass` verdict but publishes no `last_verified`, since there is no tree hash
+ * to bind the evidence to.
+ */
 test("已有 run 目录不复用，非 Git 通过也不绑定", async () => {
   const root = await gitRepo();
   await mkdir(path.join(root, ".cw", "tasks", taskId, "runs"), { recursive: true });
@@ -234,6 +330,12 @@ test("已有 run 目录不复用，非 Git 通过也不绑定", async () => {
   expect((await readState(plain, taskId)).last_verified).toBeNull();
 });
 
+/**
+ * 批准输入集是判定前提：验收输入哈希与批准值不符即 undetermined，本次证据不被采信。
+ *
+ * The approved input set is a precondition: an acceptance-input hash that disagrees with the
+ * approved value is `undetermined`, and the evidence of this run is not trusted.
+ */
 test("验收输入哈希不符则无法判定", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -246,6 +348,14 @@ test("验收输入哈希不符则无法判定", async () => {
   expect((await readState(root, taskId)).last_verified).toBeNull();
 });
 
+/**
+ * 哈希阶段的 IO 失败（自指 symlink 触发 ELOOP）不向上抛：写进 run.json 的 record_error、
+ * 对应哈希落成 null，并判 undetermined；退出码仍保留进程的真实值。
+ *
+ * IO failures while hashing (a self-referential symlink loops) never propagate: they land in
+ * run.json `record_error` with a null hash and an `undetermined` verdict, while the exit code
+ * keeps the process's real value.
+ */
 test("快照与产物哈希 IO 错误记入 run.json 并判无法判定", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -285,6 +395,13 @@ test("快照与产物哈希 IO 错误记入 run.json 并判无法判定", async 
   }
 });
 
+/**
+ * `__proto__` 这类会触发原型赋值的路径必须作为自有属性写进 run.json，否则普通对象赋值会把它
+ * 悄悄吞掉，recheck 再也看不到该产物变化。
+ *
+ * A path like `__proto__` must be recorded in run.json as an own property: a plain object
+ * assignment would swallow it, and recheck could never notice the artifact changing.
+ */
 test("__proto__ 路径哈希必须记入 run.json 且 recheck 失效", async () => {
   const root = await gitRepo();
   await writeFile(path.join(root, "__proto__"), "artifact\n");
@@ -325,6 +442,13 @@ baseline_inputs = ["tests/a.py", "__proto__"]
   expect((await readState(root, taskId)).last_verified).toBeNull();
 });
 
+/**
+ * 验证器 cmd 引用的仓库脚本按批准哈希冻结：内容漂移或批准哈希缺失都 fail-closed 判
+ * undetermined，且不发布验证。
+ *
+ * A repo script referenced by the validator cmd is frozen by its approved hash: drift, or a
+ * missing approved hash, fails closed to `undetermined` without publishing verification.
+ */
 test("验证器引用的仓库脚本按批准哈希冻结：漂移判无法判定", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -375,6 +499,14 @@ EOF
   expect(unfrozen.verdict.reasons[0]).toBe("approved input set mismatch");
 }, 20_000);
 
+/**
+ * 取消覆盖发布全程：结果已在磁盘上通过，abort 仍落在退出后的快照/判定/发布阶段，也必须丢弃
+ * 该结果并保证 last_verified 不被写下。
+ *
+ * Cancellation covers the whole publication path: even with a passing result already on disk,
+ * an abort landing after the validator exited (snapshot / judge / publish) must discard it and
+ * leave `last_verified` unwritten.
+ */
 test("取消覆盖发布全程：判定阶段取消不写已验证", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -401,6 +533,13 @@ test("取消覆盖发布全程：判定阶段取消不写已验证", async () =>
   expect((await readState(root, taskId)).last_verified).toBeNull();
 }, 20_000);
 
+/**
+ * claimRun 对 runs 根做防逃逸检查：symlink 与普通文件都拒绝，且失败时不会经链接目标在仓库
+ * 之外留下任何写入。
+ *
+ * claimRun guards the runs root against escapes: a symlink or a plain file is rejected, and the
+ * failed attempt writes nothing outside the repo through the link target.
+ */
 test("runs 目录拒绝 symlink、普通文件与越界写入", async () => {
   const root = await gitRepo();
   const runs = path.join(root, ".cw", "tasks", taskId, "runs");
@@ -419,6 +558,14 @@ test("runs 目录拒绝 symlink、普通文件与越界写入", async () => {
   await expect(claimRun(root, taskId)).resolves.toBe(path.join(resolvedRoot, ".cw", "tasks", taskId, "runs", "1"));
 });
 
+/**
+ * 证据形状错误一律 undetermined 且 run.json 照常保留：loaded_by 指向未知 check、result.json
+ * 是目录、产物路径的父级是普通文件都走这条路径。
+ *
+ * Malformed evidence always yields `undetermined` while the run.json record is kept: an
+ * artifact `loaded_by` an unknown check id, a result.json that is a directory, and an artifact
+ * path whose parent is a plain file all take this path.
+ */
 test("loaded_by 未知 ID 与 result.json 形状错误均为无法判定且保留 run 记录", async () => {
   const root = await gitRepo();
   const { contract, hashes } = await prepared(root);
@@ -458,6 +605,12 @@ test("loaded_by 未知 ID 与 result.json 形状错误均为无法判定且保�
   expect(midFile.verdict.reasons[0]).toContain("artifact missing tests/a.py/nested.bin");
 });
 
+/**
+ * 夹具专用 git 包装：退出码非 0 即 reject（错误信息是命令行），仓库搭建失败立刻暴露。
+ *
+ * Fixture-only git wrapper: a non-zero exit rejects with the argv, so a broken repo setup
+ * surfaces immediately instead of failing somewhere downstream.
+ */
 function git(cwd: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd });

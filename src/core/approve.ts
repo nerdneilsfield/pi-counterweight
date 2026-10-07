@@ -1,6 +1,19 @@
+/**
+ * 批准后追加到会话的“任务视图”渲染：把契约压缩成不超过 40 行的清单，固定框架行永不丢弃，超长小节从尾部截断并留下省略标记。
+ *
+ * Post-approval task-view rendering: packs the contract into at most 40 lines
+ * of plain text. Fixed framing lines are never dropped; oversized list sections
+ * lose their tail with an explicit remainder marker.
+ */
 import type { Approval } from "./task.js";
 import type { Contract } from "./types.js";
 
+/**
+ * 渲染上限：整条视图的硬行数（40）与目标行的字符预算（超长压平后以 `…` 收尾）。
+ *
+ * Rendering limits: the view's hard line cap and the character budget for the
+ * single goal line, which is flattened and ellipsized when it overflows.
+ */
 const VIEW_MAX_LINES = 40;
 const GOAL_MAX_CHARS = 300;
 
@@ -10,6 +23,10 @@ interface Section {
 }
 
 /**
+ * 批准后追加到会话的“任务视图”消息，40 行硬上限：目标、非目标、验收项 id（先红项带标注）、回归项 id、
+ * 冻结路径，以及两个面向模型的工具的用途。超长小节从尾部逐项截断（先截最长的小节）并给出显式的剩余标记；
+ * 固定框架行永不丢弃。传入 `notes`（M7 升级）时，前一模型的笔记在“未经验证”标记下紧随其后，同样按行数截断。
+ *
  * The post-approval task view appended to the session as one message, hard
  * capped at 40 lines: goal, non-goals, acceptance ids (red items marked),
  * regression ids, frozen paths, and the two model-facing tools' purpose.
@@ -67,6 +84,11 @@ export function renderTaskView(contract: Contract, approval: Approval, notes: st
   return lines.slice(0, VIEW_MAX_LINES).join("\n");
 }
 
+/**
+ * 压平空白并把文字截到 `max` 个字符，超出时以 `…` 收尾。
+ *
+ * Flattens whitespace and truncates to `max` characters, appending `…` when cut.
+ */
 function oneline(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;

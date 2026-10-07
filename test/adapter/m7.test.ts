@@ -1,3 +1,15 @@
+/**
+ * M7 测试：升级（`escalate`）的两种模式，以及升级 worktree 会话经引用接管同一份账本。
+ *
+ * M7 tests: both `escalate` modes — `--from current` replaces the session on the
+ * same ledger, `--from base` prepares a worktree for a manual handover — plus the
+ * regressions of a worktree session taking over the ONE authoritative ledger
+ * through `.cw/task.json`. A second theme is cache discipline: after adoption the
+ * adapter sets the model exactly once and otherwise never touches model, tools,
+ * prompts, or sends proactive messages. Every failure path here must roll the
+ * ledger back and leave no handback material, no meter event, and no success
+ * claim behind.
+ */
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -15,7 +27,22 @@ import { blobHash } from "../../src/core/gitstate.ts";
 import { acquireLock, createTask, findSessionTasks, readReference, readState, updateState, type Approval } from "../../src/core/task.ts";
 import type { TaskState } from "../../src/core/types.ts";
 
+/**
+ * 共享的假验证器脚本：第一个参数选模式；本文件只用 `reportfile`（结论从第二参的文件读，
+ * 于是门禁轮次之间可以改结论而不动批准的命令）与 `touch`（把 x 追加到运行目录的
+ * tracked.txt，用来证明验证器到底跑在哪个目录）。
+ *
+ * The shared fake validator script: mode first. This file uses `reportfile` (the
+ * verdict is read from the file given as the second argument, so a test can change
+ * it between gate rounds without touching the approved command) and `touch`
+ * (appends `x` to `tracked.txt` in its cwd, proving where the validator ran).
+ */
 const fixture = path.join(import.meta.dirname, "../fixtures/validators/fake.sh");
+/**
+ * 任务 id 的日期前缀（`YYYYMMDD`，本地时区），与 `createTask` 的命名口径一致。
+ *
+ * The date prefix of task ids (`YYYYMMDD`, local time), matching `createTask`.
+ */
 const ymd = () => {
   const now = new Date();
   return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
@@ -26,6 +53,15 @@ type Handler = (event: any, ctx: any) => any;
 
 interface PiCall { method: string; phase: number }
 
+/**
+ * 伪 pi 宿主：收集扩展注册的处理器与命令，记录 `sendMessage` 与 `setModel`。
+ * `call` 只调用某事件名下最后注册的处理器（会话变更时适配器会重新注册）。
+ *
+ * A fake pi host: collects the handlers and commands the extension registers and
+ * records `sendMessage` / `setModel`. `call` invokes the LAST handler of an event
+ * name, mirroring how the adapter re-registers handlers on session changes;
+ * `setModelFn` lets a case fail the model switch (by default it succeeds).
+ */
 function fakePi(options: { setModelFn?: (model: { provider: string; id: string }) => boolean } = {}): {
   pi: ExtensionAPI;
   handlers: Map<string, Handler[]>;
@@ -71,7 +107,11 @@ function fakePi(options: { setModelFn?: (model: { provider: string; id: string }
   };
 }
 
-/** A proxy that records EVERY method call the adapter makes on `pi`. */
+/**
+ * 记录适配器对 `pi` 的每一次方法调用（连同调用发生时的阶段号），供缓存纪律断言使用。
+ *
+ * A proxy that records EVERY method call the adapter makes on `pi`.
+ */
 function recordingPi(base: ReturnType<typeof fakePi>, phase: () => number): {
   pi: ExtensionAPI;
   calls: PiCall[];
@@ -92,6 +132,18 @@ function recordingPi(base: ReturnType<typeof fakePi>, phase: () => number): {
   return { pi: pi as ExtensionAPI, calls };
 }
 
+/**
+ * `fakeCtx` 的开关：UI 有无与确认答案、会话 id、会话当前模型（`currentModel`，供模型恢复
+ * 断言）、注册表中缺失的模型（`missingModels`，制造接管失败）、被替换会话的 `sendMessage`
+ * 抛错（`failSendMessage`，制造晚段失败），以及会话替换本身（`newSession`，可返回
+ * cancelled 表示替换被取消）。
+ *
+ * Knobs for `fakeCtx`: UI availability and the confirm answer, the session id, the
+ * session's current model (`currentModel`, for model-restore assertions), models
+ * missing from the registry (`missingModels`, a failed adoption), a throwing
+ * `sendMessage` on the replaced session (`failSendMessage`, a late failure), and the
+ * session replacement itself (`newSession`; returning `cancelled` rejects it).
+ */
 interface CtxOptions {
   hasUI?: boolean;
   confirmResult?: boolean;
@@ -105,6 +157,15 @@ interface CtxOptions {
   newSession?: (options: { withSession?: (c: ExtensionContext) => Promise<void> }) => Promise<{ cancelled: boolean }>;
 }
 
+/**
+ * 伪扩展上下文：工作目录为 `repo`，无 UI 时降级为 print 模式；`ui.notify` 收进
+ * `notifications`，`ui.confirm` 一律返回 `confirmResult`（默认 false，即用户拒绝），
+ * 被替换会话的 `sendMessage` 收进 `replacedSent`。
+ *
+ * A fake extension context rooted at `repo` (print mode unless `hasUI`): `ui.notify`
+ * lands in `notifications`, `ui.confirm` always answers `confirmResult` (false by
+ * default, i.e. rejected), and `sendMessage` lands in `replacedSent`.
+ */
 function fakeCtx(repo: string, options: CtxOptions = {}) {
   const notifications: Array<{ message: string; type?: string }> = [];
   const replacedSent: Array<{ message: { content: string } }> = [];
@@ -140,6 +201,12 @@ function fakeCtx(repo: string, options: CtxOptions = {}) {
   };
 }
 
+/**
+ * 在 `cwd` 运行一条 git 命令并返回 stdout；非零退出即 reject（stderr 不参与断言）。
+ *
+ * Runs one git command in `cwd` and resolves its stdout; a non-zero exit rejects —
+ * stderr is never asserted on.
+ */
 async function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd });
@@ -150,6 +217,12 @@ async function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+/**
+ * 像用户在命令面板里那样执行 `/cw <args>`：直接调用已注册的命令处理器。
+ *
+ * Drives `/cw <args>` the way a user would: invokes the registered command handler
+ * directly, failing loudly when `/cw` was never registered.
+ */
 async function runCmd(fake: ReturnType<typeof fakePi>, args: string, ctx: ExtensionContext): Promise<void> {
   const command = fake.commands.get("cw");
   if (command === undefined) throw new Error("/cw not registered");
@@ -158,10 +231,20 @@ async function runCmd(fake: ReturnType<typeof fakePi>, args: string, ctx: Extens
 
 const lastNotify = (notifications: Array<{ message: string }>) => notifications.at(-1)?.message ?? "";
 
-/** Any notification carrying `text` — notify order varies with takeovers. */
+/**
+ * 任意一条通知包含 `text`：接管会改变通知顺序，所以不断言“最后一条”。
+ *
+ * Any notification carrying `text` — notify order varies with takeovers.
+ */
 const anyNotify = (notifications: Array<{ message: string }>, text: string) =>
   notifications.some((entry) => entry.message.includes(text));
 
+/**
+ * 门禁结算事件的最小载荷：本轮已完成（completed），且宿主允许继续（canContinue）。
+ *
+ * The minimal `agent_before_settle` payload: the turn completed and the host allows
+ * continuing.
+ */
 const settleEvent = () => ({
   type: "agent_before_settle",
   entries: [],
@@ -170,9 +253,23 @@ const settleEvent = () => ({
   context: { canContinue: true },
 });
 
+/**
+ * 验证器报告 JSON：`complete: true` 表示报告完整；`@RUN@` 由假验证器换成本轮 run_id。
+ *
+ * A validator report as JSON: `complete: true` marks it complete, and `@RUN@` is
+ * substituted with the current run id by the fake validator.
+ */
 const report = (checks: Array<{ id: string; status: string; message?: string }>) =>
   JSON.stringify({ protocol: 1, run_id: "@RUN@", complete: true, checks, build: { required: false }, summary: "x", logs: [] });
 
+/**
+ * 测试契约文本：tier=change、交付物是代码、验收与先红都只查 keep，冻结/基线输入只有
+ * tests/a.py（`${id}` 由调用方给出任务 id）。
+ *
+ * The test contract text: tier `change`, a code deliverable, `keep` as both the
+ * acceptance and the red check, and `tests/a.py` as the only frozen / baseline
+ * input (`${id}` is the caller's task id).
+ */
 const contractText = (id: string) => `version = 1
 task_id = "${id}"
 tier = "change"
@@ -185,6 +282,13 @@ frozen = ["tests/a.py"]
 baseline_inputs = ["tests/a.py"]
 `;
 
+/**
+ * 夹具句柄：仓库与基线提交，加三个写入口——重写结论载荷、按 id 写契约、以某会话身份改账本。
+ *
+ * A fixture handle: the repo and its base commit plus three write entry points —
+ * rewrite the verdict payload, write a contract for an id, and mutate the ledger
+ * state as some session.
+ */
 interface Setup {
   repo: string;
   base: string;
@@ -195,6 +299,11 @@ interface Setup {
 }
 
 /**
+ * 建一个最小仓库（一次 base 提交、两份被跟踪文件、`.cw/project.toml` 与三个 tier 的模型），
+ * 再按 `approved` 决定任务是否预置成已批准：默认已批准并登记会话 s1，`approved: false`
+ * 时任务留给 `/cw task new` 命令自己创建。结论载荷位于 `.cw/payload.json`（`.cw/` 不参与
+ * 清洁检查与树哈希），因此测试可以在门禁轮次之间改结论而不动批准的命令。
+ *
  * A repo whose validator reads the verdict from `<repo>/payload.json`, so a
  * test can change it between gate rounds without touching the approved
  * command. With `approved` (default) the task is already approved; with
@@ -268,6 +377,12 @@ interface = "strong"
   };
 }
 
+/**
+ * 注册扩展并把 `session_start`（reason=startup）派发出去，返回伪 pi 与伪 ctx。
+ *
+ * Registers the extension and dispatches `session_start` (`reason: "startup"`),
+ * returning the fake pi together with the fake context.
+ */
 async function startAdapter(
   repo: string, timeouts?: Partial<AdapterTimeouts>,
   fakeOptions?: { setModelFn?: (model: { provider: string; id: string }) => boolean },
@@ -279,7 +394,11 @@ async function startAdapter(
   return { fake, ...context };
 }
 
-/** Meter events of a task, parsed from meter.jsonl (empty when absent). */
+/**
+ * 任务的计量事件：解析 meter.jsonl，只取 `kind: "task"` 的行；文件不存在时返回空数组。
+ *
+ * Meter events of a task, parsed from meter.jsonl (empty when absent).
+ */
 async function meterEvents(repo: string, id: string): Promise<string[]> {
   try {
     const text = await readFile(path.join(repo, ".cw", "tasks", id, "meter.jsonl"), "utf8");
@@ -292,11 +411,21 @@ async function meterEvents(repo: string, id: string): Promise<string[]> {
   }
 }
 
+/**
+ * 任务的升级 worktree 路径：仓库 realpath 的同级目录 `<仓库名>-cw-<task_id>-esc`。
+ *
+ * The task's escalation worktree path: `<repo>-cw-<task_id>-esc` beside the
+ * realpathed repo.
+ */
 const worktreeOf = async (repo: string) =>
   escalationWorktreePath(await realpath(repo), taskId);
 
 // ---- task new: tier model selection ----------------------------------------
 
+// 契约：tier→模型取自 .cw/project.toml 的映射，创建即写入 state.model；新任务停在 drafting，
+// 所以批准前不会跑验证。
+// Contract: tiers map to models via project.toml and the choice is written to state.model at
+// creation; the task stays drafting, so no validation runs before approval.
 test("task new 按 tiers/models 选定模型写入 state.model", async () => {
   const { repo } = await setup({ approved: false });
   const { fake, ctx, notifications } = await startAdapter(repo);
@@ -312,6 +441,12 @@ test("task new 按 tiers/models 选定模型写入 state.model", async () => {
 
 // ---- cache discipline ------------------------------------------------------
 
+// 契约：一次完整任务只允许 on/registerTool/registerCommand/sendMessage/setModel 五种 pi 调用，
+// 模型只在批准时设置一次，门禁轮次（phase ≥ 4）零调用 —— 缓存前缀因此永远不被扰动；
+// meter.jsonl 每行可解析，usage 合计等于 tokens_used。
+// Contract: a whole task allows exactly five adapter→pi methods, one setModel at approval time,
+// and zero calls during gate rounds (phase ≥ 4) — the cached prompt prefix is never disturbed;
+// every meter.jsonl line parses and the usage sum equals tokens_used.
 test("缓存纪律：完整模拟任务记录所有 pi 调用；首轮后不切模型/工具/提示，无主动消息；meter 每行可解析", async () => {
   const s = await setup({ approved: false });
   const flowId = `${ymd()}-flow-fix`;
@@ -392,6 +527,11 @@ test("缓存纪律：完整模拟任务记录所有 pi 调用；首轮后不切�
 
 // ---- escalate --from current ----------------------------------------------
 
+// 契约：--from current 换的是会话而不是账本——登记会话换成新会话，状态、修复与预算计数原样
+// 保留；前一模型的笔记以“未经验证”随任务视图发给新会话；不建升级 worktree。
+// Contract: --from current replaces the session, not the ledger — status, repairs and budget
+// survive; the new session's task view carries the previous model's unverified notes; no
+// escalation worktree is created.
 test("escalate --from current：同账本替换会话，strong 模型，笔记进任务视图，计数不清零", async () => {
   const s = await setup();
   await s.writePayload([{ id: "keep", status: "pass" }]);
@@ -434,6 +574,9 @@ test("escalate --from current：同账本替换会话，strong 模型，笔记�
   expect(existsSync(await worktreeOf(s.repo))).toBe(false);
 }, 20_000);
 
+// 失败语义：用户取消替换 = 任务保持原状；不得留下任何宣称升级成功的材料或事件，也不切模型。
+// Failure semantics: a cancelled replacement leaves the task as it was — no success material,
+// no escalation event, and no model switch.
 test("escalate --from current 会话替换被取消：任务保持原状，无升级材料与事件", async () => {
   const s = await setup();
   const { fake } = await startAdapter(s.repo);
@@ -453,6 +596,11 @@ test("escalate --from current 会话替换被取消：任务保持原状，无�
   expect(fake.setModels.filter((model) => model.id === "strong")).toEqual([]);
 }, 20_000);
 
+// 失败语义：晚段失败（替换会话的 sendMessage 抛错）必须持锁把账本回滚、恢复幸存会话的模型，
+// 并通过替换后的 ctx 报告（旧 ctx 已失效），绝不宣称成功。
+// Failure semantics: a late failure (the replaced session's sendMessage throws) rolls the ledger
+// back under the task lock, restores the surviving session's model, reports through the fresh
+// context (the old one is stale), and never claims success.
 test("escalate --from current withSession 晚段失败：账本持锁回滚、模型恢复，零材料零事件", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running", repairs_used: 2, tokens_used: 500 }));
@@ -493,6 +641,10 @@ test("escalate --from current withSession 晚段失败：账本持锁回滚、�
   expect(replaced!.replacedSent).toEqual([]);
 }, 20_000);
 
+// 边界：连“恢复原模型”这一步都失败（setModel 返回 false）时，报告必须如实说会话仍是 g/strong，
+// 而不是冒充已恢复原状。
+// Boundary: when even restoring the previous model fails (setModel returns false), the report must
+// say the session is still on g/strong instead of pretending it was restored.
 test("escalate --from current 模型恢复失败：明确报告仍为 strong，不宣称原状", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running" }));
@@ -524,6 +676,10 @@ test("escalate --from current 模型恢复失败：明确报告仍为 strong，�
   expect(await meterEvents(s.repo, taskId)).not.toContain("escalated");
 }, 20_000);
 
+// 失败语义：接管失败（strong 不在模型注册表中）发生在第一次账本写入之前，因此账本、登记会话、
+// 计数与会话模型一律未动。
+// Failure semantics: a failed adoption (strong missing from the model registry) precedes the first
+// ledger write, so ledger, registration, counters and session model are untouched.
 test("escalate --from current 模型接管失败：账本从未被改，零材料零事件", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running", repairs_used: 1, tokens_used: 100 }));
@@ -554,6 +710,13 @@ test("escalate --from current 模型接管失败：账本从未被改，零材�
 
 // ---- escalate --from base --------------------------------------------------
 
+// 契约：--from base 不启动会话（newSession 没有 cwd，pi 无法跨目录替你起会话），只建
+// base_commit 的分离 worktree + 指向唯一账本的引用，把本会话从任务上释放，材料记成
+// “待手动交接”（escalate_pending），并给出可执行的手动步骤。
+// Contract: --from base starts no session (newSession has no cwd, so pi cannot start one in another
+// directory) — it builds a detached base_commit worktree plus a reference to the one ledger,
+// releases this session, records the material as a pending manual handover (escalate_pending), and
+// reports the manual steps.
 test("escalate --from base：worktree、账本引用、释放原会话；无 cwd 不伪造成功，报告手动步骤", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running", repairs_used: 1, tokens_used: 300 }));
@@ -609,6 +772,10 @@ test("escalate --from base：worktree、账本引用、释放原会话；无 cwd
   await git(s.repo, ["worktree", "prune"]);
 }, 20_000);
 
+// 失败语义：验收输入与批准哈希不一致时拒绝升级（绝不在漂移的输入上继续升级），不留 worktree，
+// 账本与模型不动。
+// Failure semantics: acceptance inputs that drifted from the approved hashes refuse the escalation
+// (never upgrade on different inputs) — no worktree left, ledger and model untouched.
 test("escalate --from base 输入漂移：拒绝且零残留", async () => {
   const s = await setup();
   await writeFile(path.join(s.repo, "tests", "a.py"), "drifted\n");
@@ -622,6 +789,11 @@ test("escalate --from base 输入漂移：拒绝且零残留", async () => {
   expect(state.sessions).toEqual(["s1"]);
 }, 20_000);
 
+// 失败语义：任务锁被其他会话持有时拒绝升级，并清理刚建的 worktree；原会话仍登记在册，
+// 不留交接材料或升级事件。
+// Failure semantics: when the task lock is held elsewhere the escalation refuses and removes the
+// fresh worktree; the original session stays registered and no handback material or escalation
+// event is left behind.
 test("escalate --from base 锁被其他会话持有：拒绝且清理 worktree，原会话保持登记", async () => {
   const s = await setup();
   const release = await acquireLock(s.repo, taskId, "other");
@@ -643,6 +815,9 @@ test("escalate --from base 锁被其他会话持有：拒绝且清理 worktree�
 // ---- ledger sharing across the escalation worktree -------------------------
 
 /**
+ * 先做一次 `--from base` 升级，再让登记会话 s2 在 worktree 里启动并接管任务；
+ * `beforeTakeover` 在 worktree 就绪、接管之前运行，供用例改批准记录等准备使用。
+ *
  * `--from base` escalation followed by a registered session taking over in
  * the worktree: the shared setup for ledger-sharing and freeze regressions.
  */
@@ -666,6 +841,11 @@ async function escalateAndTakeover(
   return { worktree, second, secondCtx };
 }
 
+// 契约：worktree 会话经 .cw/task.json 引用接管同一份权威账本（worktree 里没有 .cw/tasks）；
+// 验证器在 worktree 运行，主检出不被写入；运行中改树 → undetermined → 交还，绝不发布验证。
+// Contract: a worktree session takes over the ONE authoritative ledger through `.cw/task.json`
+// (the worktree has no `.cw/tasks`); the validator runs in the worktree, the main checkout stays
+// untouched, and a tree touched mid-run yields undetermined — a handback, never a verification.
 test("升级 worktree 会话经引用接管同一账本；验证器跑在 worktree，主检出不动", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running" }));
@@ -697,6 +877,11 @@ test("升级 worktree 会话经引用接管同一账本；验证器跑在 worktr
   await git(s.repo, ["worktree", "prune"]);
 }, 20_000);
 
+// 契约：冻结检查以 worktree 里的文件哈希为准，冲突写进主检出的账本；路径落在 worktree
+// 不是降级理由——不得出现“未能检查”一类通知。
+// Contract: the frozen-file check hashes the worktree files and records the conflict in the main
+// checkout's ledger; running in a worktree is no excuse to degrade — no "unable to check"
+// notification may appear.
 test("worktree 会话 tool_result 冻结检查：哈希工作树文件，冲突记入账本，无 ENOENT 降级", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running" }));
@@ -728,6 +913,10 @@ test("worktree 会话 tool_result 冻结检查：哈希工作树文件，冲突�
   await git(s.repo, ["worktree", "prune"]);
 }, 20_000);
 
+// 失败语义：材料落盘失败时账本必须回滚到升级前并清理 worktree；不留半份材料（json/md）、
+// 不留升级事件，且要明确报错而不是静默成功。
+// Failure semantics: a failed material write rolls the ledger back and cleans the worktree — no
+// half-written material (json/md), no escalation event, and an explicit error instead of silence.
 test("base 升级材料 md 写失败：状态回滚、无 json/md/事件残留", async () => {
   const s = await setup();
   await s.setState((state) => ({ ...state, status: "running" }));
@@ -749,6 +938,9 @@ test("base 升级材料 md 写失败：状态回滚、无 json/md/事件残留",
   expect(context.notifications.some((entry) => entry.type === "error")).toBe(true);
 }, 20_000);
 
+// 安全边界：升级 worktree 的 .cw/task.json 引用属受保护路径，模型对它写入必须被 block。
+// Security boundary: the escalation worktree's `.cw/task.json` reference is a protected path, so a
+// model write to it must be blocked.
 test("升级 worktree 的 .cw/task.json 引用对模型写入是受保护路径", async () => {
   const s = await setup();
   const { fake } = await startAdapter(s.repo);
@@ -762,6 +954,11 @@ test("升级 worktree 的 .cw/task.json 引用对模型写入是受保护路径"
   expect((result as { reason: string }).reason).toContain("受保护");
 }, 20_000);
 
+// 契约：释放原会话后，未登记会话（哪怕在 worktree 里启动）不会自动接管——引用本身不等于登记；
+// 只有登记进账本的会话才接管，其 resume 的任务视图带前一模型的未验证笔记。
+// Contract: after the original session is released, an unregistered session starting in the
+// worktree must not auto-take-over — the reference alone is not a registration; only a registered
+// session takes over, and its resume view carries the previous model's unverified notes.
 test("释放原会话后，旧会话重启不会自动接管；新登记会话才会", async () => {
   const s = await setup();
   await writeFile(path.join(s.repo, ".cw", "tasks", taskId, "notes.md"),

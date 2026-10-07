@@ -1,3 +1,15 @@
+/**
+ * M4 门禁决策与交还材料验收测试：`decide` 的固定优先级（cancel > blocked > budget > freeze_conflict >
+ * 非 code finish > validate > pass/undetermined/fail）、continue 消息的脱敏与截断、失败指纹的稳定性，
+ * 以及 handback.md/json 的内容与「末次有效 run」选取规则；用例都在临时目录中自建任务与运行记录。
+ *
+ * M4 gate decisions and handback material: the fixed priority order inside
+ * `decide` (cancel > blocked > budget > freeze_conflict > non-code finish >
+ * validate > pass/undetermined/fail), censoring and truncation of the continue
+ * message, fingerprint stability, and the contents plus last-valid-run selection
+ * of `handback.md`/`handback.json`. Each case builds its own task and run
+ * records under the OS temp directory.
+ */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,6 +23,12 @@ import type { Contract, TaskState } from "../../src/core/types.ts";
 
 const taskId = "20260928-lifetime-fix";
 
+/**
+ * TaskState fixture：默认是运行中的 code 任务，0 次修复、未验证、无冲突。
+ *
+ * TaskState fixture: a running task with no repairs used, no verified evidence and
+ * no recorded conflicts.
+ */
 function stateOf(overrides: Partial<TaskState> = {}): TaskState {
   return {
     task_id: taskId, status: "running", model: "gateway/medium", base_commit: null,
@@ -20,6 +38,12 @@ function stateOf(overrides: Partial<TaskState> = {}): TaskState {
   };
 }
 
+/**
+ * GateInput fixture：所有事实都取否定值且不带 verdict，用例只覆写自己要考察的那一项。
+ *
+ * GateInput fixture with every fact negative and no verdict, so each case
+ * overrides exactly the one fact it exercises.
+ */
 function inputOf(overrides: Partial<GateInput> = {}): GateInput {
   return {
     state: stateOf(),
@@ -33,12 +57,20 @@ function inputOf(overrides: Partial<GateInput> = {}): GateInput {
   };
 }
 
+/**
+ * 共享 fixture：一个冻结冲突、一个 fail 结论、一条失败项；均为纯数据，可在用例间自由复用。
+ *
+ * Shared fixtures — one freeze conflict, one failing verdict and one failed
+ * check; plain data, safe to reuse across cases.
+ */
 const conflict = {
   path: "tests/a.py", expected: "e".repeat(64), actual: "a".repeat(64), found_at: "2026-10-01T00:00:00Z",
 };
 const failVerdict: Verdict = { conclusion: "fail", reasons: ["fail tests/a.py::t1"] };
 const failure: GateFailure = { id: "tests/a.py::t1", message: "AssertionError: expected 42" };
 
+// 顺序契约首条：把所有其它触发条件同时置真，cancel 仍然独占胜出。
+// Priority #1: every other trigger is set at once and cancel still wins alone.
 test("cancelled 优先于一切：即使已 blocked、超预算、有冲突、有 fail 结论", () => {
   const decision = decide(inputOf({
     cancelled: true,
@@ -50,6 +82,8 @@ test("cancelled 优先于一切：即使已 blocked、超预算、有冲突、�
   expect(decision).toEqual({ kind: "cancel" });
 });
 
+// 空字符串不算报告：只有非空 blockedReport 才导致交还，否则继续按后面的分支判定。
+// An empty string is not a report: only a non-empty `blockedReport` hands back.
 test("已调用 report_blocked：直接交还，不返回 validate", () => {
   const decision = decide(inputOf({ blockedReport: "契约第2条与现有接口冲突" }));
   expect(decision).toEqual({ kind: "handback", reason: "blocked" });
@@ -74,6 +108,9 @@ test("冻结冲突：交还，优先于需要验证；预算又优先于冲突",
   }))).toEqual({ kind: "handback", reason: "budget" });
 });
 
+// 非 code 交付物跳过验证分支：即使带 fail 结论也 finish，并标记未经自动验证；blocked 等更早分支仍然优先。
+// Non-code deliverables skip validation: they finish unverified even with a
+// failing verdict, while the earlier branches (blocked and above) still win.
 test("code 任务未带结论：validate；非 code 任务：finish 且标未经自动验证", () => {
   expect(decide(inputOf({}))).toEqual({ kind: "validate" });
   expect(decide(inputOf({ deliverable: "diagnosis" })))
@@ -89,6 +126,9 @@ test("verdict=pass：finish 且自动验证通过", () => {
     .toEqual({ kind: "finish", autoVerified: true });
 });
 
+// undetermined 是环境或验证器问题：交还但不重试，因此决策不携带 repairs_used 供调用方落盘。
+// `undetermined` marks an environment or validator problem: hand back without
+// retrying, so the decision carries no `repairs_used` for the caller to persist.
 test("undetermined：交还不重试，且不消耗修复次数", () => {
   const decision = decide(inputOf({
     state: stateOf({ repairs_used: 1 }),
@@ -98,6 +138,9 @@ test("undetermined：交还不重试，且不消耗修复次数", () => {
   expect(decision).not.toHaveProperty("repairs_used");
 });
 
+// continue 消息格式固定——编号是「即将进行的第 used+1 次」，只含事实，禁词表断言保证不出现建议类措辞。
+// The continue message is fixed-format — attempt counter `used + 1`, facts only,
+// which the forbidden-word loop pins down.
 test("fail 且次数未满：continue，次数加一，消息只含事实", () => {
   const decision = decide(inputOf({
     state: stateOf({ repairs_used: 1 }),
@@ -119,6 +162,8 @@ test("fail 且次数未满：continue，次数加一，消息只含事实", () =
   }
 });
 
+// 用尽判定只比较 state.repairs_used 与 budget.repairs；预算为 0（无可修次数）时同样直接交还。
+// Exhaustion compares `state.repairs_used` against `budget.repairs`; a zero budget also hands back.
 test("fail 且次数用尽：handback repairs_exhausted", () => {
   expect(decide(inputOf({ state: stateOf({ repairs_used: 3 }), verdict: failVerdict })))
     .toEqual({ kind: "handback", reason: "repairs_exhausted" });
@@ -129,6 +174,9 @@ test("fail 且次数用尽：handback repairs_exhausted", () => {
   }))).toEqual({ kind: "handback", reason: "repairs_exhausted" });
 });
 
+// 消息体量上限：最多 10 条失败项、每条截到 300 字符；没有 failures 时退回 verdict.reasons 当 id（消息为空）。
+// Message limits: at most 10 failure items, each truncated to 300 chars; without
+// `failures` the verdict's reasons are used as ids with an empty message.
 test("失败项最多 10 个，message 截断到 300 字符，无失败时退回结论原因", () => {  const long = "x".repeat(350);
   const many: GateFailure[] = Array.from({ length: 12 }, (_, index) => ({
     id: `tests/a.py::t${index}`, message: long,
@@ -146,6 +194,9 @@ test("失败项最多 10 个，message 截断到 300 字符，无失败时退回
   expect(fallback.message).toContain("- skip tests/a.py::t2: ");
 });
 
+// 脱敏是纯字符串替换，作用于 id、message 与日志路径，且先脱敏后截断——300 字符后的禁词也漏不出来。
+// Censoring is a pure replace over id, message and log path, and it runs before truncation, so a
+// forbidden word past the 300-char cut still cannot leak.
 test("continue 消息对验证器动态文本脱敏：禁词被确定性替换，不回灌建议", () => {
   const decision = decide(inputOf({
     verdict: failVerdict,
@@ -174,6 +225,9 @@ test("continue 消息对验证器动态文本脱敏：禁词被确定性替换�
   expect(boundary.message).toContain(`- t: ${"x".repeat(300)}`);
 });
 
+// 指纹只用于标注交还材料，不参与门禁决策；口径是 sha256(id + status + 去掉易变片段的消息)。
+// Fingerprints annotate handback material only and never feed the gate: sha256
+// over id, status and the message with volatile spans stripped.
 test("失败指纹：路径 span 到分隔边界整体去除，hex 只删独立 token，id/status 区分", () => {
   const fp = (message: string) => failureFingerprint("t1", "fail", message);
 
@@ -201,6 +255,12 @@ test("失败指纹：路径 span 到分隔边界整体去除，hex 只删独立 
   expect(fp("same")).not.toBe(failureFingerprint("t1", "skip", "same"));
 });
 
+/**
+ * 最小契约 fixture：只填 handback 要读的 acceptance / regression。
+ *
+ * Minimal contract fixture: only `acceptance` and `regression`, the fields
+ * handback reads.
+ */
 function contractOf(acceptance: string[], regression: string[]): Contract {
   return {
     version: 1, task_id: taskId, tier: "change", deliverable: "code", goal: "g",
@@ -209,6 +269,12 @@ function contractOf(acceptance: string[], regression: string[]): Contract {
   };
 }
 
+/**
+ * 最小 run.json fixture：默认有效（未取消、结果未丢弃，run 号自洽）；result.json 由 putRun 另写。
+ *
+ * Minimal run-record fixture, valid by default (not cancelled, result not
+ * discarded); `result.json` is written separately by `putRun`.
+ */
 function runRecord(run: number, overrides: Record<string, unknown> = {}) {
   const tree = "t".repeat(64);
   return {
@@ -222,12 +288,24 @@ function runRecord(run: number, overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * 只建任务台账的临时目录（不建 git）：handback 只读 runs/notes/state，本组用例不需要仓库。
+ *
+ * Temp dir holding just the task ledger and no git repository — handback reads
+ * runs, notes and state, so a repo is not needed here.
+ */
 async function taskRepo(): Promise<string> {
   const root = await mkdtemp(path.join(tmpdir(), "cw-m4-"));
   await createTask(root, taskId, "gateway/medium");
   return root;
 }
 
+/**
+ * 写入 runs/<n>/ 的 result.json 与 run.json；`recordOverrides` 用来构造取消、结果丢弃等无效 run。
+ *
+ * Writes a run's `result.json` and `run.json`; `recordOverrides` builds the
+ * invalid variants (cancelled, discarded result) that must be ignored.
+ */
 async function putRun(root: string, run: number, checks: unknown[], recordOverrides = {}): Promise<void> {
   const dir = path.join(root, ".cw", "tasks", taskId, "runs", String(run));
   await mkdir(dir, { recursive: true });
@@ -238,6 +316,12 @@ async function putRun(root: string, run: number, checks: unknown[], recordOverri
   await writeRunRecord(path.join(dir, "run.json"), runRecord(run, recordOverrides));
 }
 
+/**
+ * 模型笔记 fixture：三个标题段落；handback 原样透传全文，只按标题抽取「建议的下一轮」段落。
+ *
+ * Model-notes fixture with three headed sections: handback passes the whole text
+ * through verbatim and only extracts the "建议的下一轮" section by its heading.
+ */
 const NOTES = [
   "## 已排除的方向",
   "- 怀疑缓存层，profile 显示热点在绑定层",
@@ -250,6 +334,10 @@ const NOTES = [
   "- 备忘",
 ].join("\n");
 
+// 落盘契约：md/json 同属一次调用，返回值给出仓内相对路径，json 内容即返回的 material（已过 schema 校验）。
+// Two-file contract: `handback.md` and `handback.json` belong to one call; the
+// returned repo-relative paths point at files whose JSON equals the returned
+// material and passes the schema check.
 test("handback 生成 md/json：状态原因、验证记录、模型笔记、问题、复现命令、未运行检查、指纹历史、下一轮建议", async () => {
   const root = await taskRepo();
   await writeFile(path.join(root, ".cw", "tasks", taskId, "notes.md"), NOTES);
@@ -316,6 +404,9 @@ test("handback 生成 md/json：状态原因、验证记录、模型笔记、问
   await rm(root, { recursive: true, force: true });
 });
 
+// 覆盖判定以「末次有效 run」为准：回归 id 都在其 checks 里就不写未运行；无 notes 时下一轮留空，冻结冲突转成待决问题。
+// Coverage is judged against the last valid run; with no notes `next_round` stays empty and freeze
+// conflicts become questions for the user.
 test("handback：回归已运行则不写全量回归未运行；无 notes 时下一轮留空；冻结冲突进入问题", async () => {
   const root = await taskRepo();
   await putRun(root, 1, [
@@ -350,6 +441,10 @@ test("handback：回归已运行则不写全量回归未运行；无 notes 时�
   await rm(root, { recursive: true, force: true });
 });
 
+// 有效性逐 run 判定：损坏 json、run_id 不符、协议号不符都让整个 run 失效，复现命令与指纹历史则回退到更早的有效 run。
+// Validity is per run: broken JSON, a mismatched `run_id` or a wrong protocol
+// version invalidate that run entirely, and reproduction plus fingerprint history
+// fall back to an earlier valid run.
 test("handback：最高 run 无效时回退到末次有效 run，run_id 不符与协议不符同样无效", async () => {
   const root = await taskRepo();
   await putRun(root, 1, [
@@ -389,6 +484,10 @@ test("handback：最高 run 无效时回退到末次有效 run，run_id 不符�
   await rm(root, { recursive: true, force: true });
 });
 
+// 无有效 run 时用 <run> 占位符并明确标出未运行回归；last_verified_record 仍来自 state，与运行有效性无关。
+// With no valid run the environment carries `<run>` placeholders and the
+// regression is reported as not run; `last_verified_record` still comes from
+// state and ignores run validity.
 test("handback：没有任何有效运行时明确未运行并使用占位符", async () => {
   const root = await taskRepo();
   const dir = path.join(root, ".cw", "tasks", taskId, "runs", "1");
@@ -418,6 +517,10 @@ test("handback：没有任何有效运行时明确未运行并使用占位符", 
   await rm(root, { recursive: true, force: true });
 });
 
+// 段落抽取按标题层级结束：遇同级或更高级标题即停，未知标题返回空串（不抛错），首尾空行被裁掉。
+// Section extraction stops at the next heading of the same or higher level and
+// returns "" for an unknown title instead of throwing; surrounding blank lines
+// are trimmed.
 test("notes 段落抽取：标题层级与截断", () => {
   expect(notesSection(NOTES, "建议的下一轮")).toBe("- 先修对象生命周期的注入顺序\n- 再补回归");
   expect(notesSection(NOTES, "不存在的标题")).toBe("");

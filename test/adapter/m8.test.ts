@@ -1,3 +1,11 @@
+/**
+ * M8 探索者（cw_explore）测试：钉住子进程 CLI 参数、答案后处理（30 行上限、path:line 标注）、
+ * 读路径逃逸拒答、超时/取消语义、树变化不可信标记与 token 记账。
+ *
+ * M8 `cw_explore` tests: the subprocess CLI contract, answer post-processing (30-line cap,
+ * `path:line` annotation), read-path escape withholding, timeout/cancel semantics, tree-movement
+ * untrusted marking, and token accounting into the parent task.
+ */
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
@@ -14,18 +22,30 @@ import { createTask, readState, updateState, type Approval } from "../../src/cor
 import { registerTools } from "../../src/adapters/pi/tools.ts";
 import type { ActiveTask } from "../../src/adapters/pi/index.ts";
 
+// 伪 pi CLI fixture：转存 argv，行为由 CW_FAKE_EXPLORE 选择（见该文件）。
+// Fake pi CLI fixture: dumps argv; behavior selected by CW_FAKE_EXPLORE.
 const fakeCli = path.join(import.meta.dirname, "../fixtures/explorer/fake-pi.mjs");
+// 本机日期拼 `YYYYMMDD` 作任务 id 前缀；用例不依赖具体日期，只要 id 合法。
+// Local date as `YYYYMMDD`; only feeds the task-id prefix — no case depends on the day.
 const ymd = () => {
   const now = new Date();
   return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
 };
 const taskId = `${ymd()}-lifetime-fix`;
 
+// pi 工具 execute 的最小签名；用例只断言返回给模型的文本。
+// Minimal pi tool `execute` signature; the tests assert only the returned text.
 type ToolExecute = (
   toolCallId: string, params: { question: string }, signal: AbortSignal | undefined,
   onUpdate: undefined, ctx: ExtensionToolContext,
 ) => Promise<{ content: Array<{ type: string; text: string }>; details: undefined }>;
 
+/**
+ * setup() 的产物：任务快照、仓库根路径、注册后的 cw_explore execute 与清理函数。
+ *
+ * What `setup()` hands back: the task snapshot, the repo path, the registered
+ * `cw_explore.execute`, and a cleanup that unsets injected env vars.
+ */
 interface Harness {
   task: ActiveTask;
   repo: string;
@@ -33,6 +53,8 @@ interface Harness {
   cleanup: () => Promise<void>;
 }
 
+// 同步执行一条 git 命令并收集 stdout；非零退出即 reject（夹具装配用）。
+// One git subprocess collecting stdout; rejects on nonzero exit (fixture plumbing).
 async function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd });
@@ -43,7 +65,11 @@ async function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
-/** Approved-task repo (m7 pattern) with the tool registered against a fake pi CLI. */
+/**
+ * 复用 m7 形态的“已批准任务”仓库：真实 git 仓库 + 契约 + 批准记录，工具注册到伪 pi CLI。
+ *
+ * Approved-task repo (m7 pattern) with the tool registered against a fake pi CLI.
+ */
 async function setup(options: {
   mode: string;
   text?: string;
@@ -75,6 +101,8 @@ script = "cheap"
 change = "medium"
 interface = "strong"
 `);
+  // 账本装配与 m7 同构：建任务、写契约，再落批准记录（哈希按真实文件计算）。
+  // M7-shaped ledger setup: create the task, write the contract, then the approval record.
   await createTask(repo, taskId, "g/medium", base);
   await writeFile(
     path.join(repo, ".cw", "tasks", taskId, "contract.toml"), `version = 1
@@ -113,6 +141,8 @@ baseline_inputs = ["tests/a.py"]
     contract, approval, project: await readProjectConfig(path.join(root, ".cw", "project.toml")),
   };
 
+  // 环境变量驱动伪 pi：模式、argv 落盘路径、回答文本与 usage 都由用例注入。
+  // Env vars drive the fake pi: mode, argv dump path, answer text, and usage.
   const argvFile = path.join(repo, ".cw", "fake-argv.json");
   process.env.CW_FAKE_EXPLORE = options.mode;
   process.env.CW_FAKE_ARGV_FILE = argvFile;
@@ -127,12 +157,16 @@ baseline_inputs = ["tests/a.py"]
     sendMessage: () => undefined,
     setModel: async () => true,
   } as unknown as ExtensionAPI;
+  // 最小 ExtensionAPI 替身：registerTool 只把工具收进本地 map 供直接调用。
+  // Minimal ExtensionAPI stub: registerTool captures tools into a local map.
   registerTools(pi, {
     getTask: () => task,
     explorerCliPath: fakeCli,
     explorerTimeoutMs: options.timeoutMs,
   });
   const explore = tools.get("cw_explore")!.execute;
+  // 清掉注入的进程级环境变量再删临时仓库，避免用例间相互污染。
+  // Unset the injected env vars, then delete the temp repo to keep cases isolated.
   const cleanup = async () => {
     for (const key of ["CW_FAKE_EXPLORE", "CW_FAKE_ARGV_FILE", "CW_FAKE_EXPLORE_TEXT", "CW_FAKE_USAGE"]) {
       delete process.env[key];
@@ -142,10 +176,14 @@ baseline_inputs = ["tests/a.py"]
   return { task, repo, explore, cleanup };
 }
 
+// 直接调用 cw_explore.execute，返回给模型看的文本（toolCallId 固定为 t1）。
+// Invoke `cw_explore.execute` directly and return the model-facing text.
 const run = (harness: Harness, question: string, signal?: AbortSignal) =>
   harness.explore("t1", { question }, signal, undefined, {} as ExtensionToolContext)
     .then((result) => result.content[0]!.text);
 
+// 读 meter.jsonl 并逐行解析；调用方须保证账本已存在（至少跑过一轮）。
+// Parses meter.jsonl line by line; callers must have run at least once.
 const meterLines = async (repo: string): Promise<Array<Record<string, unknown>>> => {
   const text = await readFile(path.join(repo, ".cw", "tasks", taskId, "meter.jsonl"), "utf8");
   return text.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -153,6 +191,8 @@ const meterLines = async (repo: string): Promise<Array<Record<string, unknown>>>
 
 // ---- CLI contract: the explorer subprocess gets exactly the verified flags --
 
+// 钉死子进程 argv（含顺序）与系统提示文件的存在性；任何漂移都必须失败。
+// Pins the subprocess argv (order included) and the prompt file's existence.
 test("探索者子进程使用核实的 CLI 参数：JSON 模式、read/grep 白名单、固定提示、禁自动加载", async () => {
   const harness = await setup({ mode: "answer", text: "结论甲 tests/a.py:1" });
   try {
@@ -185,6 +225,8 @@ test("探索者子进程使用核实的 CLI 参数：JSON 模式、read/grep 白
 
 // ---- plan acceptance: bounded output, invalid refs, timeout, tree, usage ----
 
+// 30 行上限是硬契约：截断必须显式注明，先放弃尾部再标注，绝不静默丢弃。
+// The 30-line cap is hard; the cut keeps the first 30 lines and is always annotated.
 test("输出超过 30 行时被截断并注明", async () => {
   const harness = await setup({ mode: "long" });
   try {
@@ -200,6 +242,8 @@ test("输出超过 30 行时被截断并注明", async () => {
   }
 }, 20_000);
 
+// 引用校验四类失败（缺文件/越界/../逃逸/.cw 台账）与缺出处都就地标注，原文不删。
+// Invalid refs and ref-less lines get annotated in place; the text is never dropped.
 test("无效引用被标注〔引用无效〕，缺出处的结论被标注〔缺少引用〕，均不删除内容", async () => {
   const answer = [
     "结论甲 tests/a.py:1",
@@ -228,6 +272,8 @@ test("无效引用被标注〔引用无效〕，缺出处的结论被标注〔�
   }
 }, 20_000);
 
+// 逃逸读 fail-closed：整条回答作废（树内读混入也不行），但 token 与失败事件仍记账。
+// Escaped reads fail closed: the whole answer is withheld, usage still metered.
 test("探索者读取工作树之外的路径：回答不予采信，usage 仍记账", async () => {
   const harness = await setup({
     mode: "readoutside",
@@ -251,6 +297,8 @@ test("探索者读取工作树之外的路径：回答不予采信，usage 仍�
   }
 }, 20_000);
 
+// 词法上仍在树内的符号链接出口同样按逃逸处理（realpath 复核）。
+// An in-repo symlink whose target escapes is still an escape (realpath re-check).
 test("仓内符号链接指向仓外同样是读路径逃逸", async () => {
   const harness = await setup({
     mode: "readlink",
@@ -270,6 +318,8 @@ test("仓内符号链接指向仓外同样是读路径逃逸", async () => {
   }
 }, 20_000);
 
+// 反向对照：树内读（以及无 path 的 grep）不触发任何拒答路径。
+// Control case: in-tree reads (and grep without a path) withhold nothing.
 test("读取全部落在工作树内：回答照常返回", async () => {
   const harness = await setup({ mode: "readinside", text: "结论甲 tests/a.py:1" });
   try {
@@ -281,6 +331,8 @@ test("读取全部落在工作树内：回答照常返回", async () => {
   }
 }, 20_000);
 
+// 超时语义：runner 返回时整个子进程组已消亡（伪 pi 记录 pid 供复核）。
+// Timeout: the runner returns only after the whole process group is gone.
 test("子进程超时被终止：整组消亡后才返回", async () => {
   const pidFile = path.join(tmpdir(), `cw-m8-pid-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   process.env.CW_FAKE_PID_FILE = pidFile;
@@ -306,6 +358,8 @@ test("子进程超时被终止：整组消亡后才返回", async () => {
   }
 }, 30_000);
 
+// 宿主 AbortSignal 走同一条进程组终止路径，终止后才返回“已被取消”。
+// Host cancellation kills through the same process-group path before returning.
 test("外部取消（宿主信号）同样终止子进程组", async () => {
   const pidFile = path.join(tmpdir(), `cw-m8-cancel-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   process.env.CW_FAKE_PID_FILE = pidFile;
@@ -328,6 +382,8 @@ test("外部取消（宿主信号）同样终止子进程组", async () => {
   }
 }, 30_000);
 
+// 先给完整回答再挂起：被杀死的运行永不采信其回答，usage 仍全额记账。
+// Answer-then-hang: a killed run never has its answer accepted; usage is metered.
 test("先输出完整回答后挂起：超时判失败，回答不被接受，usage 仍记账", async () => {
   const pidFile = path.join(tmpdir(), `cw-m8-late-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   process.env.CW_FAKE_PID_FILE = pidFile;
@@ -354,6 +410,8 @@ test("先输出完整回答后挂起：超时判失败，回答不被接受，us
   }
 }, 30_000);
 
+// 同上但走取消路径：回答丢弃、子进程已死、usage 仍记账。
+// Same as above on the cancel path: answer dropped, usage still metered.
 test("先输出完整回答后被取消：回答不被接受，usage 仍记账", async () => {
   const pidFile = path.join(tmpdir(), `cw-m8-late-cancel-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   process.env.CW_FAKE_PID_FILE = pidFile;
@@ -384,6 +442,8 @@ test("先输出完整回答后被取消：回答不被接受，usage 仍记账",
   }
 }, 30_000);
 
+// 内存注册可能过期：执行前以账本为准，拒绝路径连子进程都不许起（argv 文件不存在）。
+// Stale in-memory registration: the ledger decides, and refusals spawn no subprocess.
 test("执行前重读权威状态：非 approved/running 或本会话不再登记时拒绝且不派子进程", async () => {
   const harness = await setup({ mode: "answer", text: "结论甲 tests/a.py:1" });
   const argvFile = path.join(harness.repo, ".cw", "fake-argv.json");
@@ -419,6 +479,8 @@ test("执行前重读权威状态：非 approved/running 或本会话不再登�
   }
 }, 20_000);
 
+// 树哈希在运行期间移动 → 头部标注“不可信”；探索者的写入留在原地不还原。
+// A moved tree hash marks the answer untrusted; the explorer's writes stay in place.
 test("子进程修改文件树时结果被标注为不可信，且改动不被还原", async () => {
   const harness = await setup({ mode: "writetree", text: "结论甲 tests/a.py:1" });
   try {
@@ -432,6 +494,8 @@ test("子进程修改文件树时结果被标注为不可信，且改动不被�
   }
 }, 20_000);
 
+// usage 全字段落 meter.jsonl，并累加进父任务的 tokens_used 预算。
+// Usage lands in meter.jsonl field by field and adds to the task's tokens_used.
 test("usage 计入父任务：meter.jsonl 逐条记录，tokens_used 累加进预算", async () => {
   const harness = await setup({
     mode: "answer",
@@ -453,6 +517,8 @@ test("usage 计入父任务：meter.jsonl 逐条记录，tokens_used 累加进�
   }
 }, 20_000);
 
+// 每条 assistant message_end 各记一条 usage 并求和（12×2 计入头部与预算）。
+// One usage line per assistant message_end, summed across turns.
 test("多轮 assistant 消息的 usage 逐条记账并求和", async () => {
   const harness = await setup({
     mode: "multimessage",
@@ -471,6 +537,8 @@ test("多轮 assistant 消息的 usage 逐条记账并求和", async () => {
   }
 }, 20_000);
 
+// stop reason 非 stop 判失败：半截回答不采信，已花的 token 照常落账。
+// A non-stop stopReason is a failure: no answer returned, tokens still charged.
 test("失败运行同样记账：stop reason 异常时不返回回答但 usage 落账", async () => {
   const harness = await setup({
     mode: "badstop",
@@ -489,6 +557,8 @@ test("失败运行同样记账：stop reason 异常时不返回回答但 usage �
   }
 }, 20_000);
 
+// getTask() 为 null 时工具直接返回提示文本，不触探索者子进程。
+// With no managed task the tool returns a notice and never spawns the explorer.
 test("无受管任务时 cw_explore 不可用", async () => {
   const tools = new Map<string, { execute: ToolExecute }>();
   const pi = {
@@ -506,6 +576,8 @@ test("无受管任务时 cw_explore 不可用", async () => {
 
 // ---- answer post-processing unit cases --------------------------------------
 
+// 单元用例：31 行只保留前 30 行 + 1 行截断注记，边界行号精确。
+// Unit: 31 lines keep exactly the first 30 plus one truncation note.
 test("finalizeExplorerAnswer：行数上限与截断标注", async () => {
   const repo = await realpath(await mkdtemp(path.join(tmpdir(), "cw-m8-unit-")));
   try {
@@ -523,6 +595,8 @@ test("finalizeExplorerAnswer：行数上限与截断标注", async () => {
   }
 });
 
+// 单元用例：行号须落在文件行数内，空文件视为 0 行；全文精确匹配证明不改原文。
+// Unit: line numbers must be in range; an empty file has zero lines.
 test("finalizeExplorerAnswer：引用行号必须落在文件范围内", async () => {
   const repo = await realpath(await mkdtemp(path.join(tmpdir(), "cw-m8-unit2-")));
   try {
@@ -540,6 +614,8 @@ test("finalizeExplorerAnswer：引用行号必须落在文件范围内", async (
   }
 });
 
+// 单元用例：缺引用标注；空行与裸“未找到”豁免（它们是合法回答形态）。
+// Unit: missing-ref annotation; blank lines and the bare `未找到` are exempt.
 test("finalizeExplorerAnswer：缺出处的结论标注〔缺少引用〕；未找到与空行豁免", async () => {
   const repo = await realpath(await mkdtemp(path.join(tmpdir(), "cw-m8-unit3-")));
   try {

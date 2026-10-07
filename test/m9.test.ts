@@ -1,3 +1,11 @@
+/**
+ * M9 测试：cw observe 现场记录（尾部行/字节窗口与截断标记、非 git 降级、版本探测、argv 解析），
+ * 以及 eval 脚手架用伪 pi 跑通四条件（含先红拒绝短路）的端到端契约。
+ *
+ * M9 tests: `cw observe` scene recording (tail line/byte bounds and truncation marker, non-git
+ * degradation, version probes, argv parsing) plus the eval scaffold end-to-end over the four
+ * conditions, including the red-check-rejection short-circuit.
+ */
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +15,8 @@ import { expect, test } from "vitest";
 import { runEvaluation } from "../eval/run.ts";
 import { parseObserveArgv, recordObservation, UsageError } from "../src/cli/observe.ts";
 
+// 同步执行一条 git 命令并收集 stdout；非零退出即 reject（resolve2 避开同名导入）。
+// One git subprocess collecting stdout; rejects on nonzero exit (`resolve2` shadows the import).
 function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve2, reject) => {
     const child = spawn("git", args, { cwd });
@@ -17,6 +27,8 @@ function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+// 建一个含基线提交（src.txt）的临时 git 仓库，供 observe/eval 用例共用。
+// Creates a temp git repo with one baseline commit (`src.txt`).
 async function gitRepo(prefix: string): Promise<string> {
   const repo = await mkdtemp(path.join(tmpdir(), prefix));
   await git(repo, ["init"]);
@@ -26,6 +38,8 @@ async function gitRepo(prefix: string): Promise<string> {
   return repo;
 }
 
+// 断言恰好生成一个观测目录并返回其路径——“一次运行一条记录”的不变量。
+// Asserts exactly one observation dir exists — one record per run.
 async function onlyObservationDir(cwd: string): Promise<string> {
   const observations = path.join(cwd, ".cw", "observations");
   const names = await readdir(observations);
@@ -33,6 +47,8 @@ async function onlyObservationDir(cwd: string): Promise<string> {
   return path.join(observations, names[0]!);
 }
 
+// 失败语义：非零退出不影响记录完整性——退出码、备注、git 绑定与两路尾部都保留。
+// A failing command still records everything: exit code, note, git binding, tails.
 test("observe：命令失败仍完整记录命令、备注、git 与尾部输出", async () => {
   const repo = await gitRepo("cw-m9-observe-");
   const head = (await git(repo, ["rev-parse", "HEAD"])).trim();
@@ -59,6 +75,8 @@ test("observe：命令失败仍完整记录命令、备注、git 与尾部输出
   }
 });
 
+// 恰好保留每个流的最后 200 行（stdout o301..o500、stderr e101..e300）。
+// Exactly the last 200 lines per stream are kept, and no fewer.
 test("observe：尾部输出恰好 200 行", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-tail-"));
   try {
@@ -83,6 +101,8 @@ test("observe：尾部输出恰好 200 行", async () => {
   }
 });
 
+// 超行数上限时截断标记必须排第一行，且不被尾部 slice 丢掉。
+// The truncation marker survives the tail slice and heads the file.
 test("observe：行数截断时标记保留，恰为 200 行尾部（150000 短行）", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-marker-"));
   try {
@@ -101,6 +121,8 @@ test("observe：行数截断时标记保留，恰为 200 行尾部（150000 短�
   }
 });
 
+// 字节窗口 1MiB 上界：大行场景行数可少于 200，但文件与标记仍有界。
+// The 1 MiB byte window bounds the file even when fewer than 200 lines fit.
 test("observe：超大输出时窗口有界并注明截断", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-window-"));
   try {
@@ -117,12 +139,16 @@ test("observe：超大输出时窗口有界并注明截断", async () => {
     expect(lines.length).toBeGreaterThan(100);
     expect(lines.length).toBeLessThanOrEqual(201);
     expect(lines[lines.length - 1]!.endsWith("|400")).toBe(true);
+    // 字节窗口可能从更早的行切入：首行只需是完整数据行，不必是 |1。
+    // The byte window may cut earlier: line 1 need not be |1, just a whole line.
     expect(lines[1]!.endsWith("|1") || /\|\d+$/.test(lines[1]!)).toBe(true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
+// 非 git 目录降级为 {supported:false}，退出码照常记录。
+// A non-git cwd degrades to {supported:false}; everything else is recorded.
 test("observe：非 git 仓库降级记录，不做 git 绑定", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-nogit-"));
   try {
@@ -134,6 +160,8 @@ test("observe：非 git 仓库降级记录，不做 git 绑定", async () => {
   }
 });
 
+// 探测只取命令与版本首行；环境变量绝不进入记录（防泄密的不变量）。
+// Probes keep only the command and version line; env vars never enter the record.
 test("observe：[observe] versions 探测工具版本，环境变量不入记录", async () => {
   const repo = await gitRepo("cw-m9-versions-");
   try {
@@ -180,6 +208,8 @@ versions = ["node"]
   }
 });
 
+// 启动失败（ENOENT）保留具体原因，exit_code 为 null；两条尾部仍写入空内容。
+// A spawn failure keeps the concrete reason; empty tails are still written.
 test("observe：命令不存在时 runner_error 保留具体原因而非裸退出码", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "cw-m9-enoent-"));
   try {
@@ -198,6 +228,8 @@ test("observe：命令不存在时 runner_error 保留具体原因而非裸退�
   }
 });
 
+// `--` 是硬边界：其后 argv 原样保留（含 --not-a-flag），各种误用抛 UsageError。
+// `--` is the hard boundary; argv after it stays verbatim, misuse throws UsageError.
 test("observe：参数解析要求 -- 并原样保留 argv", () => {
   expect(parseObserveArgv(["--note", "a b", "--", "make", "test"])).toEqual({
     command: ["make", "test"],
@@ -211,7 +243,12 @@ test("observe：参数解析要求 -- 并原样保留 argv", () => {
   expect(() => parseObserveArgv(["--"])).toThrow(UsageError);
 });
 
-/** Fixture repo + tasks.toml shared by the eval tests. */
+/**
+ * eval 用例共用的夹具：一个 git 仓库（verify.mjs + validate.sh 验证器）与一份 tasks.toml；
+ * validate.sh 把 t:red 的 pass/fail 交给 CW_EVAL_RED_STATUS 控制，用于制造先红拒绝场景。
+ *
+ * Fixture repo + tasks.toml shared by the eval tests.
+ */
 async function evalWorkspace(prefix: string): Promise<{ workspace: string; repo: string; tasksPath: string }> {
   const workspace = await mkdtemp(path.join(tmpdir(), prefix));
   const repo = path.join(workspace, "repo");
@@ -266,15 +303,21 @@ baseline_inputs = []
   return { workspace, repo, tasksPath };
 }
 
+// results.csv 去掉表头后的数据行，供按列断言用。
+// Data rows of results.csv with the header stripped.
 async function readRows(outDir: string): Promise<string[][]> {
   const lines = (await readFile(path.join(outDir, "results.csv"), "utf8")).trimEnd().split("\n");
   return lines.slice(1).map((line) => line.split(","));
 }
 
+// 四条件端到端：CSV/argv/评判清单/key 的行数与取值、无孤儿进程、worktree 无残留。
+// Four conditions end to end: CSV, argv, judging/key outputs, and no leftovers.
 test("eval：伪 pi 跑通四条件，CSV 行数正确，评判清单不含条件标签", async () => {
   const { workspace, repo, tasksPath } = await evalWorkspace("cw-m9-eval-");
   const argvLog = path.join(workspace, "argv.jsonl");
   process.env.CW_EVAL_ARGV_FILE = argvLog;
+  // 强制便宜模型失败，逼出 escalate 条件的升级（tokens 30 = 便宜 + 强模型两次运行）。
+  // Forces the cheap-model failure that the `escalate` condition must remedy.
   process.env.CW_EVAL_FAIL_MODEL = "fake/cheap";
   const outDir = path.join(workspace, "out");
   try {
@@ -364,6 +407,8 @@ test("eval：伪 pi 跑通四条件，CSV 行数正确，评判清单不含条�
   }
 });
 
+// 先红拒绝短路：该终态不判 pass、不跑验证、不计升级，也不启动强模型。
+// Red-check rejection short-circuits: no verdict, no escalation, no strong model.
 test("eval：先红拒绝时 contract/escalate 为 red_check_failed，不计升级不启动强模型", async () => {
   const { workspace, tasksPath } = await evalWorkspace("cw-m9-red-");
   const argvLog = path.join(workspace, "argv.jsonl");

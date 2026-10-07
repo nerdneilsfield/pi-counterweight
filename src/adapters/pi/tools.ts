@@ -1,3 +1,19 @@
+/**
+ * 注册 Counterweight 暴露给模型的三个工具：report_blocked（报告受阻）、propose_contract_change
+ * （提议契约变更；直接写受保护文件会被拒绝）与 cw_explore（只读探索者，带审计与记账）。
+ *
+ * 三个工具都是 `sequential`：它们读任务账本、向账本追加记录，不能彼此或与并行的同级调用交错。
+ * 工具本身不做判断，只把事实写进 core 的账本与计量文件；门禁在结算时读取这些记录。
+ *
+ * Registers the three model-facing Counterweight tools: report_blocked,
+ * propose_contract_change (direct writes to protected files are refused), and
+ * cw_explore (the read-only explorer, audited and metered).
+ *
+ * All three are declared `sequential`: they read the task ledger and append to
+ * it, so they must not interleave with each other or with parallel sibling
+ * calls. The tools judge nothing; they record facts into the core ledger and
+ * meter files, and the gate reads those records at settle time.
+ */
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { finalizeExplorerAnswer } from "../../core/explore.js";
@@ -7,12 +23,32 @@ import { readState, updateState, writeBlocked, writeProposal } from "../../core/
 import { runExplorer } from "../../explorer/run.js";
 import type { ActiveTask } from "./index.js";
 
+/**
+ * 工具注册所需的依赖：读取当前受管任务的回调，以及两个只给测试用的注入口。生产调用不传这两个口，
+ * CLI 发现与子进程预算由 `runExplorer` 使用自身默认值。
+ *
+ * What tool registration needs: a callback for the currently managed task plus
+ * two test seams. Production calls pass neither seam; CLI discovery and the
+ * subprocess budget stay with `runExplorer`'s own defaults.
+ */
 export interface ToolRegistration {
-  /** Currently managed task, or null when this session manages none. */
+  /**
+   * 当前正在管理的任务；本会话不管理任务时为 null。
+   *
+   * Currently managed task, or null when this session manages none.
+   */
   getTask: () => ActiveTask | null;
-  /** Test seam: overrides explorer CLI discovery. */
+  /**
+   * 测试接缝：覆盖探索者 CLI 的发现结果。
+   *
+   * Test seam: overrides explorer CLI discovery.
+   */
   explorerCliPath?: string;
-  /** Test seam: overrides the explorer subprocess budget. */
+  /**
+   * 测试接缝：覆盖探索者子进程的预算。
+   *
+   * Test seam: overrides the explorer subprocess budget.
+   */
   explorerTimeoutMs?: number;
 }
 
@@ -21,11 +57,23 @@ function text(message: string) {
 }
 
 /**
+ * 注册模型可见的工具。`report_blocked` 与 `propose_contract_change` 会读写任务账本，是 harness
+ * 工具；`cw_explore` 交给只读探索者子进程。三者都声明为 `sequential`，彼此以及与并行的同级调用
+ * 不能交错。
+ *
  * The two model-facing harness tools. Both are declared `sequential`: they
  * read and append task-ledger files and must not interleave with each other
  * or with parallel sibling calls.
  */
 export function registerTools(pi: ExtensionAPI, registration: ToolRegistration): void {
+  /**
+   * report_blocked：记录受阻报告（原因 + 待答问题）。没有受管任务时只回一句说明、不落记录；记录
+   * 本身不改变任务状态，交还由本轮结束时的门禁完成。
+   *
+   * report_blocked: records a blocked report (reason plus open questions). With
+   * no managed task it only answers and writes nothing; the record changes no
+   * status — the gate hands the task back when the turn settles.
+   */
   pi.registerTool({
     name: "report_blocked",
     label: "报告受阻",
@@ -48,6 +96,16 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
     },
   });
 
+  /**
+   * propose_contract_change：把契约字段改动写成提议文件。有交互界面时当场问用户并记
+   * approved/rejected，没有界面时记 pending；本工具从不直接改 contract.toml，生成新契约版本与
+   * 重跑先红检查归批准流程。
+   *
+   * propose_contract_change: writes a field change as a proposal file. With a UI
+   * it asks the user and records approved/rejected, otherwise pending. It never
+   * edits contract.toml itself; regenerating the contract and re-running the
+   * red check belong to the approval flow.
+   */
   pi.registerTool({
     name: "propose_contract_change",
     label: "提议契约变更",
@@ -87,6 +145,15 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
     },
   });
 
+  /**
+   * cw_explore：把问题交给只读探索者子进程，回答经后处理（30 行上限、`path:line` 引用校验）后
+   * 返回。拒绝条件、token 记账与不可信标记都在 `runExploreForTask` 里，这里只是入口。
+   *
+   * cw_explore: hands the question to the read-only explorer subprocess and
+   * returns the post-processed answer (30-line cap, `path:line` validation).
+   * Refusal rules, token accounting, and the untrusted marking live in
+   * `runExploreForTask`; this registration is only the entry point.
+   */
   pi.registerTool({
     name: "cw_explore",
     label: "探索者提问",
@@ -107,10 +174,27 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
 }
 
 /**
+ * 对受管任务跑一轮探索者：子进程调用前后各取一次树哈希，用量计入父会话的计量与任务预算，回答经后
+ * 处理（30 行上限、`path:line` 校验），运行期间树哈希发生变化就给回答打上不可信标记。
+ *
  * One explorer round for the managed task: subprocess run with tree
  * bookkeeping around it, usage into the parent meter and budget, answer
  * post-processed (30-line cap, `path:line` validation), and an untrusted
  * marking whenever the tree hash moved across the run.
+ *
+ * @returns 给模型的一段文本：拒绝原因、失败说明（带本次 token 消耗）或最终回答 /
+ * One text block for the model: refusal, failure note with tokens spent, or the finalized answer
+ *
+ * @remarks
+ * 权限以权威账本为准，不看内存里的注册信息：状态不是 approved/running、或本会话已不在任务的会话
+ * 列表里，就不起子进程，只返回拒绝文案。用量无论成败都记账（token 已经花掉），回答出来与否都写一条
+ * `explore` 任务事件，供审计。
+ *
+ * Authority is the ledger, not the in-memory registration: a state other than
+ * approved/running, or a session no longer listed on the task, spawns no
+ * subprocess and only returns a refusal. Usage is metered no matter how the run
+ * ended — the tokens were spent — and every round writes one `explore` task
+ * event for audit.
  */
 async function runExploreForTask(
   task: ActiveTask, question: string, signal: AbortSignal | undefined,
@@ -189,6 +273,9 @@ async function runExploreForTask(
 }
 
 /**
+ * 探索者不得写入：运行期间树哈希发生变化（或树哈希根本算不出来）就把回答标为不可信（plan M8
+ * item 5）。被改动的文件保持原样，不做回滚。
+ *
  * The explorer must not write; a tree hash that moved across the run (or a
  * tree hash that cannot be computed at all) marks the answer untrusted
  * (plan M8 item 5). The changed files are left as they are.

@@ -1,3 +1,16 @@
+/**
+ * M6 先红门禁与批准链路的集成测试：在临时 git 仓库上驱动 runRedCheck、
+ * judgeRedBaseline、writeApproval、提议采纳/消费与 renderTaskView。失败路径的
+ * 统一语义是“拒绝而不是将就”——无法隔离、契约漂移、未采纳提议、取消与超时都
+ * 不得留下批准记录，也不得发布 last_verified。
+ *
+ * Integration tests for the M6 red gate and approval chain: drives
+ * `runRedCheck`, `judgeRedBaseline`, `writeApproval`, proposal adoption and
+ * consumption, and `renderTaskView` against throwaway git repos. Every failure
+ * path refuses rather than compromises — un-isolatable inputs, contract drift,
+ * un-adopted proposals, cancellation, and timeouts leave no approval record and
+ * publish no `last_verified`.
+ */
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,12 +26,20 @@ import { createTask, proposalAdopted, readState, updateState, writeApproval, wri
 import type { Approval } from "../../src/core/task.ts";
 import type { Contract, ValidatorConfig } from "../../src/core/types.ts";
 
+/** 本文件所有验证器都通过这一个固定脚本驱动 / Every validator here runs through this one fixture script. */
 const fixture = path.join(import.meta.dirname, "../fixtures/validators/fake.sh");
 const taskId = "20260928-lifetime-fix";
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 验证器报告里单个检查项的最小形状 / Minimal shape of one check entry in a validator report. */
 type Check = { id: string; status: string; message?: string };
 
+/**
+ * 构造一份完整的 protocol-1 报告文本；只有 checks 由用例决定，其余字段固定。
+ *
+ * Build a complete protocol-1 report body; only `checks` varies per case, every
+ * other field is pinned to the happy-path shape.
+ */
 function payload(checks: Check[]): string {
   return JSON.stringify({
     protocol: 1, run_id: "1", complete: true, checks,
@@ -26,6 +47,13 @@ function payload(checks: Check[]): string {
   });
 }
 
+/**
+ * 夹具契约：acceptance 为 [red1, keep]、red 为 [red1]、regression 为 [reg1]，
+ * 并冻结 tests/a.py；任一字段可整体覆盖。
+ *
+ * Fixture contract: acceptance `[red1, keep]`, red `[red1]`, regression
+ * `[reg1]`, `tests/a.py` frozen; any field can be overridden wholesale.
+ */
 function contractOf(overrides: Partial<Contract> = {}): Contract {
   return {
     version: 1,
@@ -45,6 +73,14 @@ function contractOf(overrides: Partial<Contract> = {}): Contract {
   };
 }
 
+/**
+ * 把契约渲染成 contract.toml 文本。批准链路比对的是落盘字节的哈希，所以用例
+ * 都先写盘再 readContract 读回，而不是直接拿内存对象去批准。
+ *
+ * Render a contract as `contract.toml` text. The approval chain hashes the
+ * bytes on disk, so cases write the file first and `readContract` it back
+ * instead of approving the in-memory object.
+ */
 function contractToml(contract: Contract): string {
   return `version = 1
 task_id = "${contract.task_id}"
@@ -60,6 +96,7 @@ approved_failures = [${contract.approved_failures.map((item) => `{ id = "${item.
 `;
 }
 
+/** 在 `cwd` 中执行一条 git 命令，失败即 reject / Runs one git command in `cwd`; rejects on failure. */
 async function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd });
@@ -70,8 +107,17 @@ async function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+/** 用例共享的默认契约 / The default contract shared by the cases below. */
 const baseContract = contractOf();
 
+/**
+ * 建一个临时 git 仓库并提交基准内容，创建任务目录、写入 contract.toml；
+ * 返回仓库路径、base commit，以及从磁盘读回（哈希与落盘字节一致）的契约。
+ *
+ * Sets up a throwaway git repo with a base commit, a task directory, and
+ * `contract.toml`; returns the repo path, the base commit, and the contract as
+ * read back from disk so its sha256 matches the stored bytes.
+ */
 async function setup(): Promise<{ repo: string; base: string; contract: Contract }> {
   const repo = await mkdtemp(path.join(tmpdir(), "cw-m6core-"));
   await git(repo, ["init"]);
@@ -87,19 +133,43 @@ async function setup(): Promise<{ repo: string; base: string; contract: Contract
   return { repo, base, contract: await readContract(file, repo) };
 }
 
+/**
+ * 用共享的 fake.sh 夹具构造验证器配置：mode 选行为（reportrun/touch/hang/none…），
+ * payloadText 是报告文本（`-` 表示不用），退出码与超时可覆盖。
+ *
+ * Builds a validator config around the shared `fake.sh` fixture: `mode` picks
+ * the behavior (reportrun / touch / hang / none …), `payloadText` is the report
+ * body (`-` when unused), and exit code / timeout are overridable.
+ */
 const validator = (mode: string, payloadText = "-", code = "0", timeout_s = 600): ValidatorConfig =>
   ({ cmd: ["/bin/sh", fixture, mode, payloadText, code], timeout_s, env: {} });
 
+/**
+ * 组装一次 runRedCheck 请求，session 固定为 s1。
+ *
+ * Assembles a `runRedCheck` request; the session is pinned to "s1".
+ */
 const redCheckRequest = (
   repo: string, contract: Contract, base: string, cmd: ValidatorConfig,
 ) => ({ repo, taskId, session: "s1", contract, validator: cmd, baseCommit: base });
 
+/**
+ * 预期被先红判定接受的报告：red1 失败、keep 与 reg1 通过。
+ *
+ * The report a passing red check expects: red1 fails while keep and reg1 pass.
+ */
 const redOkPayload = payload([
   { id: "red1", status: "fail", message: "AssertionError: owner alive" },
   { id: "keep", status: "pass" },
   { id: "reg1", status: "pass" },
 ]);
 
+/**
+ * 已注册的 worktree 数量（含主工作树）；基线清理干净后必须回到 1。
+ *
+ * Number of registered worktrees including the main one; must return to 1 once
+ * the temporary baseline is cleaned up.
+ */
 async function worktreeCount(repo: string): Promise<number> {
   const text = await git(repo, ["worktree", "list", "--porcelain"]);
   return text.split("worktree ").length - 1;
@@ -166,6 +236,9 @@ test("先红判定：存量失败豁免的回归可以失败但必须出现在�
     protocol: 1 as const, run_id: "1", complete: true, checks,
     build: { required: false }, summary: "x", logs: [],
   });
+  // 豁免只放宽状态要求，不放宽报告要求：漏报等同于未验证。
+  // The exemption relaxes the status requirement only, never the reporting one:
+  // a missing entry counts as unverified.
   const exempt = judgeRedBaseline(contract, shape([
     { id: "red1", status: "fail" }, { id: "keep", status: "pass" }, { id: "reg1", status: "fail" },
   ]));
@@ -185,6 +258,11 @@ test("先红检查：脏工作树下用原始基线与当前验收输入运行�
   await writeFile(path.join(repo, "src.py"), "impl\n");
   const treeBefore = (await treeHash(repo)).value!;
 
+  // 报告里回填验证器的实际 pwd 与 run id（fake.sh 的 reportrun 负责替换占位符），
+  // 下面的断言靠它证明验证器确实跑在隔离基线目录、且 run id 与账本一致。
+  // The report echoes the validator's real pwd and run id (fake.sh's reportrun
+  // substitutes the placeholders), which lets the assertions below prove it ran
+  // in the isolated baseline directory with the ledger's run id.
   const outcome = await runRedCheck(redCheckRequest(repo, contract, base, validator(
     "reportrun",
     redOkPayload.replace('"summary":"x"', '"summary":"@PWD@"').replace('"run_id":"1"', '"run_id":"@RUN@"'),
@@ -218,6 +296,9 @@ test("先红检查：脏工作树下用原始基线与当前验收输入运行�
 
 test("先红检查：验收输入缺失或 base_commit 不存在时拒绝隔离", async () => {
   const { repo, base, contract } = await setup();
+  // 无法忠实隔离就直接拒绝批准，绝不在当前半成品工作树上跑先红检查。
+  // Un-isolatable inputs refuse the approval outright: the red check never runs
+  // against the current half-done worktree.
   await rm(path.join(repo, "tests", "a.py"));
   await expect(runRedCheck(redCheckRequest(repo, contract, base, validator("none"))))
     .rejects.toBeInstanceOf(CannotIsolateError);
@@ -240,6 +321,11 @@ test("先红检查：验证器改动基线 → undetermined 拒绝；超时杀�
   // 超时：hang 模式忽略 SIGTERM，5s 后 SIGKILL；返回时进程组必须已死。
   const waiting = runRedCheck(redCheckRequest(repo, contract, base, validator("hang", "-", "0", 1)));
   const runs = path.join(repo, ".cw", "tasks", taskId, "runs");
+  // hang 模式的子进程把 PID 写进 child.pid；先取到 PID，超时返回后才能证明整个
+  // 进程组已被杀（对已消失的 PID 发信号 0 会抛错）。
+  // The hang-mode child writes its PID to child.pid; capturing it up front lets
+  // the test prove the whole process group is dead once the run returns (signal
+  // 0 to a vanished PID throws).
   let pid: number | undefined;
   for (let attempt = 0; attempt < 100 && pid === undefined; attempt++) {
     await delay(100);
@@ -261,6 +347,13 @@ test("先红检查：验证器改动基线 → undetermined 拒绝；超时杀�
   expect(await worktreeCount(repo)).toBe(1);
 }, 20_000);
 
+/**
+ * 占位批准记录：哈希全是哑值，只用于 renderTaskView 这类只读展示字段、
+ * 不校验一致性的用例。
+ *
+ * Placeholder approval with dummy hashes; only for cases like `renderTaskView`
+ * that read display fields and never verify hash consistency.
+ */
 function approvalOf(contract: Contract): Approval {
   return {
     version: 1,
@@ -278,6 +371,9 @@ function approvalOf(contract: Contract): Approval {
 
 test("并发批准：后到者锁内被拒且不覆盖已批准记录任何字段", async () => {
   const { repo, base, contract } = await setup();
+  // 局部同名 helper 遮蔽占位版：并发用例需要真实的 contract_sha256。
+  // Shadows the module-level placeholder: the race case needs a real
+  // `contract_sha256` to get past `writeApproval`'s consistency check.
   const approvalOf = (approvedAt: string): Approval => ({
     version: 1,
     contract_sha256: contractSha256(contract),
@@ -340,6 +436,13 @@ test("批准与契约漂移：契约在先红后再次修改则拒绝批准", as
     .rejects.toThrow();
 });
 
+/**
+ * 哈希由真实契约与 base commit 计算出的批准记录；先红后契约漂移等用例只能用
+ * 它来构造一个“本来会成功”的批准。
+ *
+ * An approval whose hashes are computed from the real contract and base commit;
+ * only this builder can produce an approval that would otherwise succeed.
+ */
 function approvalOfReal(contract: Contract, base: string): Approval {
   return {
     version: 1,
@@ -400,6 +503,9 @@ test("任务视图：≤40 行，含目标、先红标记与工具用途；超�
   expect(view).toContain("propose_contract_change");
   expect(view).toContain("report_blocked");
 
+  // 四类列表各 30 项：验证 40 行硬上限下的尾部截断与“其余 N 项”余量提示。
+  // Four list sections of 30 items each: exercises truncation from the tail
+  // under the 40-line hard cap and the explicit remainder marker.
   const long = contractOf({
     non_goals: Array.from({ length: 30 }, (_, index) => `非目标 ${index}`),
     acceptance: Array.from({ length: 30 }, (_, index) => `acc${index}`),
@@ -418,6 +524,10 @@ test("提议采纳边界：字段值与 new_value 一致才算被契约采纳", 
   expect(proposalAdopted(contract, { field: "goal", new_value: "fix lifetime issue" })).toBe(true);
   expect(proposalAdopted(contract, { field: "goal", new_value: "changed" })).toBe(false);
   expect(proposalAdopted(contract, { field: "acceptance", new_value: '["red1","keep"]' })).toBe(true);
+  // 列表字段按 JSON 解析后逐元素比较：空白不影响判定，非 JSON 文本一律按未采纳
+  // 处理（fail closed）。
+  // List fields are parsed as JSON and compared element-wise; whitespace is
+  // irrelevant and non-JSON text never counts as adopted (fail closed).
   expect(proposalAdopted(contract, { field: "acceptance", new_value: '[ "red1" , "keep" ]' })).toBe(true);
   expect(proposalAdopted(contract, { field: "acceptance", new_value: '["red1"]' })).toBe(false);
   expect(proposalAdopted(contract, { field: "acceptance", new_value: "red1,keep" })).toBe(false);
@@ -486,6 +596,13 @@ test("提议消费：仅采纳中的 approved 提议被消费，未采纳者拒�
   expect((await readState(repo, taskId)).status).toBe("approved");
 });
 
+/**
+ * 每 5ms 轮询一次条件，超时即抛错；用来把 abort 精确卡在验证器退出之后、
+ * 证据判定结束之前。
+ *
+ * Polls `predicate` every 5ms and throws on timeout; used to land the abort
+ * exactly in the window between validator exit and the end of evidence judging.
+ */
 const waitFor = async (predicate: () => Promise<boolean>, timeoutMs: number): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -500,6 +617,11 @@ test("runner 迟到取消：验证器退出后、证据发布前取消 → 不�
   await git(repo, ["init"]);
   await mkdir(path.join(repo, "inputs"), { recursive: true });
   await writeFile(path.join(repo, "tracked.txt"), "base\n");
+  // 800 个输入文件把“验证器退出 → 证据判定结束”的窗口拉长，让 abort 稳定落在
+  // 验证器退出之后、last_verified 发布之前。
+  // 800 input files widen the window between validator exit and the end of
+  // evidence judging, so the abort reliably lands after the validator exited but
+  // before `last_verified` could be published.
   const inputs: string[] = [];
   for (let index = 0; index < 800; index++) {
     const relative = `inputs/f${index}.txt`;
@@ -570,6 +692,9 @@ test("redcheck 迟到取消：证据判定期间取消 → valid=false，记录�
       return false;
     }
   }, 10_000);
+  // result.json 已出现、本次运行尚未成为批准依据时取消：结果作废，不得发布。
+  // Cancel after result.json appeared but before this run could back an approval:
+  // the result is discarded and must never be published.
   controller.abort();
   const outcome = await run;
 
