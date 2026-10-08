@@ -21,6 +21,7 @@ import { contractSha256, readContract } from "../../src/core/contract.ts";
 import { createTask, readState, updateState, type Approval } from "../../src/core/task.ts";
 import { registerTools } from "../../src/adapters/pi/tools.ts";
 import type { ActiveTask } from "../../src/adapters/pi/index.ts";
+import { findPiCli } from "../../src/explorer/run.ts";
 
 // 伪 pi CLI fixture：转存 argv，行为由 CW_FAKE_EXPLORE 选择（见该文件）。
 // Fake pi CLI fixture: dumps argv; behavior selected by CW_FAKE_EXPLORE.
@@ -188,6 +189,32 @@ const meterLines = async (repo: string): Promise<Array<Record<string, unknown>>>
   const text = await readFile(path.join(repo, ".cw", "tasks", taskId, "meter.jsonl"), "utf8");
   return text.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
 };
+
+// findPiCli 的定位契约：本地安装优先；落空时回退到运行中的 pi 进程入口——argv[1] 解析符号
+// 链接后必须落在 pi 的 CLI bundle 上，其它入口一律拒绝。托管安装不落地宿主包，回退即此路。
+// findPiCli's lookup contract: an installed pi package wins; otherwise the running pi process
+// entry is used — argv[1] must resolve (through symlinks) to the pi CLI bundle, and anything
+// else is rejected. Managed installs ship no host package, so this fallback is the only path.
+test("findPiCli：本地安装优先，落空时回退到运行中的 pi 入口", async () => {
+  const bundle = path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+  expect(findPiCli()).toBe(bundle);
+
+  const outside = await mkdtemp(path.join(tmpdir(), "cw-findpi-"));
+  const original = process.argv[1];
+  try {
+    process.argv[1] = bundle;
+    expect(findPiCli(outside)).toBe(bundle);
+    const link = path.join(outside, "pi");
+    await symlink(bundle, link);
+    process.argv[1] = link;
+    expect(findPiCli(outside)).toBe(bundle);
+    process.argv[1] = path.resolve("package.json");
+    expect(findPiCli(outside)).toBeNull();
+  } finally {
+    process.argv[1] = original;
+    await rm(outside, { recursive: true, force: true });
+  }
+});
 
 // ---- CLI contract: the explorer subprocess gets exactly the verified flags --
 

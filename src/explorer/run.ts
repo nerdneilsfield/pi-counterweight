@@ -7,7 +7,7 @@
  * escapes. Cancellation, a timeout, or an escaped read never yields an answer,
  * yet the usage of such a discarded run is still returned for accounting.
  */
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -32,15 +32,21 @@ export function explorerPromptPath(): string {
 }
 
 /**
- * 从 `from` 起逐级向上查找已安装的 pi CLI bundle（`bin.pi` → `dist/bundle/cli.js`），
- * 直到文件系统根；未安装时返回 null。
+ * 从 `from` 起逐级向上查找已安装的 pi CLI bundle
+ * （`node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`），直到文件系统根；
+ * 落空时回退到运行中的 pi 进程入口。托管安装（`pi install git:` / `npm:`）以
+ * `--omit=dev --omit=peer` 安装依赖、不落地宿主包，检出目录附近没有物理的 pi 包，
+ * 向上查找必然落空——回退是 explorer 在这种布局下仍能工作的关键。
  *
- * Locate the pinned pi CLI bundle (`bin.pi` → `dist/bundle/cli.js`) by walking
- * up from this module to the nearest `node_modules/@earendil-works/
- * pi-coding-agent`. Returns null when the package is not installed there.
+ * Locate the installed pi CLI bundle (`node_modules/@earendil-works/
+ * pi-coding-agent/dist/bundle/cli.js`) by walking up from this module to the
+ * filesystem root; when that misses, fall back to the running pi process entry.
+ * Managed installs (`pi install git:` / `npm:`) install with `--omit=dev
+ * --omit=peer`, so no host package exists near the checkout and the walk-up
+ * always misses there — the fallback keeps the explorer usable.
  *
  * @param from - 起点目录，默认本模块所在目录 / Start dir; defaults to this module's own directory.
- * @returns 命中的绝对路径；未安装时 null / Absolute path when found, else null.
+ * @returns 命中的绝对路径；都找不到时 null / Absolute path when found, else null.
  */
 export function findPiCli(from: string = path.dirname(fileURLToPath(import.meta.url))): string | null {
   let dir = from;
@@ -49,8 +55,29 @@ export function findPiCli(from: string = path.dirname(fileURLToPath(import.meta.
       dir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
     if (existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
-    if (parent === dir) return null;
+    if (parent === dir) break;
     dir = parent;
+  }
+  return piCliOfRunningProcess();
+}
+
+/**
+ * 运行中 pi 进程的入口（`process.argv[1]`）解析符号链接后若指向 pi 自己的 CLI bundle，
+ * 返回其真实路径；其余情况一律 null（普通 node 脚本、打包二进制、非 pi 入口都拒绝）。
+ *
+ * The running pi process entry (`process.argv[1]`) resolved through symlinks
+ * when it points at pi's own CLI bundle, else null — ordinary node scripts,
+ * compiled binaries and non-pi entries are rejected.
+ */
+function piCliOfRunningProcess(): string | null {
+  const entry = process.argv[1];
+  if (entry === undefined) return null;
+  try {
+    const resolved = realpathSync(entry);
+    const suffix = path.join("@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+    return resolved.endsWith(path.sep + suffix) ? resolved : null;
+  } catch {
+    return null;
   }
 }
 
