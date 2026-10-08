@@ -52,6 +52,14 @@ npm install <本仓库的 git 地址或本地路径>
 pi --extension node_modules/pi-counterweight/src/adapters/pi/index.ts
 ```
 
+**方式 C：作为 pi 包安装（从 GitHub）**
+
+```sh
+pi install git:github.com/nerdneilsfield/pi-counterweight
+```
+
+包清单（`package.json` 的 `pi` 字段）把扩展指向源码入口，无需构建。安装默认写入个人设置 `~/.pi/agent/settings.json`，此后每个会话自动加载；加 `-l` 写入项目 `.pi/settings.json`（读取前需批准项目信任）。用 `@` 固定版本（如 `@v0.1.0`），更新用 `pi update --extensions`。
+
 ## 🚀 Quick start
 
 1. 挂载扩展后，在 pi 里执行 `/cw-version`，预期通知：`Counterweight: pi 1.0.0`。
