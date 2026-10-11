@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathInside } from "../core/paths.js";
-import { runValidatorProcess } from "../core/runner.js";
+import { runProcess } from "../core/process.js";
 
 /**
  * 探索者子进程的默认预算：180 秒后整组被终止。
@@ -249,7 +249,7 @@ export async function runExplorer(request: ExplorerRequest): Promise<ExplorerRun
   ];
   const scratch = await mkdtemp(path.join(tmpdir(), "cw-explorer-"));
   try {
-    const outcome = await runValidatorProcess({
+    const outcome = await runProcess({
       cwd: request.workRoot,
       cmd: [process.execPath, cli, ...argv],
       env: { ...process.env },

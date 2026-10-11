@@ -9,5 +9,5 @@
     "outDir": "dist",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "eval/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }

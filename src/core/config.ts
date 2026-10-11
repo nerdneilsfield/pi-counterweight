@@ -1,16 +1,51 @@
 /**
- * 读取并校验 `.cw/project.toml`，为可选字段补上默认值；解析或校验失败一律抛错，调用方拿不到半套配置。
+ * 读取并校验 `.cw/project.toml`（轻量版）：`[check]` 结束检查、`[protect]` 受保护路径、
+ * `[explorer]` 探索者模型、`[observe]` 版本探测。整个文件与每个小节都是可选的——
+ * 没有配置文件时扩展完全被动。解析或校验失败一律抛错，绝不返回半套配置。
  *
- * Reads and validates `.cw/project.toml` and fills defaults for its optional
- * fields. Parse and validation failures throw, so no caller ever sees a
- * half-validated config; `provider/model` model names are checked by the schema
- * before anything else can use them.
+ * Reads and validates `.cw/project.toml` (lite): `[check]` end-of-turn check,
+ * `[protect]` protected paths, `[explorer]` explorer model, `[observe]`
+ * version probes. The file and every section are optional — without a config
+ * the extension is fully passive. Parse and validation failures throw, so no
+ * caller ever sees a half-validated config.
  */
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { Type } from "typebox";
 import { parse } from "smol-toml";
+import { isNotFound, relativeParts } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
-import type { ProjectConfig, Tier } from "./types.js";
+
+/**
+ * 结束检查配置：`cmd` 按 argv 直接 spawn（不经 shell），`timeout_s` 到点杀掉整个进程组，`env` 覆盖继承的环境变量。
+ *
+ * End-check configuration: `cmd` is spawned directly as argv (no shell),
+ * `timeout_s` kills the whole process group when it elapses, and `env`
+ * overrides the inherited environment.
+ */
+export interface CheckConfig {
+  cmd: string[];
+  timeout_s: number;
+  env: Record<string, string>;
+}
+
+/**
+ * `.cw/project.toml` 校验并补全默认值后的形状。
+ *
+ * The shape of `.cw/project.toml` after validation and default filling.
+ * `check` and `explorer` are null when their section is absent.
+ */
+export interface ProjectConfig {
+  version: 1;
+  /** 结束检查；未配置时为 null，扩展在该项上完全被动。 / The end check; null when not configured. */
+  check: CheckConfig | null;
+  /** 受保护路径（仓库内相对路径或目录前缀）。 / Protected repo-relative paths or directory prefixes. */
+  protect: { paths: string[] };
+  /** 探索者模型；未配置时 `cw_explore` 不可用。 / Explorer model; `cw_explore` is unavailable without it. */
+  explorer: { model: string } | null;
+  /** `cw observe` 的版本探测命令 / Version probes for `cw observe`. */
+  observe: { versions: string[] };
+}
 
 /**
  * `provider/model` 形式的模型名：恰好一个斜杠、两侧非空、不含空白字符。
@@ -19,13 +54,6 @@ import type { ProjectConfig, Tier } from "./types.js";
  * no whitespace.
  */
 const ModelName = Type.String({ minLength: 1, pattern: "^[^/\\s]+/[^/\\s]+$" });
-/**
- * `[tiers]` 可指向的三个模型槽位；`explorer` 槽位不参与任务档位映射。
- *
- * The three model slots `[tiers]` may point at; the `explorer` slot is not a
- * valid tier target.
- */
-const TierName = Type.Union([Type.Literal("cheap"), Type.Literal("medium"), Type.Literal("strong")]);
 
 /**
  * `.cw/project.toml` 的校验模式：所有对象都禁止未知字段，拼错键名会直接报错而不是被忽略。
@@ -35,95 +63,103 @@ const TierName = Type.Union([Type.Literal("cheap"), Type.Literal("medium"), Type
  */
 const projectSchema = Type.Object({
   version: Type.Literal(1),
-  validator: Type.Object({
+  check: Type.Optional(Type.Object({
     cmd: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
     timeout_s: Type.Optional(Type.Integer({ minimum: 1 })),
     env: Type.Optional(Type.Object({}, { additionalProperties: Type.String({ minLength: 0 }) })),
-  }, { additionalProperties: false }),
-  budget: Type.Optional(Type.Object({
-    tokens: Type.Optional(Type.Integer({ minimum: 1 })),
-    wall_minutes: Type.Optional(Type.Integer({ minimum: 1 })),
-    repairs: Type.Optional(Type.Integer({ minimum: 0 })),
   }, { additionalProperties: false })),
-  models: Type.Object({
-    cheap: ModelName,
-    medium: ModelName,
-    strong: ModelName,
-    explorer: ModelName,
-  }, { additionalProperties: false }),
-  tiers: Type.Object({
-    script: TierName,
-    change: TierName,
-    interface: TierName,
-  }, { additionalProperties: false }),
+  protect: Type.Optional(Type.Object({
+    paths: Type.Array(Type.String({ minLength: 1 })),
+  }, { additionalProperties: false })),
+  explorer: Type.Optional(Type.Object({
+    model: ModelName,
+  }, { additionalProperties: false })),
   observe: Type.Optional(Type.Object({
     versions: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
-/**
- * 可选字段缺省时使用的默认值：验证器超时秒数与三项预算上限；`??` 回退保留显式零值，例如 `repairs: 0`。
- *
- * Defaults applied when the optional fields are omitted: the validator timeout
- * and the three budget ceilings. The `??` fallback keeps explicit falsy values
- * such as `repairs: 0`.
- */
+/** `[check] timeout_s` 缺省值 / Default for `[check] timeout_s`. */
 const DEFAULT_TIMEOUT_S = 600;
-const DEFAULT_REPAIRS = 3;
-const DEFAULT_TOKENS = 2_000_000;
-const DEFAULT_WALL_MINUTES = 90;
 
 /**
- * 读取并校验 `.cw/project.toml`，返回补全默认值后的 `ProjectConfig`。
+ * 读取 `repo/.cw/project.toml`；文件不存在时返回 null（扩展保持被动），存在但不可读或非法时抛错。
  *
- * Reads and validates `.cw/project.toml`, returning a `ProjectConfig` with
- * every optional field filled in. The file is parsed as TOML, checked against
- * `projectSchema` (unknown keys are rejected), then narrowed to the config
- * shape; unreadable files and parse failures surface as one
- * `project.toml: <reason>` error.
+ * Reads `repo/.cw/project.toml`: a missing file yields null (the extension
+ * stays passive), while an unreadable or invalid file throws.
  *
- * @param path - `.cw/project.toml` 的绝对路径 / Absolute path of `.cw/project.toml`.
- * @returns 可选字段已补齐的配置 / The config with defaults filled in.
- * @throws 文件不可读或不符合 schema 时 / When the file is unreadable or fails schema validation.
+ * @param repo - 仓库根 / Repository root.
+ * @returns 补全默认值的配置，或 `null` / The config with defaults filled in, or `null`.
+ * @throws 文件存在但不可读、TOML 解析失败或不符合 schema 时 / When the file exists but is unreadable, unparsable, or invalid.
  */
-export async function readProjectConfig(path: string): Promise<ProjectConfig> {
+export async function loadProjectConfig(repo: string): Promise<ProjectConfig | null> {
+  let text: string;
+  try {
+    text = await readFile(path.join(repo, ".cw", "project.toml"), "utf8");
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw new Error(`project.toml: ${error instanceof Error ? error.message : "unreadable"}`);
+  }
+  return parseProjectConfig(text);
+}
+
+/**
+ * 解析并校验 project.toml 文本；受保护路径在这里就被规范化，非法路径在加载时就失败，而不是在拦截时静默失效。
+ *
+ * Parses and validates project.toml text. Protected paths are normalized here,
+ * so an invalid path fails at load time instead of silently disabling the
+ * guard later.
+ */
+function parseProjectConfig(text: string): ProjectConfig {
   let parsed: unknown;
   try {
-    parsed = parse(await readFile(path, "utf8"));
+    parsed = parse(text);
   } catch (error) {
-    throw new Error(`project.toml: ${error instanceof Error ? error.message : "unreadable"}`);
+    throw new Error(`project.toml: ${error instanceof Error ? error.message : "unparsable"}`);
   }
   rejectUnknown(projectSchema, parsed, "project.toml");
   const value = parsed as {
-    validator: { cmd: string[]; timeout_s?: number; env?: Record<string, string> };
-    budget?: { tokens?: number; wall_minutes?: number; repairs?: number };
-    models: ProjectConfig["models"];
-    tiers: ProjectConfig["tiers"];
+    check?: { cmd: string[]; timeout_s?: number; env?: Record<string, string> };
+    protect?: { paths: string[] };
+    explorer?: { model: string };
     observe?: { versions?: string[] };
   };
   return {
     version: 1,
-    validator: {
-      cmd: value.validator.cmd,
-      timeout_s: value.validator.timeout_s ?? DEFAULT_TIMEOUT_S,
-      env: value.validator.env ?? {},
+    check: value.check === undefined ? null : {
+      cmd: value.check.cmd,
+      timeout_s: value.check.timeout_s ?? DEFAULT_TIMEOUT_S,
+      env: value.check.env ?? {},
     },
-    budget: {
-      tokens: value.budget?.tokens ?? DEFAULT_TOKENS,
-      wall_minutes: value.budget?.wall_minutes ?? DEFAULT_WALL_MINUTES,
-      repairs: value.budget?.repairs ?? DEFAULT_REPAIRS,
-    },
-    models: value.models,
-    tiers: value.tiers,
+    protect: { paths: (value.protect?.paths ?? []).map(normalizeProtectedPath) },
+    explorer: value.explorer ?? null,
     observe: { versions: value.observe?.versions ?? [] },
   };
 }
 
 /**
- * 任务档位 `tier` 实际运行的 `provider/model` 模型名，按 `[tiers]` → `[models]` 映射。
+ * 规范化一条受保护路径：去掉 `./` 前缀与结尾 `/`，拒绝空路径、通配符、`..`/绝对路径与 `.cw` 下的路径。
  *
- * The `provider/model` string a task of `tier` runs on, per `[tiers]` → `[models]`.
+ * Normalizes one protected path: strips a `./` prefix and trailing slashes,
+ * and rejects empty paths, glob wildcards, `..` or absolute paths, and
+ * anything under `.cw` (the harness owns that directory).
+ *
+ * @throws 路径不合法时，消息以 `project.toml:` 开头 / When the path is invalid; the message starts with `project.toml:`.
  */
-export function tierModel(project: ProjectConfig, tier: Tier): string {
-  return project.models[project.tiers[tier]];
+function normalizeProtectedPath(value: string): string {
+  let normalized = value;
+  while (normalized.startsWith("./")) normalized = normalized.slice(2);
+  while (normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  if (normalized === "") throw new Error(`project.toml: protect.paths 为空路径 ${value}`);
+  if (normalized.includes("*")) throw new Error(`project.toml: protect.paths 不支持通配符 ${value}`);
+  try {
+    relativeParts(normalized);
+  } catch (error) {
+    throw new Error(`project.toml: protect.paths 非法路径 ${value}（${
+      error instanceof Error ? error.message : "无效"}）`);
+  }
+  if (normalized === ".cw" || normalized.startsWith(".cw/")) {
+    throw new Error(`project.toml: protect.paths 不接受 .cw 下的路径 ${value}`);
+  }
+  return normalized;
 }

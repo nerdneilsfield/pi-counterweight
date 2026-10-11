@@ -10,14 +10,14 @@
  * still leaves a complete record behind.
  */
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, open, lstat, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { readProjectConfig } from "../core/config.js";
+import { loadProjectConfig } from "../core/config.js";
 import { headCommit, repoToplevel, treeHash } from "../core/gitstate.js";
-import { runValidatorProcess } from "../core/runner.js";
+import { runProcess } from "../core/process.js";
 
 /** 仓库里保留的 stdout/stderr 尾部行数 / Trailing stdout/stderr lines kept in the repo. */
 export const TAIL_LINES = 200;
@@ -231,7 +231,7 @@ export async function recordObservation(options: {
   await writeObservationRecord(dir, record);
   const scratch = await mkdtemp(path.join(tmpdir(), "cw-observe-"));
   try {
-    const outcome = await runValidatorProcess({
+    const outcome = await runProcess({
       cwd,
       cmd: options.command,
       env: { ...process.env },
@@ -287,13 +287,8 @@ async function gitSummary(cwd: string): Promise<GitSummary> {
  * `[observe] versions` commands from `.cw/project.toml`; missing file means none.
  */
 async function probeConfiguredVersions(cwd: string): Promise<VersionProbe[]> {
-  const file = path.join(cwd, ".cw", "project.toml");
-  try {
-    await lstat(file);
-  } catch {
-    return [];
-  }
-  const project = await readProjectConfig(file);
+  const project = await loadProjectConfig(cwd);
+  if (project === null) return [];
   return Promise.all(project.observe.versions.map((command) => probeVersion(command, cwd)));
 }
 
