@@ -46,6 +46,22 @@ if (mode === "answer") {
   process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r2", toolName: "grep", args: { pattern: "x", path: "../outside" } })}\n`);
   process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r3", toolName: "read", args: { path: "tests/a.py" } })}\n`);
   emit(message("stop", text));
+} else if (mode === "readvariant") {
+  // 直引号文件名不存在，弯引号同名文件才存在。read 会改用变体，grep 不会。
+  // The straight-quote name is missing; only the curly-quote file exists.
+  const quoted = process.env.CW_FAKE_VARIANT ?? "capture'secret.txt";
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: quoted } })}\n`);
+  emit(message("stop", text));
+} else if (mode === "grepvariant") {
+  const quoted = process.env.CW_FAKE_VARIANT ?? "capture'secret.txt";
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "g1", toolName: "grep", args: { pattern: "x", path: quoted } })}\n`);
+  emit(message("stop", text));
+} else if (mode === "readat") {
+  // `@` 前缀的绝对路径：pi 读工具会去掉 `@` 后打开，审计必须同样去掉。
+  // An `@`-prefixed absolute path: pi's read tool strips `@` before opening.
+  const outside = process.env.CW_FAKE_OUTSIDE ?? "/etc/hosts";
+  process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: `@${outside}` } })}\n`);
+  emit(message("stop", text));
 } else if (mode === "readlink") {
   // 读符号链接 link.py：链接逃逸检测。 / Reads the symlink link.py: link-escape detection.
   process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "link.py" } })}\n`);

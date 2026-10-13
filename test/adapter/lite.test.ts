@@ -1,10 +1,11 @@
 /**
- * 轻量适配层测试：结算检查（跳过/通过/反馈一次/如实结束）、受保护路径拦截（含别名与悬空链接）、
- * 受保护文件变化报告、usage 记账与 shutdown 回收。
+ * 轻量适配层测试：结算检查（每次完成都跑、通过/反馈一次/如实结束）、受保护路径拦截
+ * （含目录链接下的缺失叶子、外指链接与悬空链接）、usage 记账与 shutdown 回收。
  *
- * Lite adapter tests: the settle check (skip/pass/one-feedback/final report),
- * protected-path interception (aliases and dangling links included), the
- * protected-change report, usage metering, and shutdown reaping.
+ * Lite adapter tests: the settle check (every completed turn, pass/one-feedback/
+ * final report), protected-path interception (a missing leaf under a directory
+ * link, an outward link, and a dangling link), usage metering, and shutdown
+ * reaping.
  */
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
@@ -94,7 +95,7 @@ cmd = ["/bin/sh", "-c", "test -f fixed.txt"]
 timeout_s = 5
 
 [protect]
-paths = ["tests"]
+paths = ["tests", "guard file.txt"]
 `;
 
 const start = (fake: Fake) => fake.handlers.get("session_start")!({}, fake.ctx);
@@ -105,71 +106,53 @@ const toolCall = (fake: Fake, toolName: string, input: Record<string, unknown>) 
   fake.handlers.get("tool_call")!({ toolName, input, toolCallId: "t1" }, fake.ctx) as
     Promise<{ block?: boolean; reason?: string } | undefined>;
 
-// 改动工作树里的一个文件，制造“自上次检查以来的变化”。
-// Writes one file so the worktree differs from the last check.
-const bump = (repo: string, n: number) => writeFile(path.join(repo, `bump-${n}.txt`), `${n}\n`);
-
 // 取最后一条追加文本（检查报告）。
 const lastText = (result: { entries: Array<{ content: string }> }): string =>
   result.entries[result.entries.length - 1]!.content;
 
-// 结算检查全流程：无变化不跑；通过报一行；失败反馈一次并续跑；第二次失败如实结束。
-// The whole settle flow: no change runs nothing; a pass reports one line; a failure feeds
-// back once and continues; a second failure reports as-is and ends.
-test("结算检查：跳过、通过、反馈一次、第二次失败如实结束", async () => {
+// 结算检查全流程：工作树没变也跑；通过报一行；失败反馈一次并续跑；修复轮仍检查；
+// 第二次失败如实结束。
+// The whole settle flow: an unchanged tree still runs the check; a pass reports
+// one line; a failure feeds back once and continues; the repair round is checked
+// again; a second failure reports as-is and ends.
+test("结算检查：无变化也跑、通过、反馈一次、修复轮仍检查、第二次失败如实结束", async () => {
   const repo = await repoWith(CHECK_TOML, { "tests/a.py": "base\n" });
   try {
     const fake = fakePi(repo);
     await start(fake);
     expect(fake.notifications.some((line) => line.includes("结束检查已启用"))).toBe(true);
 
-    // 没有变化：不跑检查。
-    expect(await settle(fake)).toBeUndefined();
-
     // 第一次失败：事实反馈 + 续跑。
-    await bump(repo, 1);
     const feedback = await settle(fake);
     expect(feedback!.continue).toBe(true);
     expect(lastText(feedback!)).toContain("结束检查未通过");
     expect(lastText(feedback!)).toContain("退出码 1");
 
-    // 修好（fixed.txt 出现）：通过，不再续跑。
+    // 修复轮：工作树相对上次失败没有再改，检查照样跑，这次通过。
     await writeFile(path.join(repo, "fixed.txt"), "ok\n");
-    await bump(repo, 2);
     const passed = await settle(fake);
     expect(passed!.continue).toBeUndefined();
     expect(lastText(passed!)).toContain("结束检查通过");
 
-    // 通过后无变化：跳过。
-    expect(await settle(fake)).toBeUndefined();
+    // 通过后再结算一次：没有新的用户回合，工作树也没变，检查仍然执行。
+    const again = await settle(fake);
+    expect(again!.continue).toBeUndefined();
+    expect(lastText(again!)).toContain("结束检查通过");
 
-    // 再次失败：第一次反馈后仍旧失败，如实报告并结束（不再重试）。
+    // 通过不归还额度：同一用户回合里再次失败直接如实结束。
     await rm(path.join(repo, "fixed.txt"));
-    await bump(repo, 3);
     const retry = await settle(fake);
-    expect(retry!.continue).toBe(true);
-    await bump(repo, 4);
+    expect(retry!.continue).toBeUndefined();
+    expect(lastText(retry!)).toContain("不再自动重试");
+
+    // 新的用户回合恢复额度后，第一次失败才再次续跑。
+    await fake.handlers.get("before_agent_start")!({}, fake.ctx);
+    const renewed = await settle(fake);
+    expect(renewed!.continue).toBe(true);
     const final = await settle(fake);
     expect(final!.continue).toBeUndefined();
     expect(lastText(final!)).toContain("未通过");
     expect(lastText(final!)).toContain("不再自动重试");
-  } finally {
-    await rm(repo, { recursive: true, force: true });
-  }
-}, 30_000);
-
-// 受保护文件被 bash 等旁路修改：结算时如实报告一行，不拦截、不还原。
-// A protected file changed outside edit/write: reported as a fact at settle, never blocked or reverted.
-test("受保护文件的变化在结算时被报告", async () => {
-  const repo = await repoWith(CHECK_TOML, { "tests/a.py": "base\n" });
-  try {
-    const fake = fakePi(repo);
-    await start(fake);
-    await writeFile(path.join(repo, "tests", "a.py"), "tampered\n");
-    await bump(repo, 1);
-    const result = await settle(fake);
-    expect(lastText(result!)).toContain("受保护文件发生变化：tests/a.py");
-    expect(await readFile(path.join(repo, "tests", "a.py"), "utf8")).toBe("tampered\n");
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
@@ -188,6 +171,16 @@ test("tool_call 拦截受保护目标", async () => {
     expect(blocked!.reason).toContain("受保护路径");
 
     expect(await toolCall(fake, "write", { path: "src/new.ts" })).toBeUndefined();
+
+    // pi 写入工具会去掉 @、把 Unicode 空格折成普通空格、展开 file://，这些都命中同一个受保护文件。
+    await writeFile(path.join(repo, "guard file.txt"), "secret\n");
+    const atPrefixed = await toolCall(fake, "write", { path: "@guard file.txt" });
+    expect(atPrefixed!.block).toBe(true);
+    expect(atPrefixed!.reason).toContain("guard file.txt");
+    const nbsp = await toolCall(fake, "edit", { path: "guard\u00A0file.txt" });
+    expect(nbsp!.block).toBe(true);
+    const fileUrl = await toolCall(fake, "write", { path: `file://${path.join(repo, "guard file.txt")}` });
+    expect(fileUrl!.block).toBe(true);
     expect(await toolCall(fake, "read", { path: "tests/a.py" })).toBeUndefined();
 
     // 词法上在保护集合之外的别名，解析后指向受保护文件。
@@ -202,6 +195,29 @@ test("tool_call 拦截受保护目标", async () => {
     expect(dangling!.block).toBe(true);
     expect(dangling!.reason).toContain("符号链接");
 
+    // 目录链接下尚不存在的叶子：alias -> tests，写入 alias/new.ts 等于写入受保护的 tests/new.ts。
+    await symlink("tests", path.join(repo, "alias"));
+    const missingLeaf = await toolCall(fake, "write", { path: "alias/new.ts" });
+    expect(missingLeaf!.block).toBe(true);
+    expect(missingLeaf!.reason).toContain("tests/new.ts");
+
+    // 指向仓库根的目录链接：缺失的中间目录与叶子都要落到受保护路径，不能拼成绝对路径后漏判。
+    await symlink(".", path.join(repo, "rootlink"));
+    const throughRoot = await toolCall(fake, "write", { path: "rootlink/tests/new.ts" });
+    expect(throughRoot!.block).toBe(true);
+    expect(throughRoot!.reason).toContain("tests/new.ts");
+
+    // 指向仓库外的目录链接：缺失叶子不能借此逃出仓库。
+    const outsideDir = await mkdtemp(path.join(tmpdir(), "cw-lite-out-"));
+    try {
+      await symlink(outsideDir, path.join(repo, "outlink"));
+      const escaped = await toolCall(fake, "write", { path: "outlink/gone.ts" });
+      expect(escaped!.block).toBe(true);
+      expect(escaped!.reason).toContain("无法核对");
+    } finally {
+      await rm(outsideDir, { recursive: true, force: true });
+    }
+
     // 仓库之外的路径无法核对。
     const outside = await toolCall(fake, "edit", { path: "/etc/hosts" });
     expect(outside!.block).toBe(true);
@@ -211,31 +227,113 @@ test("tool_call 拦截受保护目标", async () => {
   }
 }, 30_000);
 
-// `.cw/project.toml` 是 harness 的控制面：没有配置文件时也不能被模型写入。
-// `.cw/project.toml` is the harness control file: even without a config the model cannot write it.
-test("没有配置文件时仍拦截 .cw/project.toml，其余读写放行", async () => {
-  const repo = await repoWith(null);
-  try {
-    const fake = fakePi(repo);
-    await start(fake);
-    const blocked = await toolCall(fake, "write", { path: ".cw/project.toml" });
-    expect(blocked!.block).toBe(true);
-    expect(await toolCall(fake, "edit", { path: "src/app.ts" })).toBeUndefined();
-  } finally {
-    await rm(repo, { recursive: true, force: true });
-  }
-}, 30_000);
-
-// 没有配置：结算与写入保护完全被动，但 usage 仍然记账。
-// Without a config the settle check and the write guard stay passive; usage is still metered.
+// 没有配置：结算不跑检查，写入（含配置文件与仓库外路径）全部放行；usage 仍然记账。
+// Without a config the settle check stays idle and every write passes, including
+// the config file and paths outside the repo; usage is still metered.
 test("没有配置时结算与保护完全被动", async () => {
   const repo = await repoWith(null, { "src/app.ts": "x\n" });
   try {
     const fake = fakePi(repo);
     await start(fake);
-    await bump(repo, 1);
     expect(await settle(fake)).toBeUndefined();
     expect(await toolCall(fake, "edit", { path: "src/app.ts" })).toBeUndefined();
+    expect(await toolCall(fake, "write", { path: ".cw/project.toml" })).toBeUndefined();
+    expect(await toolCall(fake, "write", { path: "/etc/hosts" })).toBeUndefined();
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+}, 30_000);
+
+// 配置非法：通知错误，但工具调用不受影响，也不为了拦截去创建 `.cw/project.toml`。
+// An invalid config reports the error and leaves tool calls alone; it does not
+// create `.cw/project.toml` just to block it.
+test("配置非法时不拦截工具调用", async () => {
+  const repo = await repoWith("version = 1\nunknown = true\n");
+  try {
+    const fake = fakePi(repo);
+    await start(fake);
+    expect(fake.notifications.some((line) => line.includes("配置加载失败"))).toBe(true);
+    expect(await settle(fake)).toBeUndefined();
+    expect(await toolCall(fake, "write", { path: ".cw/project.toml" })).toBeUndefined();
+    expect(await toolCall(fake, "edit", { path: "/tmp/outside.txt" })).toBeUndefined();
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+}, 30_000);
+
+// 初始化预算耗尽时，已经赋上的配置必须清掉，否则回退说了“不拦截”实际仍在拦截。
+// An exhausted startup budget clears a config assigned before the fallback, so
+// the "not intercepting" notice matches what tool calls actually do.
+test("会话初始化超时后不保留已加载的配置", async () => {
+  const repo = await repoWith(CHECK_TOML, { "tests/a.py": "base\n" });
+  try {
+    const fake = fakePi(repo, { sessionStartMs: 1 });
+    await start(fake);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fake.notifications.some((line) => line.includes("未能在时限内完成"))).toBe(true);
+    expect(await settle(fake)).toBeUndefined();
+    expect(await toolCall(fake, "write", { path: "tests/a.py" })).toBeUndefined();
+    expect(await toolCall(fake, "write", { path: ".cw/project.toml" })).toBeUndefined();
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+}, 30_000);
+
+// 一次失败链只反馈一次：连续三次失败结算是继续、结束、结束。新的用户回合恢复额度。
+// One feedback per failing chain: three consecutive failed settles continue,
+// then end, then end. A new user turn restores the allowance.
+test("连续三次失败只反馈一次，新用户回合恢复额度", async () => {
+  const repo = await repoWith(CHECK_TOML);
+  try {
+    const fake = fakePi(repo);
+    await start(fake);
+    const first = await settle(fake);
+    const second = await settle(fake);
+    const third = await settle(fake);
+    expect([first!.continue, second!.continue, third!.continue]).toEqual([true, undefined, undefined]);
+    expect(lastText(third!)).toContain("不再自动重试");
+
+    await fake.handlers.get("before_agent_start")!({}, fake.ctx);
+    const renewed = await settle(fake);
+    expect(renewed!.continue).toBe(true);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+}, 30_000);
+
+// 在仓库子目录启动：读根上的配置，检查在根上跑，相对路径按 cwd 解析后再和根比较。
+// Starting in a repo subdirectory loads the root config, runs the check at the
+// root, and resolves relative paths against cwd before comparing with the root.
+test("子目录启动使用仓库根", async () => {
+  const repo = await repoWith(CHECK_TOML, { "tests/a.py": "base\n", "pkg/app.ts": "x\n" });
+  const sub = path.join(repo, "pkg");
+  try {
+    const fake = fakePi(sub);
+    await start(fake);
+    expect(fake.notifications.some((line) => line.includes("结束检查已启用"))).toBe(true);
+
+    // 相对 cwd 的 app.ts 是 pkg/app.ts，不在保护集合里。
+    expect(await toolCall(fake, "edit", { path: "app.ts" })).toBeUndefined();
+    // 从子目录回到受保护路径，以及根上的配置文件，仍然拦截。
+    const tests = await toolCall(fake, "write", { path: "../tests/a.py" });
+    expect(tests!.block).toBe(true);
+    expect(tests!.reason).toContain("受保护路径");
+    const config = await toolCall(fake, "write", { path: "../.cw/project.toml" });
+    expect(config!.block).toBe(true);
+
+    // 检查命令 `test -f fixed.txt` 以仓库根为 cwd：根上出现该文件即通过。
+    await writeFile(path.join(repo, "fixed.txt"), "ok\n");
+    const result = await settle(fake);
+    expect(lastText(result!)).toContain("结束检查通过");
+
+    await fake.handlers.get("message_end")!({
+      message: {
+        role: "assistant", model: "g/medium",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } },
+      },
+    }, fake.ctx);
+    const meter = await readFile(path.join(repo, ".cw", "meter.jsonl"), "utf8");
+    expect(meter).toContain("\"kind\":\"usage\"");
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
@@ -278,7 +376,6 @@ timeout_s = 60
   try {
     const fake = fakePi(repo);
     await start(fake);
-    await bump(repo, 1);
     const pending = settle(fake);
     // 等检查子进程真正起来（ps 里能看到标记 sleep）。
     for (let waited = 0; waited < 5_000; waited += 25) {
@@ -307,7 +404,6 @@ timeout_s = 1
   try {
     const fake = fakePi(repo);
     await start(fake);
-    await bump(repo, 1);
     const result = await settle(fake);
     const text = lastText(result!);
     expect(text).toContain("结束检查超时");
@@ -329,7 +425,6 @@ timeout_s = 1
   try {
     const fake = fakePi(repo, { checkMarginMs: 0 });
     await start(fake);
-    await bump(repo, 1);
     const result = await settle(fake);
     expect(lastText(result!)).toMatch(/结束检查(超时|未能完成)/);
     expect(lastText(result!)).not.toContain("通过");

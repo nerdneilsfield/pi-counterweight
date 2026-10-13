@@ -101,20 +101,19 @@ export function checkPassed(outcome: CheckOutcome): boolean {
 
 /**
  * 把一次检查渲染成只含事实的一段文本：命令、退出码（或超时/信号/启动失败）、耗时、两条输出流的
- * 有界尾部，以及受保护文件的变化。不写建议、不猜原因。
+ * 有界尾部。不写建议、不猜原因。
  *
  * Renders one check as a facts-only block: the command, the exit code (or the
- * timeout/signal/launch failure), the duration, bounded tails of both streams,
- * and any protected-file changes. No advice, no guessed cause.
+ * timeout/signal/launch failure), the duration, and bounded tails of both
+ * streams. No advice, no guessed cause.
  *
  * @param outcome - 本次检查的事实 / The check's facts.
- * @param options - 命令原文、是否最后一次自动检查、受保护文件变化（null 表示无法核对）。
+ * @param options - 命令原文、是否最后一次自动检查。
  * @returns 供会话追加的文本 / The text to append to the session.
  */
 export function renderCheckReport(outcome: CheckOutcome, options: {
   command: string;
   final: boolean;
-  protectedChanged: string[] | null;
 }): string {
   const seconds = (outcome.durationMs / 1000).toFixed(1);
   const lines: string[] = [];
@@ -132,13 +131,6 @@ export function renderCheckReport(outcome: CheckOutcome, options: {
   }
   appendTail(lines, "标准输出", outcome.stdoutTail, outcome.stdoutTruncated);
   appendTail(lines, "标准错误", outcome.stderrTail, outcome.stderrTruncated);
-  if (options.protectedChanged === null) {
-    lines.push("受保护文件无法核对：内容快照不可用。");
-  } else if (options.protectedChanged.length > 0) {
-    const shown = options.protectedChanged.slice(0, 20);
-    const rest = options.protectedChanged.length - shown.length;
-    lines.push(`受保护文件发生变化：${shown.join(", ")}${rest > 0 ? `（其余 ${rest} 个略）` : ""}`);
-  }
   return lines.join("\n");
 }
 

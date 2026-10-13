@@ -1,10 +1,10 @@
 /**
  * cw_explore（轻量版）测试：钉住子进程 CLI 参数、答案后处理（30 行上限、path:line 标注）、
- * 读路径逃逸拒答、超时/取消语义、树变化不可信标记与 token 记账。
+ * 读路径逃逸拒答、超时/取消语义、计量失败不丢答案与 token 记账。
  *
  * `cw_explore` (lite) tests: the subprocess CLI contract, answer post-processing
  * (30-line cap, `path:line` annotation), read-path escape withholding,
- * timeout/cancel semantics, tree-movement untrusted marking, and token
+ * timeout/cancel semantics, a meter failure that keeps the answer, and token
  * accounting into `.cw/meter.jsonl`.
  */
 import { spawn } from "node:child_process";
@@ -87,6 +87,7 @@ async function setup(options: {
   } as unknown as ExtensionAPI;
   registerTools(pi, {
     getProject: () => project,
+    getRepo: () => repo,
     explorerCliPath: fakeCli,
     explorerTimeoutMs: options.timeoutMs,
   });
@@ -258,6 +259,68 @@ test("探索者读取工作树之外的路径：回答不予采信，usage 仍�
   }
 }, 20_000);
 
+// pi 读工具会去掉前导 `@` 再打开，所以 `@` + 仓库外绝对路径必须整条拒答。
+// Pi's read tool strips a leading `@` before opening, so `@` plus an absolute
+// path outside the repo withholds the whole answer.
+test("探索者以 @ 前缀读取仓库外绝对路径：回答不予采信", async () => {
+  const outside = path.join(tmpdir(), `cw-explore-at-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+  await writeFile(outside, "outside\n");
+  process.env.CW_FAKE_OUTSIDE = outside;
+  const harness = await setup({
+    mode: "readat",
+    text: "结论甲 leaked:1",
+    usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3 },
+  });
+  try {
+    const result = await run(harness, "q");
+    expect(result).toContain("未返回结果");
+    expect(result).toContain("读取了工作树之外的路径");
+    expect(result).toContain(outside);
+    expect(result).not.toContain("结论甲");
+    const events = (await meterLines(harness.repo)).filter((line) => line.kind === "event"
+      && line.event === "explore");
+    expect(events.at(-1)!.detail).toMatchObject({ outcome: "failed", escaped_reads: 1 });
+  } finally {
+    delete process.env.CW_FAKE_OUTSIDE;
+    await rm(outside, { force: true });
+    await harness.cleanup();
+  }
+}, 20_000);
+
+// 直引号文件名不存在，弯引号同名符号链接指向仓库外。read 会打开变体所以拒答；
+// grep 不做文件名变体，缺失路径不是逃逸。
+// The straight-quote name is missing; the curly-quote symlink points outside.
+// read opens the variant and is withheld; grep tries no variant, so a missing
+// path is not an escape.
+test("read 采用弯引号变体并拒答，grep 对同一缺失路径不判逃逸", async () => {
+  const outside = await mkdtemp(path.join(tmpdir(), "cw-explore-variant-"));
+  const straight = "capture'secret.txt";
+  const curly = "capture\u2019secret.txt";
+  process.env.CW_FAKE_VARIANT = straight;
+  const readHarness = await setup({ mode: "readvariant", text: "未找到" });
+  const grepHarness = await setup({ mode: "grepvariant", text: "未找到" });
+  try {
+    await symlink(outside, path.join(readHarness.repo, curly));
+    await symlink(outside, path.join(grepHarness.repo, curly));
+    process.env.CW_FAKE_EXPLORE = "readvariant";
+    process.env.CW_FAKE_VARIANT = straight;
+    const readResult = await run(readHarness, "q");
+    expect(readResult).toContain("未返回结果");
+    expect(readResult).toContain("读取了工作树之外的路径");
+    expect(readResult).not.toContain("未找到");
+    process.env.CW_FAKE_EXPLORE = "grepvariant";
+    process.env.CW_FAKE_VARIANT = straight;
+    const grepResult = await run(grepHarness, "q");
+    expect(grepResult).toContain("未找到");
+    expect(grepResult).not.toContain("读取了工作树之外的路径");
+  } finally {
+    delete process.env.CW_FAKE_VARIANT;
+    await rm(outside, { recursive: true, force: true });
+    await readHarness.cleanup();
+    await grepHarness.cleanup();
+  }
+}, 20_000);
+
 // 词法上仍在树内的符号链接出口同样按逃逸处理（realpath 复核）。
 // An in-repo symlink whose target escapes is still an escape (realpath re-check).
 test("仓内符号链接指向仓外同样是读路径逃逸", async () => {
@@ -399,17 +462,21 @@ test("先输出完整回答后被取消：回答不被接受，usage 仍记账",
   }
 }, 30_000);
 
-// 树哈希在运行期间移动 → 头部标注“不可信”；探索者的写入留在原地不还原。
-// A moved tree hash marks the answer untrusted; the explorer's writes stay in place.
-test("子进程修改文件树时结果被标注为不可信，且改动不被还原", async () => {
-  const harness = await setup({ mode: "writetree", text: "结论甲 tests/a.py:1" });
+// 计量目录被换成符号链接：已经拿到的回答仍然返回，并说明用量没写上。
+// A symlinked meter directory keeps the answer already in hand and says the
+// usage was not recorded.
+test("计量写入失败时仍返回已获得的回答", async () => {
+  const harness = await setup({ mode: "answer", text: "结论甲 tests/a.py:1" });
+  const elsewhere = await mkdtemp(path.join(tmpdir(), "cw-meter-"));
   try {
+    await rm(path.join(harness.repo, ".cw"), { recursive: true, force: true });
+    await symlink(elsewhere, path.join(harness.repo, ".cw"));
     const result = await run(harness, "q");
-    expect(result).toContain("仓库树发生变化");
-    expect(result).toContain("不可信");
     expect(result).toContain("结论甲 tests/a.py:1");
-    expect(existsSync(path.join(harness.repo, "explorer-wrote.txt"))).toBe(true);
+    expect(result).toContain("用量未能写入计量");
+    expect(result).not.toContain("不可信");
   } finally {
+    await rm(elsewhere, { recursive: true, force: true });
     await harness.cleanup();
   }
 }, 20_000);

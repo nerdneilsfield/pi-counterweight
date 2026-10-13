@@ -12,7 +12,7 @@ import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { pathInside } from "../core/paths.js";
+import { pathInside, resolvePiReadPath, resolvePiToolPath } from "../core/paths.js";
 import { runProcess } from "../core/process.js";
 
 /**
@@ -402,7 +402,7 @@ async function readEscapes(
     const value = (call.args as { path?: unknown } | null)?.path;
     if (typeof value !== "string" || value === "") continue;
     try {
-      await assertReadInside(root, value);
+      await assertToolInside(root, call.toolName, value);
     } catch (error) {
       escaped.push(error instanceof Error && error.message !== "" ? `${value}（${error.message}）` : value);
     }
@@ -411,19 +411,23 @@ async function readEscapes(
 }
 
 /**
- * 校验一个 read/grep 路径参数没有跑出 `root`：先做字符串判定，再用 realpath 判定
- * 符号链接；目标不存在直接放行——不存在的目标读不到任何东西。
+ * 校验一个 read/grep 路径参数没有跑出 `root`。`read` 按 pi 1.0.0 的 `resolveReadPathAsync`
+ * 解析（含命中现存文件才采用的截图/NFD/弯引号变体）；`grep` 只按 `resolveToCwd`，不做这些变体。
+ * 之后两者都用 realpath 判定符号链接。目标不存在直接放行——不存在的目标读不到任何东西。
  *
- * Verify that one read/grep path argument stays inside `root`: a lexical check
- * first, then a realpath check for symlinks. A missing target passes because
- * nothing could have been read from it.
+ * Verify that one read/grep path argument stays inside `root`. `read` resolves
+ * like pi 1.0.0's `resolveReadPathAsync`, adopting a filename variant only when
+ * that file exists; `grep` uses `resolveToCwd` and tries no variants. Both then
+ * check the realpath for symlinks. A missing target passes because nothing
+ * could have been read from it.
  *
- * @param root - 已 realpath 的工作树根 / The realpathed working-tree root.
+ * @param root - 已 realpath 的工作树根，也是子进程 cwd / The realpathed working-tree root, also the subprocess cwd.
+ * @param toolName - `read` 或 `grep` / `read` or `grep`.
  * @param raw - 子进程上报的原始路径参数 / The raw path argument from the subprocess.
  * @throws 参数（含经符号链接解析后）落在工作树之外时 / When the argument resolves outside `root`.
  */
-async function assertReadInside(root: string, raw: string): Promise<void> {
-  const absolute = path.isAbsolute(raw) ? raw : path.resolve(root, raw);
+async function assertToolInside(root: string, toolName: string, raw: string): Promise<void> {
+  const absolute = toolName === "read" ? await resolvePiReadPath(raw, root) : resolvePiToolPath(raw, root);
   const relative = path.relative(root, absolute);
   if (relative !== "" && (relative.startsWith("..") || path.isAbsolute(relative))) {
     throw new Error("路径在工作树之外");

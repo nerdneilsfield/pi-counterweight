@@ -3,17 +3,18 @@
  * agent_before_settle、message_end、session_shutdown），把 pi 事件翻译成 core 调用，再把结论
  * 翻译回 pi 的返回值。没有任务、没有契约、没有批准流程：装上之后，pi 收到任务就直接干活。
  *
- * 行为只在配置了 `.cw/project.toml` 时生效：`[check]` 配了结束检查，每轮结束跑一次、失败反馈一次；
- * `[protect]` 配了受保护路径，`edit`/`write` 直接拦截、结算时如实报告变化。没有配置就完全被动。
+ * 行为只在配置了 `.cw/project.toml` 时生效：`[check]` 配了结束检查，每轮正常结束都跑一次、失败反馈一次；
+ * `[protect]` 配了受保护路径，`edit`/`write` 直接拦截。没有配置、或配置非法时，工具调用完全放行。
+ * assistant 用量仍会记入仓库根的 `.cw/meter.jsonl`。
  *
  * Counterweight's pi extension entry (lite): five event handlers that translate
  * pi events into core calls and back. No tasks, no contracts, no approval flow —
  * once installed, pi works on the task immediately.
  *
  * Behavior only activates for a configured `.cw/project.toml`: `[check]` runs
- * once per settled turn and feeds a failure back once; `[protect]` blocks
- * direct writes and reports changes at settle time. Without a config the
- * extension is fully passive.
+ * on every completed settle and feeds a failure back once; `[protect]` blocks
+ * direct writes. With no config, or an invalid one, tool calls pass through.
+ * Assistant usage is still appended to the repo root's `.cw/meter.jsonl`.
  */
 import type {
   AgentBeforeSettleEvent,
@@ -27,14 +28,13 @@ import type {
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
-import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
 import { loadProjectConfig, type ProjectConfig } from "../../core/config.js";
-import { treeHash } from "../../core/gitstate.js";
+import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
-import { isNotFound, realpathOr, resolveSymlinkInRepo } from "../../core/paths.js";
-import { changedProtected, isProtected, snapshotProtected } from "../../core/protect.js";
+import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
+import { isProtected } from "../../core/protect.js";
 import { registerTools } from "./tools.js";
 
 /**
@@ -138,8 +138,6 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   const limits: AdapterTimeouts = { ...DEFAULT_TIMEOUTS, ...timeouts };
   let repo: string | null = null;
   let project: ProjectConfig | null = null;
-  let protectedSnapshot: Map<string, string | null> | null = null;
-  let lastCheckTree: string | null = null;
   let repairUsed = false;
   let checkRun: CheckHandle | null = null;
 
@@ -151,14 +149,12 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     }
   };
 
-  // ---- session_start: load config, snapshot the protected set, remember the tree ----
+  // ---- session_start: repo root, then the optional config ----
   pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) =>
     withTimeout(limits.sessionStartMs, async () => {
-      repo = await realpathOr(ctx.cwd);
+      repo = await sessionRoot(ctx.cwd);
       try {
         project = await loadProjectConfig(repo);
-        protectedSnapshot = await snapshotProtected(repo, protectedPatterns(project));
-        lastCheckTree = await currentTree(repo);
         repairUsed = false;
         const check = project?.check ?? null;
         if (check !== null) {
@@ -169,16 +165,21 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         }
       } catch (error) {
         // An unreadable or invalid config never half-arms the harness: report
-        // it and stay passive for this session.
+        // it and leave tool calls alone for this session. The repo root stays,
+        // so usage metering still has somewhere to write.
         project = null;
-        protectedSnapshot = null;
-        lastCheckTree = null;
-        notifyError(ctx, `Counterweight: 配置加载失败，本会话保持被动（${
+        notifyError(ctx, `Counterweight: 配置加载失败，本会话不拦截工具调用（${
           error instanceof Error ? error.message : "未知错误"}）`);
       }
       return undefined;
-    }, () => {
-      notifyError(ctx, "Counterweight: 会话初始化未能在时限内完成，本会话保持被动");
+    }, async () => {
+      // The budget lapsed, possibly after a config had already been assigned.
+      // The root stays for metering; the loaded config does not, or a late
+      // assignment would arm protection the fallback just called passive.
+      project = null;
+      repairUsed = false;
+      if (repo === null) repo = await sessionRoot(ctx.cwd).catch(() => realpathOr(ctx.cwd));
+      notifyError(ctx, "Counterweight: 会话初始化未能在时限内完成，本会话不拦截工具调用");
       return undefined;
     }));
 
@@ -186,10 +187,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) =>
     withTimeout(limits.toolCallMs, async (signal) => {
       const root = repo;
-      if (root === null || signal.aborted) return undefined;
+      if (root === null || project === null || signal.aborted) return undefined;
       const raw = writeToolPath(event);
       if (raw === null) return undefined;
-      return await checkProtectedTarget(root, protectedPatterns(project), raw);
+      return await checkProtectedTarget(root, ctx.cwd, protectedPatterns(project), raw);
     }, () => {
       notifyError(ctx, "Counterweight: 写入保护检查未能在时限内完成，本次调用被拒绝");
       return { block: true, reason: "[counterweight] 保护检查超时或失败，写入被拒绝" };
@@ -211,22 +212,13 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   });
 
   /**
-   * 执行一次结算检查：只在配置了结束检查、本轮正常完成、且工作树自上次检查以来有变化时运行。
+   * 执行一次结算检查：配置了结束检查且本轮正常完成就运行，不看工作树有没有变化。
    * 通过就报一行事实；失败把尾部事实反馈一次并续跑；第二次失败如实报告后结束。
    *
-   * Runs the settle check: only when a check is configured, the turn completed,
-   * and the worktree changed since the last check. A pass reports one line; a
-   * failure feeds the tail facts back once and continues; a second failure is
-   * reported as-is and the turn ends.
-   *
-   * @remarks
-   * 变化判定用树哈希：纯问答轮不跑检查。检查命令自己写出的构建产物不影响下一次判定——检查结束后
-   * 重新记录树哈希。受保护文件的变化只报告、不拦截、不还原。
-   *
-   * Change detection uses the tree hash, so a pure Q&A turn runs no check; the
-   * tree hash is re-recorded after the check so artifacts the command itself
-   * wrote do not count as further changes. Protected-file changes are only
-   * reported.
+   * Runs the settle check whenever a check is configured and the turn completed,
+   * whether or not the worktree changed. A pass reports one line; a failure
+   * feeds the tail facts back once and continues; a second failure is reported
+   * as-is and the turn ends.
    */
   async function runSettle(
     event: AgentBeforeSettleEvent,
@@ -237,8 +229,6 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     const check = project?.check ?? null;
     if (root === null || check === null) return undefined;
     if (event.outcome !== "completed") return undefined;
-    const tree = await currentTree(root);
-    if (tree !== null && lastCheckTree !== null && tree === lastCheckTree) return undefined;
 
     const session = ctx.sessionManager.getSessionId();
     const controller = new AbortController();
@@ -255,8 +245,6 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     link(ctx.signal);
     link(outerSignal);
 
-    const patterns = protectedPatterns(project);
-    const protectedChanged = await changedProtectedOrNull(root, patterns, protectedSnapshot);
     const started = Date.now();
     let outcome: CheckOutcome;
     try {
@@ -272,15 +260,15 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     // fallback). A late cancel stays visible until the process group is gone.
     if (outcome.cancelled) return undefined;
 
-    lastCheckTree = await currentTree(root);
     const passed = checkPassed(outcome);
     const retrying = !passed && !repairUsed;
     const text = renderCheckReport(outcome, {
       command: check.cmd.join(" "),
       final: !passed && repairUsed,
-      protectedChanged,
     });
-    repairUsed = retrying;
+    // Consumed for the rest of this user turn. A pass does not hand the
+    // allowance back; only before_agent_start does.
+    if (retrying) repairUsed = true;
     await recordEvent(root, session, "check", {
       exit_code: outcome.exitCode,
       timed_out: outcome.timedOut,
@@ -288,11 +276,6 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       ms: Date.now() - started,
       outcome: outcome.runnerError !== null ? "spawn_error" : passed ? "passed" : retrying ? "feedback" : "reported",
     });
-    if (protectedChanged !== null && protectedChanged.length > 0) {
-      // The change has been reported; accept the current content as the new
-      // baseline so the same edit is not re-reported on the next check.
-      protectedSnapshot = await snapshotProtected(root, patterns);
-    }
     const result = {
       entries: [...event.entries, {
         type: "custom_message" as const,
@@ -353,6 +336,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
   registerTools(pi, {
     getProject: () => project,
+    getRepo: () => repo,
   });
 
   pi.registerCommand("cw-version", {
@@ -390,34 +374,20 @@ function protectedPatterns(project: ProjectConfig | null): string[] {
 }
 
 /**
- * 当前工作树的树哈希；非 git 或失败时返回 null（调用方按“无法判定变化”处理，照常跑检查）。
+ * 本会话的仓库根：cwd 在 git 工作树内时用工作树根（这样子目录启动仍读根上的配置、检查和计量），
+ * 否则用 cwd 自身的 realpath。
  *
- * Tree hash of the current worktree, or null when git is unavailable or the
- * hash fails — callers then treat "changed" as unknown and run the check.
+ * This session's repo root: the git worktree root when cwd is inside one, so a
+ * session started in a subdirectory still reads the root config, check, and
+ * meter. Otherwise the realpath of cwd itself.
  */
-async function currentTree(root: string): Promise<string | null> {
+async function sessionRoot(cwd: string): Promise<string> {
+  const here = await realpathOr(cwd);
   try {
-    const value = await treeHash(root);
-    return value.supported ? value.value : null;
+    const toplevel = await repoToplevel(here);
+    return toplevel === null ? here : await realpathOr(toplevel);
   } catch {
-    return null;
-  }
-}
-
-/**
- * 与快照对比受保护文件的变化；没有快照或核对失败时返回 null（渲染成「无法核对」）。
- *
- * Protected-file changes against the snapshot, or null when there is no
- * snapshot or the comparison fails (rendered as "cannot verify").
- */
-async function changedProtectedOrNull(
-  root: string, patterns: readonly string[], snapshot: Map<string, string | null> | null,
-): Promise<string[] | null> {
-  if (snapshot === null) return null;
-  try {
-    return await changedProtected(root, patterns, snapshot);
-  } catch {
-    return null;
+    return here;
   }
 }
 
@@ -439,24 +409,25 @@ const UNVERIFIABLE_REASON = (value: string) =>
   `[counterweight] 路径无法核对受保护集合（符号链接逃逸仓库或不可解析），已拒绝：${value}`;
 
 /**
- * 判断写入工具能否碰 `raw`：先查词法路径，对已存在的目标再查解析后的真实路径——指向受保护文件的
- * 别名即使词法名字不在保护集合内也要拦。悬空别名按 fail-closed 拒绝（写入工具会沿链接重建一个无法
- * 核对的目标），只有路径确实不存在（真正的新文件）才放行；映射不到仓库内的路径同样直接拒绝。
+ * 判断写入工具能否碰 `raw`。相对路径先按 pi 的口径对 `cwd` 解析，再和仓库根比较，避免把子目录启动
+ * 误当成根替换。词法命中直接拒绝；否则解析真实路径（缺失叶子沿最近的现存祖先走），指向受保护路径或
+ * 仓库外的别名同样拒绝。只有仓库内、且解析后仍不受保护的新文件才放行。
  *
- * Whether a write tool may touch `raw`. Checks the lexical path and, for
- * existing targets, the fully resolved real path — an alias pointing at a
- * protected file is blocked even though its lexical name is not protected. A
- * dangling alias is fail-closed: the write tool would follow it and recreate an
- * unverifiable target, so only a plain missing path (a genuinely new file)
- * stays writable.
+ * Whether a write tool may touch `raw`. A relative path is resolved against
+ * `cwd` the way pi resolves it, then compared with the repo root, so starting
+ * in a subdirectory is not treated as a naive root substitution. A lexical hit
+ * is refused; otherwise the real path is resolved (a missing leaf walks up to
+ * the nearest existing ancestor) and an alias into a protected path or outside
+ * the repo is refused too. Only a new file that stays unprotected inside the
+ * repo is allowed.
  *
  * @returns `undefined` 表示放行；`{ block: true; reason }` 表示拒绝本次调用 /
  * `undefined` to allow the call, `{ block: true; reason }` to refuse it
  */
 async function checkProtectedTarget(
-  root: string, patterns: readonly string[], raw: string,
+  root: string, cwd: string, patterns: readonly string[], raw: string,
 ): Promise<ToolCallEventResult | undefined> {
-  const lexical = toRepoRelative(root, raw);
+  const lexical = toRepoRelative(root, cwd, raw);
   if (lexical === null) {
     return {
       block: true,
@@ -466,41 +437,28 @@ async function checkProtectedTarget(
   if (isProtected(lexical, patterns)) return { block: true, reason: PROTECTED_REASON(lexical) };
   let resolved: string;
   try {
-    resolved = await resolveSymlinkInRepo(root, lexical);
+    resolved = await resolveWriteTarget(root, lexical);
   } catch (error) {
-    if (!isNotFound(error)) {
-      // Existing target that cannot be resolved inside the repo (symlink
-      // escape) — fail closed rather than allow an unverifiable write.
-      return { block: true, reason: UNVERIFIABLE_REASON(raw) };
-    }
-    const absolute = path.join(root, lexical);
-    let dangling = false;
-    try {
-      dangling = (await lstat(absolute)).isSymbolicLink();
-    } catch {
-      // Nothing exists at the path: a plain new file, judged lexically above.
-    }
-    if (dangling) {
-      return {
-        block: true,
-        reason: `[counterweight] ${raw} 是指向缺失目标的符号链接，写入会沿链接重建无法核对的路径，已拒绝。`,
-      };
-    }
-    return undefined;
+    // Nothing on the path exists: a new file, already judged lexically. A
+    // symlink escape, a dangling link, or a non-directory ancestor cannot be
+    // checked, so the write is refused.
+    if (isNotFound(error)) return undefined;
+    return { block: true, reason: UNVERIFIABLE_REASON(raw) };
   }
-  if (resolved !== lexical && isProtected(resolved, patterns)) {
-    return { block: true, reason: `${PROTECTED_REASON(resolved)}（路径 ${raw} 指向该受保护文件）` };
+  if (isProtected(resolved, patterns)) {
+    const via = resolved === lexical ? "" : `（路径 ${raw} 指向该受保护文件）`;
+    return { block: true, reason: `${PROTECTED_REASON(resolved)}${via}` };
   }
   return undefined;
 }
 
 /**
- * 内置写入工具的文件路径参数：只有 `edit` 与 `write` 会声明要改的路径；bash 等其它改写工作树的
- * 途径不在这里预拦，改由结算时的受保护文件对比报告。
+ * 内置写入工具的文件路径参数：只有 `edit` 与 `write` 会声明要改的路径。bash 等其它改写工作树的
+ * 途径不在这里拦截。
  *
  * File-path inputs of built-in write tools. Only `edit` and `write` declare a
- * path they will modify; bash and other routes to the worktree are covered by
- * the settle-time protected-file comparison instead.
+ * path they will modify. Bash and other routes to the worktree are not
+ * intercepted here.
  */
 function writeToolPath(event: ToolCallEvent): string | null {
   if (event.toolName !== "edit" && event.toolName !== "write") return null;
@@ -509,13 +467,17 @@ function writeToolPath(event: ToolCallEvent): string | null {
 }
 
 /**
- * 词法上的仓库相对路径（分隔符统一成 `/`）；目标落在仓库之外时返回 null。只看词法，不解析符号链接，
- * 真实路径的核对是调用方 `checkProtectedTarget` 的后续步骤。
+ * 仓库相对路径（分隔符统一成 `/`）。先按 pi 1.0.0 写入工具的 `resolveToCwd` 解析（`@` 前缀、
+ * Unicode 空格、`~`、`file://`），再和仓库根比较；目标落在仓库之外时返回 null。符号链接的核对是
+ * 调用方 `checkProtectedTarget` 的后续步骤。
  *
- * Lexical repo-relative form, or null when the target escapes the repository.
+ * Repo-relative form. Resolved the way pi 1.0.0's write tools resolve
+ * (`resolveToCwd`: `@` prefix, Unicode spaces, `~`, `file://`), then compared
+ * with the repo root. Null when the target escapes the repository. Symlink
+ * resolution is the caller's next step.
  */
-function toRepoRelative(repoRoot: string, value: string): string | null {
-  const absolute = path.isAbsolute(value) ? value : path.resolve(repoRoot, value);
+function toRepoRelative(repoRoot: string, cwd: string, value: string): string | null {
+  const absolute = resolvePiToolPath(value, cwd);
   const relative = path.relative(repoRoot, absolute);
   if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
   return relative.split(path.sep).join("/");

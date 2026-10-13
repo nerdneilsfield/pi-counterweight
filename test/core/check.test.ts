@@ -124,28 +124,27 @@ test("外部取消终止进程组", async () => {
 // failure is marked as not retried.
 test("渲染只含事实", async () => {
   const failed = await inTempCheck(["/bin/sh", "-c", "printf 'boom\\n'; exit 1"]);
-  const retry = renderCheckReport(failed, { command: "npm test", final: false, protectedChanged: [] });
+  const retry = renderCheckReport(failed, { command: "npm test", final: false });
   expect(retry).toContain("[counterweight] 结束检查未通过：`npm test` 退出码 1");
   expect(retry).not.toContain("不再自动重试");
   expect(retry).toContain("标准输出（尾部）：\nboom");
   expect(retry).not.toContain("建议");
 
-  const final = renderCheckReport(failed, { command: "npm test", final: true, protectedChanged: ["tests/a.py"] });
+  const final = renderCheckReport(failed, { command: "npm test", final: true });
   expect(final).toContain("不再自动重试");
-  expect(final).toContain("受保护文件发生变化：tests/a.py");
+  expect(final).not.toContain("受保护文件发生变化");
 
   const passed = renderCheckReport(
-    { ...failed, exitCode: 0 }, { command: "npm test", final: false, protectedChanged: null });
+    { ...failed, exitCode: 0 }, { command: "npm test", final: false });
   expect(passed).toContain("结束检查通过");
-  expect(passed).toContain("受保护文件无法核对");
 
   const timeout = renderCheckReport(
-    { ...failed, timedOut: true }, { command: "npm test", final: false, protectedChanged: [] });
+    { ...failed, timedOut: true }, { command: "npm test", final: false });
   expect(timeout).toContain("结束检查超时");
   expect(timeout).toContain("进程组已终止");
 
   const missing = renderCheckReport(
-    { ...failed, runnerError: "spawn npm ENOENT" }, { command: "npm test", final: false, protectedChanged: [] });
+    { ...failed, runnerError: "spawn npm ENOENT" }, { command: "npm test", final: false });
   expect(missing).toContain("结束检查未能启动");
   expect(missing).toContain("spawn npm ENOENT");
 });

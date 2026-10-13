@@ -11,9 +11,7 @@ import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-codi
 import { Type } from "typebox";
 import type { ProjectConfig } from "../../core/config.js";
 import { finalizeExplorerAnswer } from "../../core/explore.js";
-import { treeHash } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
-import { realpathOr } from "../../core/paths.js";
 import { runExplorer } from "../../explorer/run.js";
 
 /**
@@ -32,6 +30,15 @@ export interface ToolRegistration {
    * or it failed to load.
    */
   getProject: () => ProjectConfig | null;
+  /**
+   * 本会话的仓库根（git 工作树根，或非 git 时的 cwd）。探索者、引用校验与计量都用它，
+   * 不另取 `ctx.cwd`，这样子目录启动时路径仍对着仓库根。
+   *
+   * This session's repo root (the git worktree root, or cwd outside git). The
+   * explorer, reference checks, and the meter all use it rather than `ctx.cwd`,
+   * so a session started in a subdirectory still addresses the repo root.
+   */
+  getRepo: () => string | null;
   /**
    * 测试接缝：覆盖探索者 CLI 的发现结果。
    *
@@ -85,27 +92,27 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
       if (model === null) {
         return text("[counterweight] 未配置探索者模型（.cw/project.toml 的 [explorer] model），cw_explore 不可用。");
       }
-      return text(await runExplore(ctx, model, params.question, signal, registration));
+      const repo = registration.getRepo();
+      if (repo === null) {
+        return text("[counterweight] 会话尚未确定仓库根，cw_explore 不可用。");
+      }
+      return text(await runExplore(ctx, repo, model, params.question, signal, registration));
     },
   });
 }
 
 /**
- * 跑一轮探索者：子进程调用前后各取一次树哈希，回答经后处理，用量逐条记入计量；运行期间树哈希发生
- * 变化就给回答打上不可信标记，被改动的文件保持原样。
+ * 跑一轮探索者：回答经后处理，用量逐条记入计量。计量写失败不丢已经拿到的回答，只在文本里说明。
  *
- * One explorer round: tree hashes around the subprocess run, the answer
- * post-processed, usage metered sample by sample; a tree hash that moved
- * across the run marks the answer untrusted, and changed files are left as
- * they are.
+ * One explorer round: the answer is post-processed and usage metered sample by
+ * sample. A meter write failure does not discard an answer already in hand; the
+ * text says so instead.
  */
 async function runExplore(
-  ctx: ExtensionToolContext, model: string, question: string,
+  ctx: ExtensionToolContext, repo: string, model: string, question: string,
   signal: AbortSignal | undefined, registration: ToolRegistration,
 ): Promise<string> {
-  const repo = await realpathOr(ctx.cwd);
   const session = ctx.sessionManager.getSessionId();
-  const before = await treeHash(repo);
   const run = await runExplorer({
     workRoot: repo,
     model,
@@ -114,25 +121,31 @@ async function runExplore(
     cliPath: registration.explorerCliPath,
     timeoutMs: registration.explorerTimeoutMs,
   });
-  const after = await treeHash(repo);
 
   // Usage is accounted no matter how the run ended: the tokens were spent.
+  // A failed append is reported next to the answer, not by throwing it away.
   let spent = 0;
+  let meterError: string | null = null;
   for (const sample of run.usage) {
-    await recordUsage(repo, {
-      time: new Date().toISOString(),
-      session,
-      model,
-      input: sample.input,
-      output: sample.output,
-      cache_read: sample.cacheRead,
-      cache_write: sample.cacheWrite,
-      cost_total: sample.costTotal,
-    });
+    try {
+      await recordUsage(repo, {
+        time: new Date().toISOString(),
+        session,
+        model,
+        input: sample.input,
+        output: sample.output,
+        cache_read: sample.cacheRead,
+        cache_write: sample.cacheWrite,
+        cost_total: sample.costTotal,
+      });
+    } catch (error) {
+      meterError ??= error instanceof Error ? error.message : "未知错误";
+    }
     spent += sample.totalTokens > 0
       ? sample.totalTokens
       : sample.input + sample.output + sample.cacheRead + sample.cacheWrite;
   }
+  const meterNote = meterError === null ? "" : `；用量未能写入计量（${meterError}）`;
 
   if (run.error !== null) {
     await recordEvent(repo, session, "explore", {
@@ -140,38 +153,17 @@ async function runExplore(
       timed_out: run.timedOut, cancelled: run.cancelled,
       escaped_reads: run.escapedReads.length,
     });
-    return `[counterweight] 探索者未返回结果（${run.error}）；本次消耗 ${spent} token。`;
+    return `[counterweight] 探索者未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。`;
   }
   const finalized = await finalizeExplorerAnswer(run.answer!, repo);
-  const untrusted = treeUntrustedReason(before, after);
   await recordEvent(repo, session, "explore", {
     outcome: "answered",
-    trusted: untrusted === null,
     truncated: finalized.truncated,
     invalid_refs: finalized.invalidRefs.length,
     missing_refs: finalized.missingRefs.length,
     tokens: spent,
     timed_out: run.timedOut,
   });
-  const header = `[counterweight] 探索者回答（模型 ${model}，消耗 ${spent} token）`
-    + (untrusted === null ? "" : `；${untrusted}，本次结果不可信`);
+  const header = `[counterweight] 探索者回答（模型 ${model}，消耗 ${spent} token${meterNote}）`;
   return `${header}：\n${finalized.text}`;
-}
-
-/**
- * 探索者不得写入：运行期间树哈希发生变化（或树哈希根本算不出来）就把回答标为不可信。被改动的文件
- * 保持原样，不做回滚。
- *
- * The explorer must not write; a tree hash that moved across the run (or a tree
- * hash that cannot be computed at all) marks the answer untrusted. The changed
- * files are left as they are.
- */
-function treeUntrustedReason(
-  before: Awaited<ReturnType<typeof treeHash>>,
-  after: Awaited<ReturnType<typeof treeHash>>,
-): string | null {
-  if (before.supported && after.supported) {
-    return before.value !== after.value ? "探索者运行期间仓库树发生变化" : null;
-  }
-  return "无法核对仓库树哈希";
 }
