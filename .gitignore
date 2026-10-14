@@ -148,3 +148,4 @@ AGENTS.md
 .cache/
 .clangd/
 
+.commandcode/
