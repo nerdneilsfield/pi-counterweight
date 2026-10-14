@@ -6,7 +6,7 @@
  * process-group leader. Timeout or caller abort SIGTERMs the whole group first,
  * SIGKILL follows after the grace period, and the promise resolves only after
  * every group member is gone — so no late child can keep writing while the
- * caller moves on. Used by the end check, `cw observe`, and the explorer.
+ * caller moves on. Used by the end check and the role subprocesses.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { open } from "node:fs/promises";

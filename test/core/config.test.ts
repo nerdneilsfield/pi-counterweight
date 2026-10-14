@@ -41,8 +41,7 @@ test("最小配置不启用任何行为", async () => {
       version: 1,
       check: null,
       protect: { paths: [] },
-      explorer: null,
-      observe: { versions: [] },
+      models: { explorer: null, review: null, over_review: null, research: null },
     });
   } finally {
     await rm(repo, { recursive: true, force: true });
@@ -61,19 +60,22 @@ env = { CI = "1" }
 [protect]
 paths = ["./tests/", "src/generated", "vitest.config.ts"]
 
-[explorer]
-model = "gateway/cheap-model"
-
-[observe]
-versions = ["node", "npm"]
+[models]
+explorer = "gateway/cheap-model"
+review = "openrouter/anthropic/claude"
+over_review = "gateway/blunt"
 `);
   try {
     expect(await loadProjectConfig(repo)).toEqual({
       version: 1,
       check: { cmd: ["npm", "test"], timeout_s: 600, env: { CI: "1" } },
       protect: { paths: ["tests", "src/generated", "vitest.config.ts"] },
-      explorer: { model: "gateway/cheap-model" },
-      observe: { versions: ["node", "npm"] },
+      models: {
+        explorer: "gateway/cheap-model",
+        review: "openrouter/anthropic/claude",
+        over_review: "gateway/blunt",
+        research: null,
+      },
     });
   } finally {
     await rm(repo, { recursive: true, force: true });
@@ -87,7 +89,7 @@ test("未知字段被拒绝", async () => {
     "version = 1\nbudget = { repairs = 3 }\n", // 旧版字段：必须报错，而不是被忽略
     "version = 1\n[check]\ncmd = [\"true\"]\nrepairs = 1\n",
     "version = 1\n[protect]\npaths = [\"tests\"]\nfreeze = true\n",
-    "version = 1\n[explorer]\nmodel = \"g/m\"\nmodels = \"g/x\"\n",
+    "version = 1\n[models]\nexplorer = \"g/m\"\nextra = \"g/x\"\n",
   ];
   for (const text of cases) {
     const repo = await repoWith(text);
@@ -125,7 +127,7 @@ test("非法的受保护路径在加载期被拒绝", async () => {
 test("其余校验规则", async () => {
   const cases = [
     "version = 1\n[check]\ncmd = []\n",
-    "version = 1\n[explorer]\nmodel = \"no-slash\"\n",
+    "version = 1\n[models]\nexplorer = \"no-slash\"\n",
     "version = 1\n[check]\ncmd = [\"true\"]\ntimeout_s = 0\n",
     "version = 2\n",
   ];

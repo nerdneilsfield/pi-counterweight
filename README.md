@@ -183,13 +183,15 @@ Counterweight 不要求模型先填任务表、签契约或等待批准。你直
 
 这个取舍让行为更容易预测：配置的检查每轮都执行，命中的直接写入就拒绝。代价也很明确：问答轮同样有检查开销，bash 旁路修改不会被检测。需要严格隔离时，应使用独立的系统权限或运行环境。
 
-### 先记录成本，再判断辅助模型是否值得用
+### 用别的模型做四件事，主模型继续写
 
-探索者是可选功能。它让另一个模型只读代码、定位实现，主模型继续处理任务；你可以选择价格更低的模型，但是否更省钱、回答是否有用，需要在自己的任务上测量。
+四个角色都是只读子进程，模型各自配置。explorer 找代码，review 只看这段改动有没有做错，over_review 只看这段改动有没有多做，research 处理主模型读代码仍定不下来的问题。做完一块改动后，主模型把要求和 diff 交给两个 review；它们只报告，不拦截结束，结束仍只看检查命令的退出码。
 
-`.cw/meter.jsonl` 记录模型用量和检查、探索事件，便于比较使用前后的成本。扩展不会据此自动升级模型或改写工作流程。目前没有真实模型评测结果证明它一定更便宜或更快。
+`.cw/meter.jsonl` 记录主模型用量、检查和这四个角色的用量。扩展不据此换模型。
 
-旧的严格流程保留在 Git 标签 `v1-strict`，包括契约、先红检查、证据哈希和门禁；普通使用不需要了解或启用它。
+每次用户回合，扩展还会往系统提示里加一段：少加没有当前调用方的抽象和兜底，用中文先给结论，不写防御性声明。没有项目配置时这段仍然会加。
+
+旧的严格流程保留在 Git 标签 `v1-strict`。普通使用不需要它。
 
 ## 可选：安装为自动加载的 Pi 包
 
@@ -203,7 +205,9 @@ pi install git:github.com/nerdneilsfield/pi-counterweight
 
 ## 配置参考
 
-在仓库根创建 `.cw/project.toml`（`.cw/` 建议加入该项目的 `.gitignore`）。在子目录里启动 pi 时，扩展用 git 工作树根定位这份配置、结束检查的工作目录和 `.cw/meter.jsonl`；不是 git 仓库时用启动目录。每个小节都是可选的；未知字段会报错。配置缺失或非法时，扩展不拦截任何工具调用，只在非法时提示错误。assistant 用量仍会写入仓库根的 `.cw/meter.jsonl`，这是没有配置时唯一会写文件的行为。
+在仓库根创建 `.cw/project.toml`（`.cw/` 建议加入该项目的 `.gitignore`）。在子目录里启动 pi 时，扩展用 git 工作树根定位这份配置、结束检查的工作目录和 `.cw/meter.jsonl`；不是 git 仓库时用启动目录。每个小节都是可选的；未知字段会报错。配置缺失或非法时，扩展不检查、不拦截，只在非法时提示错误。assistant 用量仍会写入 `.cw/meter.jsonl`。没有配置时，系统提示里的 counterweight 段仍会写入。
+
+从旧配置升级时，把 `[explorer] model` 改成 `[models] explorer`，删掉 `[observe]`，然后重启。留下旧字段会让整份配置加载失败，这一会话的检查和保护都不生效。
 
 ```toml
 version = 1
@@ -216,11 +220,11 @@ env = {}                    # 额外环境变量（校验时只允许字符串�
 [protect]                   # 受保护路径；不写这一节就只保护 .cw/project.toml 本身
 paths = ["tests/", "vitest.config.ts"]
 
-[explorer]                  # cw_explore 的模型；不写这一节该工具不可用
-model = "gateway/cheap-model"
-
-[observe]                   # cw observe 记录哪些工具的版本
-versions = ["node"]
+[models]                    # 没写的角色，对应工具调用时返回不可用
+explorer = "gateway/cheap-model"
+review = "gateway/careful"
+over_review = "gateway/blunt"
+research = "openrouter/anthropic/claude"   # 只按第一个斜杠分 provider
 ```
 
 ### 结束检查怎么跑
@@ -242,52 +246,27 @@ versions = ["node"]
 
 ### 计量
 
-每条 assistant 消息的 usage、结束检查与探索者运行的记录都追加到 `.cw/meter.jsonl`（只增不减）。示例：
+每条 assistant 消息的 usage、结束检查和四个角色的记录都追加到 `.cw/meter.jsonl`（只增不减）。示例：
 
 ```json
 {"kind":"usage","time":"…","session":"…","model":"gateway/medium-model","input":12000,"output":800,"cache_read":9000,"cache_write":0,"cost_total":0.03}
 {"kind":"event","time":"…","session":"…","event":"check","detail":{"exit_code":0,"timed_out":false,"spawn_error":null,"ms":12400,"outcome":"passed"}}
 ```
 
-## 可选：用辅助模型探索代码
+## 四个只读角色
 
-先在 Pi 中确认你有权限使用的模型，再将它的 `provider/model` 标识填入 `[explorer] model`。上面完整配置中的 `gateway/cheap-model` 只是占位示例，不能直接使用。保存配置并重启后，可以对 Pi 说：“请用 cw_explore 找出登录校验的入口，给出文件和行号。”这是模型工具，不是需要你在终端执行的命令。
+模型名写成 `provider/model`。Pi 按第一个斜杠区分提供商，所以 `openrouter/anthropic/claude` 这种多个斜杠的名字可用。上面配置里的名字都是占位，换成你账号里真实有的模型，保存后重启。
 
-模型可以调用 `cw_explore({ question })` 向只读探索者子代理提问：
+| 工具 | 输入 | 它做什么 | 超时 |
+| --- | --- | --- | --- |
+| `cw_explore` | 一个问题 | 找代码。每条结论带 `路径:行号`，找不到就回 `未找到` | 300 秒 |
+| `cw_review` | 这次的要求，和 diff | 只报做错的地方，包括被削弱的真实边界 | 300 秒 |
+| `cw_over_review` | 这次的要求，和 diff | 只报没资格留下的抽象、兜底、多余测试、防御性分支 | 300 秒 |
+| `cw_research` | 一个问题 | 结论在前。没读到的写 `未核实` | 1800 秒 |
 
-- 子进程 pi 以配置的 `[explorer] model` 运行，只有 `read` / `grep` 两个工具，超时 180 秒；
-- 每次实际执行的 read/grep 路径参数都对照工作树审计：出现越树路径（绝对路径、`..` 逃逸、外指符号链接）时，**整个回答不采信**，只返回错误；token 用量无论成败都记入 `.cw/meter.jsonl`；
-- 回答 ≤30 行，每条结论须带 `仓库相对路径:行号` 引用：引用按仓库根校验，无效标〔引用无效〕，缺引用标〔缺少引用〕（`未找到` 除外）；
-- 用量写入失败时，已经拿到的回答仍然返回，并说明计量没有写上。扩展不根据工作树哈希给回答打不可信标记。
+四个子进程都只有 `read` 和 `grep`，不能改文件。review 不自己跑 `git diff`，diff 由主模型传入。它们不在结束时自动运行，也不决定检查是否通过。没配模型的工具仍在列表里，调用时返回不可用。用量写失败时，已经拿到的回答仍返回。
 
-## 高级：记录命令运行现场
-
-`cw observe` 是独立的开发辅助功能，第一次使用扩展不需要它。以下 npm 命令在 Counterweight 源码仓库执行：
-
-```sh
-npm run build
-npm run observe -- [--note <文字>] -- <cmd> [args...]
-```
-
-其中 `<cmd>` 和 `[args...]` 要替换为实际程序和参数，方括号表示可选部分，不要原样输入。例如：`npm run observe -- --note "检查 Node 版本" -- node --version`。
-
-要观察另一个项目，先在扩展仓库构建，再切换到目标项目，用构建入口的绝对路径运行，例如 `node ~/pi-counterweight/dist/src/cli/observe.js -- npm test`。观察器在当前目录运行命令，把现场记录到 `./.cw/observations/<UTC时间戳>/`：
-
-- `observation.json`：命令 argv、工作目录、`--note`、退出码、终止信号、超时/取消标记、git 仓库根/提交/树哈希（非 git 记 `supported: false`）、OS 摘要、`[observe] versions` 的 `--version` 探测结果；
-- `stdout-tail.txt` / `stderr-tail.txt`：两条流尾部各 200 行（超约 1 MiB 截断并注明）。
-
-命令失败或被 Ctrl+C 不影响记录完整性（`observation.json` 启动前先落盘、结束后更新）。环境变量不入记录。退出码镜像被观测命令（spawn 失败 127，用法错误 2）。
-
-### 网关缓存探针（可选）
-
-```sh
-export CW_GATEWAY_URL=<完整 chat/completions 地址>
-export CW_GATEWAY_API_KEY=<key>
-export CW_GATEWAY_MODEL=<model>
-npm run probe-cache
-```
-
-两次长请求会产生费用；只有首个请求 prompt token 超过 2000 且第二个请求报告缓存读取时结果才为 `supported`，否则为 `unconfirmed`（证据不足，不代表网关不支持）。
+扩展不核对引用，也不限制回答行数。只读靠工具白名单，不是沙箱。
 
 ## 常见问题
 
@@ -303,17 +282,17 @@ npm run probe-cache
 | 模型改不了 `tests/xxx` | 受保护路径拦截。需要改就由你手动改，或调整 `[protect].paths` |
 | bash 改了受保护文件但没被拦 | 设计如此：只拦 `edit`/`write`，bash 不拦截、也不在结算时报告 |
 | 检查失败后模型没被反馈 | 每个失败链只反馈一次；再次失败如实报告。新的一轮用户消息会重新给一次额度 |
-| `cw_explore` 不可用 | 没配 `[explorer] model`。补上 `provider/model` 形式的模型名 |
-| `cw observe` 退出码非 0 | 镜像被观测命令的退出码；127 是 spawn 失败，2 是用法错误 |
+| 角色工具说未配置 | `[models]` 里没有这个角色。补上 `provider/model` 后重启 |
+| 升级后检查和保护都不跑了 | 配置里还留着 `[explorer]` 或 `[observe]`。未知字段会让整份配置失败。按上面的迁移改完重启 |
 
 ## 使用边界
 
 - **同账户下不是强安全边界。** 拦截靠进程内的路径检查，不能抵抗同账户下的恶意进程或模型伪造。
 - **bash 是旁路。** 只拦 `edit`/`write`；其他途径的修改不会被拦截，也不会被报告。
 - **检查只按退出码判定。** 不解析测试身份、不核对产物哈希、不检查模型是否新增了 skip 或弱化测试；模型自写的测试不能当权威结论。
-- **`cw_explore` 的只读是工具白名单。** 不是沙箱。
-- **`cw observe` 仍记录工作树哈希。** 那是观察记录里的一个字段，默认扩展不用它决定检查、保护或探索者回答。
-- **真实网关与真实模型未在本仓库测试中执行。** `npm test` 用真实 pi RPC 加载扩展但不需要模型凭据；探针未在付费真实模型上跑过。
+- **四个角色的只读是工具白名单。** 不是沙箱。
+- **两个 review 不自动运行。** 主模型不做调用，就没有这份报告。结束仍只看检查命令。
+- **真实模型未在本仓库测试中执行。** `npm test` 用真实 pi RPC 加载扩展，不需要模型凭据。
 - **严格流程在 tag 里。** `v1-strict` 保留了契约/先红/证据/门禁的完整实现，需要时 `git switch --detach v1-strict` 查看或移植。
 
 ## 开发与验证

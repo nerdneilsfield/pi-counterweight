@@ -145,8 +145,14 @@ test("结算检查：无变化也跑、通过、反馈一次、修复轮仍检�
     expect(retry!.continue).toBeUndefined();
     expect(lastText(retry!)).toContain("不再自动重试");
 
-    // 新的用户回合恢复额度后，第一次失败才再次续跑。
-    await fake.handlers.get("before_agent_start")!({}, fake.ctx);
+    // 新的用户回合恢复额度，并写入 counterweight 段，不碰其它段。
+    const prompt = { systemPromptOptions: { sections: { addendum: "keep" } } };
+    await fake.handlers.get("before_agent_start")!(prompt, fake.ctx);
+    const sections = prompt.systemPromptOptions.sections as Record<string, string>;
+    expect(sections.addendum).toBe("keep");
+    expect(sections.counterweight).toContain("cw_review");
+    await fake.handlers.get("before_agent_start")!(prompt, fake.ctx);
+    expect(sections.counterweight.match(/cw_review/g)).toHaveLength(1);
     const renewed = await settle(fake);
     expect(renewed!.continue).toBe(true);
     const final = await settle(fake);
@@ -293,7 +299,7 @@ test("连续三次失败只反馈一次，新用户回合恢复额度", async ()
     expect([first!.continue, second!.continue, third!.continue]).toEqual([true, undefined, undefined]);
     expect(lastText(third!)).toContain("不再自动重试");
 
-    await fake.handlers.get("before_agent_start")!({}, fake.ctx);
+    await fake.handlers.get("before_agent_start")!({ systemPromptOptions: { sections: {} } }, fake.ctx);
     const renewed = await settle(fake);
     expect(renewed!.continue).toBe(true);
   } finally {

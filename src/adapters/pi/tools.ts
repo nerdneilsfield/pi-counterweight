@@ -1,129 +1,111 @@
 /**
- * 注册 `cw_explore`：只读探索者工具（轻量版）。没有 report_blocked、没有 propose_contract_change——
- * 没有契约之后它们不再有意义。工具本身不做判断，只把问题交给只读子进程，把答案与用量带回来。
- *
- * Registers `cw_explore`, the read-only explorer (lite). There is no
- * report_blocked and no propose_contract_change — without a contract they no
- * longer mean anything. The tool judges nothing; it hands the question to the
- * read-only subprocess and brings back the answer and the usage.
+ * 四个只读角色工具。没配模型的角色仍注册，调用时返回错误。
+ * 用量记入 `.cw/meter.jsonl`；记账失败不丢已经拿到的回答。
  */
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ProjectConfig } from "../../core/config.js";
-import { finalizeExplorerAnswer } from "../../core/explore.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
-import { runExplorer } from "../../explorer/run.js";
+import { rolePromptPath, type RoleName } from "../../roles/prompts.js";
+import { runRole } from "../../roles/run.js";
 
-/**
- * 工具注册所需的依赖：读取当前会话的配置（探索者模型），以及两个只给测试用的注入口。
- * 生产调用不传这两个口，CLI 发现与子进程预算由 `runExplorer` 使用自身默认值。
- *
- * What tool registration needs: a callback for the session's config (the
- * explorer model) plus two test seams. Production calls pass neither seam; CLI
- * discovery and the subprocess budget stay with `runExplorer`'s own defaults.
- */
 export interface ToolRegistration {
-  /**
-   * 当前会话加载到的配置；没有配置文件或加载失败时为 null。
-   *
-   * The config loaded for this session, or null when there is no config file
-   * or it failed to load.
-   */
   getProject: () => ProjectConfig | null;
-  /**
-   * 本会话的仓库根（git 工作树根，或非 git 时的 cwd）。探索者、引用校验与计量都用它，
-   * 不另取 `ctx.cwd`，这样子目录启动时路径仍对着仓库根。
-   *
-   * This session's repo root (the git worktree root, or cwd outside git). The
-   * explorer, reference checks, and the meter all use it rather than `ctx.cwd`,
-   * so a session started in a subdirectory still addresses the repo root.
-   */
   getRepo: () => string | null;
-  /**
-   * 测试接缝：覆盖探索者 CLI 的发现结果。
-   *
-   * Test seam: overrides explorer CLI discovery.
-   */
-  explorerCliPath?: string;
-  /**
-   * 测试接缝：覆盖探索者子进程的预算。
-   *
-   * Test seam: overrides the explorer subprocess budget.
-   */
-  explorerTimeoutMs?: number;
+  /** 测试用：覆盖 pi CLI。 */
+  cliPath?: string;
+  /** 测试用：覆盖该角色的超时。 */
+  timeoutMs?: Partial<Record<RoleName, number>>;
 }
+
+const ROLES: Array<{
+  name: RoleName;
+  tool: string;
+  label: string;
+  description: string;
+  input: "question" | "review";
+}> = [
+  {
+    name: "explorer",
+    tool: "cw_explore",
+    label: "探索代码",
+    description: "把一个代码问题交给只读探索者。它只有 read 和 grep，返回带来源的结论。不做修改。",
+    input: "question",
+  },
+  {
+    name: "review",
+    tool: "cw_review",
+    label: "正确性审查",
+    description: "把这次的要求和 diff 交给只读审查。它只报行为错误和被削弱的真实边界，不报缺测试、不提重构、不改文件。",
+    input: "review",
+  },
+  {
+    name: "over_review",
+    tool: "cw_over_review",
+    label: "过度工程审查",
+    description: "把这次的要求和 diff 交给只读审查。它只报没资格留下的抽象、兜底、多余测试和防御性分支，不评对错、不改文件。",
+    input: "review",
+  },
+  {
+    name: "research",
+    tool: "cw_research",
+    label: "研究问题",
+    description: "把主模型读代码仍定不下来的问题交给只读研究角色。结论在前，没读到的标未核实。不实现。",
+    input: "question",
+  },
+];
 
 function text(message: string) {
   return { content: [{ type: "text" as const, text: message }], details: undefined };
 }
 
-/**
- * 注册模型可见的工具。`cw_explore` 声明为 `sequential`：它读工作树并向计量文件追加记录，
- * 不能与并行的同级调用交错。
- *
- * Registers the model-facing tool. `cw_explore` is declared `sequential`: it
- * reads the worktree and appends to the meter file, so it must not interleave
- * with parallel sibling calls.
- */
 export function registerTools(pi: ExtensionAPI, registration: ToolRegistration): void {
-  /**
-   * cw_explore：把问题交给只读探索者子进程，回答经后处理（30 行上限、`path:line` 引用校验）后
-   * 返回。模型来自配置的 `[explorer] model`；没有配置就不提供这个工具的能力。token 用量无论成败
-   * 都计入 `meter.jsonl`。
-   *
-   * cw_explore: hands the question to the read-only explorer subprocess and
-   * returns the post-processed answer (30-line cap, `path:line` validation).
-   * The model comes from the configured `[explorer] model`; without it the tool
-   * reports that it is unavailable. Tokens are metered however the run ended.
-   */
-  pi.registerTool({
-    name: "cw_explore",
-    label: "探索者提问",
-    description:
-      "向只读探索者子代理提问代码库问题。探索者在子进程中运行，只有 read 与 grep 两个工具，"
-      + "不能修改文件；回答有 30 行上限，逐条校验 path:line 引用。用于定位代码事实（实现位置、调用关系、现状），"
-      + "不要用它做需要写入或执行的操作。token 消耗计入 .cw/meter.jsonl。",
-    parameters: Type.Object({
-      question: Type.String({ minLength: 1 }),
-    }, { additionalProperties: false }),
-    executionMode: "sequential",
-    execute: async (_toolCallId, params, signal, _onUpdate, ctx: ExtensionToolContext) => {
-      const model = registration.getProject()?.explorer?.model ?? null;
-      if (model === null) {
-        return text("[counterweight] 未配置探索者模型（.cw/project.toml 的 [explorer] model），cw_explore 不可用。");
-      }
-      const repo = registration.getRepo();
-      if (repo === null) {
-        return text("[counterweight] 会话尚未确定仓库根，cw_explore 不可用。");
-      }
-      return text(await runExplore(ctx, repo, model, params.question, signal, registration));
-    },
-  });
+  for (const role of ROLES) {
+    const parameters = role.input === "question"
+      ? Type.Object({ question: Type.String({ minLength: 1 }) }, { additionalProperties: false })
+      : Type.Object({
+          request: Type.String({ minLength: 1 }),
+          diff: Type.String({ minLength: 1 }),
+        }, { additionalProperties: false });
+    pi.registerTool({
+      name: role.tool,
+      label: role.label,
+      description: role.description,
+      parameters,
+      execute: async (_id, params, signal, _onUpdate, ctx: ExtensionToolContext) => {
+        const model = registration.getProject()?.models[role.name] ?? null;
+        if (model === null) {
+          return text(`[counterweight] 未配置 [models].${role.name}，${role.tool} 不可用。`);
+        }
+        const repo = registration.getRepo();
+        if (repo === null) return text(`[counterweight] 会话尚未确定仓库根，${role.tool} 不可用。`);
+        const message = role.input === "question"
+          ? (params as { question: string }).question
+          : reviewMessage(params as { request: string; diff: string });
+        return text(await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration));
+      },
+    });
+  }
 }
 
-/**
- * 跑一轮探索者：回答经后处理，用量逐条记入计量。计量写失败不丢已经拿到的回答，只在文本里说明。
- *
- * One explorer round: the answer is post-processed and usage metered sample by
- * sample. A meter write failure does not discard an answer already in hand; the
- * text says so instead.
- */
-async function runExplore(
-  ctx: ExtensionToolContext, repo: string, model: string, question: string,
-  signal: AbortSignal | undefined, registration: ToolRegistration,
+function reviewMessage(params: { request: string; diff: string }): string {
+  return `要求：\n${params.request}\n\ndiff：\n${params.diff}\n`;
+}
+
+async function runAndMeter(
+  ctx: ExtensionToolContext, repo: string, role: RoleName, tool: string, model: string,
+  message: string, signal: AbortSignal | undefined, registration: ToolRegistration,
 ): Promise<string> {
   const session = ctx.sessionManager.getSessionId();
-  const run = await runExplorer({
+  const run = await runRole({
+    role,
     workRoot: repo,
     model,
-    question,
+    message,
     signal,
-    cliPath: registration.explorerCliPath,
-    timeoutMs: registration.explorerTimeoutMs,
+    cliPath: registration.cliPath,
+    timeoutMs: registration.timeoutMs?.[role],
   });
-
-  // Usage is accounted no matter how the run ended: the tokens were spent.
-  // A failed append is reported next to the answer, not by throwing it away.
   let spent = 0;
   let meterError: string | null = null;
   for (const sample of run.usage) {
@@ -146,24 +128,13 @@ async function runExplore(
       : sample.input + sample.output + sample.cacheRead + sample.cacheWrite;
   }
   const meterNote = meterError === null ? "" : `；用量未能写入计量（${meterError}）`;
-
   if (run.error !== null) {
-    await recordEvent(repo, session, "explore", {
+    await recordEvent(repo, session, role, {
       outcome: "failed", error: run.error, tokens: spent,
       timed_out: run.timedOut, cancelled: run.cancelled,
-      escaped_reads: run.escapedReads.length,
     });
-    return `[counterweight] 探索者未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。`;
+    return `[counterweight] ${tool} 未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。`;
   }
-  const finalized = await finalizeExplorerAnswer(run.answer!, repo);
-  await recordEvent(repo, session, "explore", {
-    outcome: "answered",
-    truncated: finalized.truncated,
-    invalid_refs: finalized.invalidRefs.length,
-    missing_refs: finalized.missingRefs.length,
-    tokens: spent,
-    timed_out: run.timedOut,
-  });
-  const header = `[counterweight] 探索者回答（模型 ${model}，消耗 ${spent} token${meterNote}）`;
-  return `${header}：\n${finalized.text}`;
+  await recordEvent(repo, session, role, { outcome: "answered", tokens: spent, timed_out: false });
+  return `[counterweight] ${tool}（模型 ${model}，提示 ${rolePromptPath(role)}，消耗 ${spent} token${meterNote}）：\n${run.answer}`;
 }

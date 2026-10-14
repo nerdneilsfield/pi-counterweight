@@ -1,20 +1,10 @@
 /**
- * Counterweight 的 pi 扩展入口（轻量版）：注册五个事件处理器（session_start、tool_call、
- * agent_before_settle、message_end、session_shutdown），把 pi 事件翻译成 core 调用，再把结论
- * 翻译回 pi 的返回值。没有任务、没有契约、没有批准流程：装上之后，pi 收到任务就直接干活。
+ * Counterweight 的 pi 扩展入口。没有任务、契约或批准。
  *
- * 行为只在配置了 `.cw/project.toml` 时生效：`[check]` 配了结束检查，每轮正常结束都跑一次、失败反馈一次；
- * `[protect]` 配了受保护路径，`edit`/`write` 直接拦截。没有配置、或配置非法时，工具调用完全放行。
- * assistant 用量仍会记入仓库根的 `.cw/meter.jsonl`。
- *
- * Counterweight's pi extension entry (lite): five event handlers that translate
- * pi events into core calls and back. No tasks, no contracts, no approval flow —
- * once installed, pi works on the task immediately.
- *
- * Behavior only activates for a configured `.cw/project.toml`: `[check]` runs
- * on every completed settle and feeds a failure back once; `[protect]` blocks
- * direct writes. With no config, or an invalid one, tool calls pass through.
- * Assistant usage is still appended to the repo root's `.cw/meter.jsonl`.
+ * `[check]` 在每轮正常结束时跑一次，失败把输出交回一次。`[protect]` 拦截 `edit`/`write`。
+ * `[models]` 决定四个只读角色用哪个模型，没配的角色调用时返回不可用。
+ * 没有配置或配置非法时，不检查、不拦截。助手用量仍写入 `.cw/meter.jsonl`。
+ * 每次用户回合都往系统提示的 `counterweight` 段写一段说话和构建约束，不管有没有配置。
  */
 import type {
   AgentBeforeSettleEvent,
@@ -35,6 +25,7 @@ import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
 import { isProtected } from "../../core/protect.js";
+import { SESSION_SECTION } from "../../roles/prompts.js";
 import { registerTools } from "./tools.js";
 
 /**
@@ -196,11 +187,12 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       return { block: true, reason: "[counterweight] 保护检查超时或失败，写入被拒绝" };
     }));
 
-  // ---- before_agent_start: a new user turn gets a fresh repair allowance ----
-  // Internal continues driven by the settle check do not emit this event, so
-  // the one-feedback bound per failing chain stays intact.
-  pi.on("before_agent_start", () => {
+  // 新的用户回合重置一次反馈额度，并写入 counterweight 段。
+  // 结算触发的续跑不发这个事件，所以失败链的额度不会被续跑重置，这段也不会叠第二次。
+  // Pi 每个回合重建 options，直接赋值不会覆盖 appendSystemPrompt。
+  pi.on("before_agent_start", (event) => {
     repairUsed = false;
+    event.systemPromptOptions.sections.counterweight = SESSION_SECTION;
     return undefined;
   });
 
