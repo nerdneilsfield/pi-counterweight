@@ -356,15 +356,28 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     getRepo: () => repo,
   });
 
+  // RPC 客户端（如 Paseo）要等命令处理函数返回才收到 prompt 的响应，并按 60 秒判超时；
+  // 一串对话框答完远不止这么久，所以问答放到后台，命令立刻返回。
+  // An RPC client (Paseo, for one) gets the prompt response only after the command handler returns
+  // and times out at 60 s; a run of dialogs takes far longer, so the dialogs continue in the background.
+  let setupRunning = false;
   pi.registerCommand("cw-setup", {
     description: "一步步设置 Counterweight：选模型、结束检查、受保护路径，写入 .cw/project.toml",
     handler: async (_args, ctx) => {
       if (repo === null) return notifyError(ctx, "Counterweight: 会话尚未确定仓库根");
       if (!ctx.hasUI) return notifyError(ctx, "Counterweight: /cw-setup 需要交互界面");
-      if (await runSetup(ctx, repo)) {
-        project = await loadProjectConfig(repo);
-        repairUsed = false;
-      }
+      if (setupRunning) return notifyError(ctx, "Counterweight: /cw-setup 正在进行");
+      const root = repo;
+      setupRunning = true;
+      void runSetup(ctx, root)
+        .then(async (written) => {
+          if (!written) return;
+          project = await loadProjectConfig(root);
+          repairUsed = false;
+        })
+        .catch((error: unknown) => notifyError(ctx, `Counterweight: /cw-setup 失败（${
+          error instanceof Error ? error.message : "未知错误"}）`))
+        .finally(() => { setupRunning = false; });
     },
   });
 
