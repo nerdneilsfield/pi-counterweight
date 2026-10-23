@@ -261,16 +261,17 @@ historian = "gateway/cheap-model"
 OMP（oh-my-pi）和 OMO（底层是 pi 的分叉 senpi）的扩展加载器都能加载这个扩展。下面是它们和 Pi 的差别。
 
 ```sh
-omp plugin install git:github.com/nerdneilsfield/pi-counterweight
+omp plugin install git:github.com/nerdneilsfield/pi-counterweight   # OMP
+omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 包 omo-ai）
 ```
 
-OMO 的安装方式未核实；它的加载器和 pi 同源，可以先用 `--extension <路径>` 试。
+`omo install` 把命令原样交给底层的 senpi 引擎，装到 `~/.omo/agent`，不会和 `~/.pi/agent` 里的 Pi 安装互通。
 
 - **结束检查。** OMP 没有 `agent_before_settle`，改用它的 `session_stop`：失败时把摘要作为续跑上下文交回一次，报告通过通知显示，而不是写入对话记录。额度规则不变。
 - **角色子进程。** OMP 的 CLI 不认 `--offline`、`--no-context-files`、`--no-prompt-templates`、`--no-themes`、`--no-approve`，所以对它用另一份参数；只读仍靠 `--tools read,grep`。从 omp 以外的方式启动的 OMP（例如单文件编译版）找不到 CLI，角色工具会返回不可用。
 - **工具可见性。** OMP 默认把扩展工具放进“可发现”层、审批级别按 exec。五个工具都显式声明为顶层可见，只读角色按 read 审批，史官按 write。
 - **配置校验。** OMP 把 `typebox` 换成自己的兼容层，会丢掉 `pattern`；配置校验因此改用字面量 JSON Schema。
-- 已验证：OMP 18.12.6 和 senpi 2026.10.21-3 的加载器能加载本扩展，OMP 上系统提示注入和 `session_stop` 流程按预期工作。未验证：在它们里面用真实模型跑完整会话，以及 OMO 的安装命令。
+- 已验证：OMP 18.12.6 和 senpi 2026.10.21-3 的加载器能加载本扩展，OMP 上系统提示注入和 `session_stop` 流程按预期工作。未验证：在它们里面用真实模型跑完整会话，以及 `omo install` 本身（只读了 omo-ai 5.1.44 的源码确认它转给 senpi，没实际执行）。
 
 ## 四个只读角色
 
