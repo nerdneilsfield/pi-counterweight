@@ -41,7 +41,7 @@ test("最小配置不启用任何行为", async () => {
       version: 1,
       check: null,
       protect: { paths: [] },
-      models: { explorer: null, review: null, over_review: null, research: null },
+      models: { explorer: null, review: null, over_review: null, research: null, historian: null },
     });
   } finally {
     await rm(repo, { recursive: true, force: true });
@@ -75,6 +75,7 @@ over_review = "gateway/blunt"
         review: "openrouter/anthropic/claude",
         over_review: "gateway/blunt",
         research: null,
+        historian: null,
       },
     });
   } finally {

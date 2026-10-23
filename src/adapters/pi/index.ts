@@ -26,6 +26,7 @@ import { recordEvent, recordUsage } from "../../core/meter.js";
 import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
 import { isProtected } from "../../core/protect.js";
 import { SESSION_SECTION } from "../../roles/prompts.js";
+import { runSetup } from "./setup.js";
 import { registerTools } from "./tools.js";
 
 /**
@@ -114,7 +115,7 @@ async function withTimeout<R>(
 }
 
 /**
- * 扩展入口：注册全部事件处理器、`cw_explore` 工具与 `/cw-version` 命令，并把本会话的仓库根、
+ * 扩展入口：注册全部事件处理器、角色工具与 `/cw-setup`、`/cw-version` 命令，并把本会话的仓库根、
  * 配置与检查状态保存在闭包里。作为扩展的默认导出，由 pi 在加载扩展时调用一次。
  *
  * Entry point of the extension: registers every event handler, the `cw_explore`
@@ -329,6 +330,18 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   registerTools(pi, {
     getProject: () => project,
     getRepo: () => repo,
+  });
+
+  pi.registerCommand("cw-setup", {
+    description: "一步步设置 Counterweight：选模型、结束检查、受保护路径，写入 .cw/project.toml",
+    handler: async (_args, ctx) => {
+      if (repo === null) return notifyError(ctx, "Counterweight: 会话尚未确定仓库根");
+      if (!ctx.hasUI) return notifyError(ctx, "Counterweight: /cw-setup 需要交互界面");
+      if (await runSetup(ctx, repo)) {
+        project = await loadProjectConfig(repo);
+        repairUsed = false;
+      }
+    },
   });
 
   pi.registerCommand("cw-version", {

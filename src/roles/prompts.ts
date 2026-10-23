@@ -1,16 +1,17 @@
 /**
- * 四个角色的系统提示。英文写规则，子进程用中文回答。
- * Role system prompts. The rules are English; the child answers in Chinese.
+ * 五个角色的系统提示。英文写规则，子进程按各自规则的语言回答。
+ * Role system prompts. The rules are English; the child answers in the language its rules name.
  */
 import { fileURLToPath } from "node:url";
 
-export type RoleName = "explorer" | "review" | "over_review" | "research";
+export type RoleName = "explorer" | "review" | "over_review" | "research" | "historian";
 
 const FILES: Record<RoleName, string> = {
   explorer: "explorer.md",
   review: "review.md",
   over_review: "over-review.md",
   research: "research.md",
+  historian: "historian.md",
 };
 
 /** 角色提示文件的绝对路径，传给 pi 的 `--system-prompt`。 */
@@ -41,5 +42,7 @@ Do not negate a position nobody holds and then state your own. Do not spend a pa
 Do not design a gate, a stage review, or a definition of done unless the user asked for one.
 
 When a chunk of the change is done, call cw_review and cw_over_review with the request and the diff. Skip both when the role is not configured. They only report; they do not block the end check.
+
+After a stage result lands (a commit, a decision, a finished sub-agent task), report it to cw_chronicle in a few sentences with dates and commit ids. Pass on what sub-agents found. If it replies with ASK, answer the questions and report again. Skip it when the role is not configured.
 
 Stop when the current question is answered. Do not ask whether to continue.`;

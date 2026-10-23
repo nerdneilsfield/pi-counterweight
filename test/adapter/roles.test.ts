@@ -83,6 +83,7 @@ test("review 和 over_review 拿到不同的提示与模型，diff 经临时文�
     const meter = await readFile(path.join(repo, ".cw", "meter.jsonl"), "utf8");
     expect(meter).toContain('"event":"review"');
     expect(meter).toContain('"event":"over_review"');
+    expect(meter).toMatch(/"event":"review".*"result":"answer".*"ms":\d+/);
     expect(meter).toContain('"kind":"usage"');
   } finally {
     await cleanup();
@@ -102,6 +103,38 @@ test("没配的角色返回不可用，不启动子进程", async () => {
     const result = await local.get("cw_research")!.execute("1", { question: "为什么" }, undefined, undefined, ctx);
     expect(result.content[0]?.text).toContain("未配置");
   } finally {
+    await cleanup();
+  }
+});
+
+test("史官：整份文档写入 HISTORY.md；ASK 和非文档回答不改文件", async () => {
+  const { repo, tools, cleanup } = await setup();
+  const historian = { models: { historian: "g/historian" } };
+  try {
+    const project = await loadProjectConfig(repo);
+    const local = new Map<string, { execute: ToolExecute }>();
+    registerTools({ registerTool: (tool: { name: string; execute: ToolExecute }) => local.set(tool.name, tool) } as unknown as ExtensionAPI, {
+      getProject: () => ({ ...project!, models: { ...project!.models, ...historian.models } }),
+      getRepo: () => repo, cliPath: fakeCli, timeoutMs: { historian: 5_000 },
+    });
+    const file = path.join(repo, ".cw", "HISTORY.md");
+    const run = (report: string) => local.get("cw_chronicle")!.execute("1", { report }, undefined, undefined, ctx);
+
+    process.env.CW_FAKE_ROLE_TEXT = "# 史\n\n新华社电";
+    expect((await run("首次")).content[0]?.text).toContain("已更新");
+    expect(await readFile(file, "utf8")).toBe("# 史\n\n新华社电\n");
+
+    process.env.CW_FAKE_ROLE_TEXT = "ASK:\n提交日期是哪天？";
+    const ask = await run("补充");
+    expect(ask.content[0]?.text).toContain("提交日期是哪天");
+    expect(await readFile(file, "utf8")).toBe("# 史\n\n新华社电\n");
+
+    process.env.CW_FAKE_ROLE_TEXT = "好的，收到";
+    expect((await run("闲话")).content[0]?.text).toContain("文档未改动");
+    expect(await readFile(file, "utf8")).toBe("# 史\n\n新华社电\n");
+    expect(tools.has("cw_chronicle")).toBe(true);
+  } finally {
+    delete process.env.CW_FAKE_ROLE_TEXT;
     await cleanup();
   }
 });

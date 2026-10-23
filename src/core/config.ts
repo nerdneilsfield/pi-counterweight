@@ -1,5 +1,5 @@
 /**
- * 读取并校验 `.cw/project.toml`：`[check]` 结束检查、`[protect]` 受保护路径、`[models]` 四个角色。
+ * 读取并校验 `.cw/project.toml`：`[check]` 结束检查、`[protect]` 受保护路径、`[models]` 五个角色。
  * 文件和每个小节都可选。解析或校验失败一律抛错，不返回半套配置。
  * 旧的 `[explorer]`、`[observe]` 是未知字段，会让整份配置失败，检查和保护一起停。
  */
@@ -22,6 +22,7 @@ export interface RoleModels {
   review: string | null;
   over_review: string | null;
   research: string | null;
+  historian: string | null;
 }
 
 export interface ProjectConfig {
@@ -31,7 +32,7 @@ export interface ProjectConfig {
   /** 受保护路径，仓库内相对路径或目录前缀。 */
   protect: { paths: string[] };
   /**
-   * 四个角色的模型。没配的为 null，对应工具调用时返回不可用。
+   * 五个角色的模型。没配的为 null，对应工具调用时返回不可用。
    * 值是 `provider/model`，只按第一个斜杠分，model 里可以再有斜杠。
    */
   models: RoleModels;
@@ -58,6 +59,7 @@ const projectSchema = Type.Object({
     review: Type.Optional(ModelName),
     over_review: Type.Optional(ModelName),
     research: Type.Optional(ModelName),
+    historian: Type.Optional(ModelName),
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
@@ -75,7 +77,7 @@ export async function loadProjectConfig(repo: string): Promise<ProjectConfig | n
   return parseProjectConfig(text);
 }
 
-function parseProjectConfig(text: string): ProjectConfig {
+export function parseProjectConfig(text: string): ProjectConfig {
   let parsed: unknown;
   try {
     parsed = parse(text);
@@ -86,7 +88,7 @@ function parseProjectConfig(text: string): ProjectConfig {
   const value = parsed as {
     check?: { cmd: string[]; timeout_s?: number; env?: Record<string, string> };
     protect?: { paths: string[] };
-    models?: { explorer?: string; review?: string; over_review?: string; research?: string };
+    models?: { explorer?: string; review?: string; over_review?: string; research?: string; historian?: string };
   };
   return {
     version: 1,
@@ -101,6 +103,7 @@ function parseProjectConfig(text: string): ProjectConfig {
       review: value.models?.review ?? null,
       over_review: value.models?.over_review ?? null,
       research: value.models?.research ?? null,
+      historian: value.models?.historian ?? null,
     },
   };
 }

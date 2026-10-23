@@ -1,10 +1,14 @@
 /**
- * 四个只读角色工具。没配模型的角色仍注册，调用时返回错误。
+ * 五个只读角色工具。没配模型的角色仍注册，调用时返回错误。
+ * 史官（cw_chronicle）的子进程同样只读，文档由本模块写入 `.cw/HISTORY.md`。
  * 用量记入 `.cw/meter.jsonl`；记账失败不丢已经拿到的回答。
  */
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ProjectConfig } from "../../core/config.js";
+import { writeCwFile } from "../../core/cwfile.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { rolePromptPath, type RoleName } from "../../roles/prompts.js";
 import { runRole } from "../../roles/run.js";
@@ -23,7 +27,7 @@ const ROLES: Array<{
   tool: string;
   label: string;
   description: string;
-  input: "question" | "review";
+  input: "question" | "review" | "report";
 }> = [
   {
     name: "explorer",
@@ -53,16 +57,29 @@ const ROLES: Array<{
     description: "把主模型读代码仍定不下来的问题交给只读研究角色。结论在前，没读到的标未核实。不实现。",
     input: "question",
   },
+  {
+    name: "historian",
+    tool: "cw_chronicle",
+    label: "汇报给史官",
+    description: "把阶段性成果汇报给史官（提交、决定、子 agent 的发现），它重写 .cw/HISTORY.md。写不下去时返回 ASK 开头的问题，由你回答后再汇报。",
+    input: "report",
+  },
 ];
+
+const HISTORY_FILE = "HISTORY.md";
 
 function text(message: string) {
   return { content: [{ type: "text" as const, text: message }], details: undefined };
 }
 
 export function registerTools(pi: ExtensionAPI, registration: ToolRegistration): void {
+  // 并发汇报排队：史官每次重写整份文档，并行会互相覆盖。
+  let chronicleTail: Promise<unknown> = Promise.resolve();
   for (const role of ROLES) {
     const parameters = role.input === "question"
       ? Type.Object({ question: Type.String({ minLength: 1 }) }, { additionalProperties: false })
+      : role.input === "report"
+      ? Type.Object({ report: Type.String({ minLength: 1 }) }, { additionalProperties: false })
       : Type.Object({
           request: Type.String({ minLength: 1 }),
           diff: Type.String({ minLength: 1 }),
@@ -79,10 +96,16 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
         }
         const repo = registration.getRepo();
         if (repo === null) return text(`[counterweight] 会话尚未确定仓库根，${role.tool} 不可用。`);
+        if (role.input === "report") {
+          const report = (params as { report: string }).report;
+          const turn = chronicleTail.then(() => chronicle(ctx, repo, model, report, signal, registration));
+          chronicleTail = turn.catch(() => undefined);
+          return text(await turn);
+        }
         const message = role.input === "question"
           ? (params as { question: string }).question
           : reviewMessage(params as { request: string; diff: string });
-        return text(await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration));
+        return text((await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration)).text);
       },
     });
   }
@@ -95,8 +118,9 @@ function reviewMessage(params: { request: string; diff: string }): string {
 async function runAndMeter(
   ctx: ExtensionToolContext, repo: string, role: RoleName, tool: string, model: string,
   message: string, signal: AbortSignal | undefined, registration: ToolRegistration,
-): Promise<string> {
+): Promise<{ text: string; answer: string | null }> {
   const session = ctx.sessionManager.getSessionId();
+  const started = Date.now();
   const run = await runRole({
     role,
     workRoot: repo,
@@ -130,11 +154,49 @@ async function runAndMeter(
   const meterNote = meterError === null ? "" : `；用量未能写入计量（${meterError}）`;
   if (run.error !== null) {
     await recordEvent(repo, session, role, {
-      outcome: "failed", error: run.error, tokens: spent,
+      outcome: "failed", error: run.error, tokens: spent, ms: Date.now() - started,
       timed_out: run.timedOut, cancelled: run.cancelled,
     });
-    return `[counterweight] ${tool} 未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。`;
+    return { answer: null, text: `[counterweight] ${tool} 未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。` };
   }
-  await recordEvent(repo, session, role, { outcome: "answered", tokens: spent, timed_out: false });
-  return `[counterweight] ${tool}（模型 ${model}，提示 ${rolePromptPath(role)}，消耗 ${spent} token${meterNote}）：\n${run.answer}`;
+  // result 区分白跑（none）、史官提问（ask）和有内容的回答，供判断这个角色值不值得自动跑。
+  const head = run.answer!.trim();
+  const result = head === "none" ? "none" : head.startsWith("ASK:") ? "ask" : "answer";
+  await recordEvent(repo, session, role, {
+    outcome: "answered", result, tokens: spent, ms: Date.now() - started, timed_out: false,
+  });
+  return {
+    answer: run.answer,
+    text: `[counterweight] ${tool}（模型 ${model}，提示 ${rolePromptPath(role)}，消耗 ${spent} token${meterNote}）：\n${run.answer}`,
+  };
+}
+
+/**
+ * 把汇报连同当前文档交给史官。回答以 `ASK:` 开头就原样交还主模型，不写文件；
+ * 不是以 `# ` 开头的整份文档也不写，免得一句闲话覆盖掉全部历史。
+ */
+async function chronicle(
+  ctx: ExtensionToolContext, repo: string, model: string, report: string,
+  signal: AbortSignal | undefined, registration: ToolRegistration,
+): Promise<string> {
+  let current = "";
+  try {
+    current = await readFile(path.join(repo, ".cw", HISTORY_FILE), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      return `[counterweight] cw_chronicle 读不了 .cw/${HISTORY_FILE}：${error instanceof Error ? error.message : "未知错误"}`;
+    }
+  }
+  const message = `当前文档：\n${current === "" ? "（空）" : current}\n\n汇报：\n${report}\n`;
+  const { text: note, answer } = await runAndMeter(ctx, repo, "historian", "cw_chronicle", model, message, signal, registration);
+  if (answer === null) return note;
+  const body = answer.trim();
+  if (body.startsWith("ASK:")) return `${note}\n史官需要你协调后再汇报，文档未改动。`;
+  if (!body.startsWith("# ")) return `[counterweight] cw_chronicle 史官没有返回整份文档（首行不是 # 标题），文档未改动：\n${body.slice(0, 200)}`;
+  try {
+    await writeCwFile(repo, HISTORY_FILE, `${body}\n`);
+  } catch (error) {
+    return `[counterweight] cw_chronicle 写入失败：${error instanceof Error ? error.message : "未知错误"}`;
+  }
+  return `[counterweight] cw_chronicle 已更新 .cw/${HISTORY_FILE}。`;
 }

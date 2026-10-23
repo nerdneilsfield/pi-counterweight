@@ -183,9 +183,11 @@ Counterweight 不要求模型先填任务表、签契约或等待批准。你直
 
 这个取舍让行为更容易预测：配置的检查每轮都执行，命中的直接写入就拒绝。代价也很明确：问答轮同样有检查开销，bash 旁路修改不会被检测。需要严格隔离时，应使用独立的系统权限或运行环境。
 
-### 用别的模型做四件事，主模型继续写
+### 用别的模型做五件事，主模型继续写
 
-四个角色都是只读子进程，模型各自配置。explorer 找代码，review 只看这段改动有没有做错，over_review 只看这段改动有没有多做，research 处理主模型读代码仍定不下来的问题。做完一块改动后，主模型把要求和 diff 交给两个 review；它们只报告，不拦截结束，结束仍只看检查命令的退出码。
+运行 `/cw-setup`，按提示从 pi 当前可用的模型里选、填检查命令和保护路径，它替你写 `.cw/project.toml`。
+
+五个角色都是只读子进程，模型各自配置。explorer 找代码，review 只看这段改动有没有做错，over_review 只看这段改动有没有多做，research 处理主模型读代码仍定不下来的问题，historian（赛博史官）维护 `.cw/HISTORY.md`：主模型把阶段性成果用 `cw_chronicle` 汇报给它，它重写整份项目开发史，英文按 ASD-STE100，中文按新华社电讯稿体；它定不下来的事以 `ASK:` 开头发回主模型协调。做完一块改动后，主模型把要求和 diff 交给两个 review；它们只报告，不拦截结束，结束仍只看检查命令的退出码。
 
 `.cw/meter.jsonl` 记录主模型用量、检查和这四个角色的用量。扩展不据此换模型。
 
@@ -225,6 +227,7 @@ explorer = "gateway/cheap-model"
 review = "gateway/careful"
 over_review = "gateway/blunt"
 research = "openrouter/anthropic/claude"   # 只按第一个斜杠分 provider
+historian = "gateway/cheap-model"
 ```
 
 ### 结束检查怎么跑
@@ -263,8 +266,9 @@ research = "openrouter/anthropic/claude"   # 只按第一个斜杠分 provider
 | `cw_review` | 这次的要求，和 diff | 只报做错的地方，包括被削弱的真实边界 | 300 秒 |
 | `cw_over_review` | 这次的要求，和 diff | 只报没资格留下的抽象、兜底、多余测试、防御性分支 | 300 秒 |
 | `cw_research` | 一个问题 | 结论在前。没读到的写 `未核实` | 1800 秒 |
+| `cw_chronicle` | 一段阶段性汇报 | 重写 `.cw/HISTORY.md`；写不下去时返回 `ASK:` 问题，文档不动 | 300 秒 |
 
-四个子进程都只有 `read` 和 `grep`，不能改文件。review 不自己跑 `git diff`，diff 由主模型传入。它们不在结束时自动运行，也不决定检查是否通过。没配模型的工具仍在列表里，调用时返回不可用。用量写失败时，已经拿到的回答仍返回。
+五个子进程都只有 `read` 和 `grep`，不能改文件。review 不自己跑 `git diff`，diff 由主模型传入。它们不在结束时自动运行，也不决定检查是否通过。没配模型的工具仍在列表里，调用时返回不可用。用量写失败时，已经拿到的回答仍返回。
 
 扩展不核对引用，也不限制回答行数。只读靠工具白名单，不是沙箱。
 
