@@ -72,6 +72,21 @@ const DEFAULT_TIMEOUTS: AdapterTimeouts = {
 };
 
 /**
+ * 结算处理超时或抛异常时的回退文本：如实报告「本轮没有得到检查结论」，绝不报告通过。
+ *
+ * Fallback text when the settle handler times out or throws: an honest "no
+ * check conclusion this turn", never a pass.
+ */
+const SETTLE_FALLBACK = "[counterweight] 结束检查未能完成（处理超时或内部错误）；本轮没有得到检查结论。";
+
+const settleEntry = (content: string) => ({
+  type: "custom_message" as const,
+  customType: "counterweight",
+  content,
+  display: true,
+});
+
+/**
  * 一次正在进行的结束检查，shutdown 必须回收。
  *
  * An end check in flight that shutdown must reap.
@@ -191,37 +206,72 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // 新的用户回合重置一次反馈额度，并写入 counterweight 段。
   // 结算触发的续跑不发这个事件，所以失败链的额度不会被续跑重置，这段也不会叠第二次。
   // Pi 每个回合重建 options，直接赋值不会覆盖 appendSystemPrompt。
+  // OMP 没有 systemPromptOptions，事件给的是 `systemPrompt: string[]`，返回新数组替换；
+  // OMP 可能对同一次提交重放整条链，每次都从事件给的基线追加，所以不会叠加。
   pi.on("before_agent_start", (event) => {
     repairUsed = false;
-    event.systemPromptOptions.sections.counterweight = SESSION_SECTION;
-    return undefined;
+    const options = (event as { systemPromptOptions?: { sections: Record<string, string> } }).systemPromptOptions;
+    if (options !== undefined) {
+      options.sections.counterweight = SESSION_SECTION;
+      return undefined;
+    }
+    const base = (event as { systemPrompt?: unknown }).systemPrompt;
+    return Array.isArray(base) ? ({ systemPrompt: [...base, SESSION_SECTION] } as never) : undefined;
   });
 
-  // ---- agent_before_settle: run the configured end check once ----
+  // ---- agent_before_settle (pi) / session_stop (OMP): run the configured end check once ----
   pi.on("agent_before_settle", (event: AgentBeforeSettleEvent, ctx: ExtensionContext) => {
     const check = project?.check ?? null;
     const budgetMs = check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs;
-    return withTimeout(budgetMs, (signal) => runSettle(event, ctx, signal), () => settleFallback(event));
+    return withTimeout(budgetMs, async (signal) => {
+      if (event.outcome !== "completed") return undefined;
+      const report = await runCheckOnce(ctx, signal);
+      if (report === undefined) return undefined;
+      const result = { entries: [...event.entries, settleEntry(report.text)] };
+      return report.retrying ? { ...result, continue: true } : result;
+    }, () => event.outcome === "completed" && hasCheck() ? { entries: [...event.entries, settleEntry(SETTLE_FALLBACK)] } : undefined);
   });
 
+  // OMP 在主会话即将结束时发 `session_stop`，不带 entries：报告走通知，失败反馈走 `additionalContext` 续跑。
+  // pi 不发这个事件；OMP 不发 `agent_before_settle`，所以同一轮只会有一边触发。
+  // OMP sends `session_stop` when the main session is about to settle, with no entries: the report goes
+  // through a notification and the failure feedback through `additionalContext`. pi never sends it,
+  // and OMP never sends `agent_before_settle`, so only one side fires per turn.
+  (pi as unknown as { on(name: string, handler: (event: { signal?: AbortSignal }, ctx: ExtensionContext) => unknown): void })
+    .on("session_stop", (event, ctx) => {
+      const check = project?.check ?? null;
+      const budgetMs = check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs;
+      return withTimeout(budgetMs, async (signal) => {
+        const report = await runCheckOnce(ctx, signal, event.signal);
+        if (report === undefined) return undefined;
+        ctx.ui.notify(report.text, report.passed ? "info" : "warning");
+        return report.retrying ? { continue: true, additionalContext: report.text } : undefined;
+      }, () => {
+        if (hasCheck()) notifyError(ctx, SETTLE_FALLBACK);
+        return undefined;
+      });
+    });
+
+  const hasCheck = (): boolean => repo !== null && (project?.check ?? null) !== null;
+
   /**
-   * 执行一次结算检查：配置了结束检查且本轮正常完成就运行，不看工作树有没有变化。
+   * 执行一次结算检查：配置了结束检查就运行，不看工作树有没有变化。
    * 通过就报一行事实；失败把尾部事实反馈一次并续跑；第二次失败如实报告后结束。
+   * 取消时返回 undefined：被取消的检查不对本轮下结论。
    *
-   * Runs the settle check whenever a check is configured and the turn completed,
-   * whether or not the worktree changed. A pass reports one line; a failure
-   * feeds the tail facts back once and continues; a second failure is reported
-   * as-is and the turn ends.
+   * Runs the settle check whenever a check is configured, whether or not the
+   * worktree changed. A pass reports one line; a failure feeds the tail facts
+   * back once and continues; a second failure is reported as-is and the turn
+   * ends. A cancelled check returns undefined: it makes no claim about the turn.
    */
-  async function runSettle(
-    event: AgentBeforeSettleEvent,
+  async function runCheckOnce(
     ctx: ExtensionContext,
     outerSignal: AbortSignal,
-  ): Promise<AgentBeforeSettleEventResult | undefined> {
+    hostSignal?: AbortSignal,
+  ): Promise<{ text: string; retrying: boolean; passed: boolean } | undefined> {
     const root = repo;
     const check = project?.check ?? null;
     if (root === null || check === null) return undefined;
-    if (event.outcome !== "completed") return undefined;
 
     const session = ctx.sessionManager.getSessionId();
     const controller = new AbortController();
@@ -237,6 +287,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     };
     link(ctx.signal);
     link(outerSignal);
+    link(hostSignal);
 
     const started = Date.now();
     let outcome: CheckOutcome;
@@ -269,34 +320,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       ms: Date.now() - started,
       outcome: outcome.runnerError !== null ? "spawn_error" : passed ? "passed" : retrying ? "feedback" : "reported",
     });
-    const result = {
-      entries: [...event.entries, {
-        type: "custom_message" as const,
-        customType: "counterweight",
-        content: text,
-        display: true,
-      }],
-    };
-    return retrying ? { ...result, continue: true } : result;
-  }
-
-  /**
-   * 结算处理超时或抛异常时的回退：如实报告「本轮没有得到检查结论」，绝不报告通过。
-   *
-   * Fallback when the settle handler times out or throws: an honest "no check
-   * conclusion this turn", never a pass.
-   */
-  function settleFallback(event: AgentBeforeSettleEvent): AgentBeforeSettleEventResult | undefined {
-    if (repo === null || (project?.check ?? null) === null) return undefined;
-    if (event.outcome !== "completed") return undefined;
-    return {
-      entries: [...event.entries, {
-        type: "custom_message" as const,
-        customType: "counterweight",
-        content: "[counterweight] 结束检查未能完成（处理超时或内部错误）；本轮没有得到检查结论。",
-        display: true,
-      }],
-    };
+    return { text, retrying, passed };
   }
 
   // ---- message_end: hand assistant usage to the meter ----

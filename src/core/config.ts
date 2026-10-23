@@ -5,7 +5,6 @@
  */
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { Type } from "typebox";
 import { parse } from "smol-toml";
 import { isNotFound, relativeParts } from "./paths.js";
 import { rejectUnknown } from "./schema.js";
@@ -39,29 +38,50 @@ export interface ProjectConfig {
 }
 
 /**
- * `provider/model`：第一个斜杠分开两边，model 里可以再有斜杠，两侧非空，不含空白。
- * Pi 也是按第一个斜杠切的。
+ * 配置的 JSON Schema，直接写字面量而不用 `Type` 构造器：OMP 把 `typebox` 换成自己的 shim，
+ * shim 会丢掉 `pattern`，导致 `provider/model` 的校验静默失效。
+ * `provider/model`：第一个斜杠分开两边，model 里可以再有斜杠，两侧非空，不含空白。Pi 也是按第一个斜杠切的。
+ *
+ * The config as a literal JSON Schema, not `Type` builders: OMP swaps `typebox` for a shim
+ * that drops `pattern`, which silently disables the `provider/model` check.
  */
-const ModelName = Type.String({ minLength: 1, pattern: "^[^/\\s]+/[^\\s]+$" });
+const ModelName = { type: "string", minLength: 1, pattern: "^[^/\\s]+/[^\\s]+$" };
 
-const projectSchema = Type.Object({
-  version: Type.Literal(1),
-  check: Type.Optional(Type.Object({
-    cmd: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-    timeout_s: Type.Optional(Type.Integer({ minimum: 1 })),
-    env: Type.Optional(Type.Object({}, { additionalProperties: Type.String({ minLength: 0 }) })),
-  }, { additionalProperties: false })),
-  protect: Type.Optional(Type.Object({
-    paths: Type.Array(Type.String({ minLength: 1 })),
-  }, { additionalProperties: false })),
-  models: Type.Optional(Type.Object({
-    explorer: Type.Optional(ModelName),
-    review: Type.Optional(ModelName),
-    over_review: Type.Optional(ModelName),
-    research: Type.Optional(ModelName),
-    historian: Type.Optional(ModelName),
-  }, { additionalProperties: false })),
-}, { additionalProperties: false });
+const projectSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["version"],
+  properties: {
+    version: { const: 1 },
+    check: {
+      type: "object",
+      additionalProperties: false,
+      required: ["cmd"],
+      properties: {
+        cmd: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+        timeout_s: { type: "integer", minimum: 1 },
+        env: { type: "object", additionalProperties: { type: "string" } },
+      },
+    },
+    protect: {
+      type: "object",
+      additionalProperties: false,
+      required: ["paths"],
+      properties: { paths: { type: "array", items: { type: "string", minLength: 1 } } },
+    },
+    models: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        explorer: ModelName,
+        review: ModelName,
+        over_review: ModelName,
+        research: ModelName,
+        historian: ModelName,
+      },
+    },
+  },
+};
 
 const DEFAULT_TIMEOUT_S = 600;
 

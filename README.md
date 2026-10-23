@@ -256,6 +256,22 @@ historian = "gateway/cheap-model"
 {"kind":"event","time":"…","session":"…","event":"check","detail":{"exit_code":0,"timed_out":false,"spawn_error":null,"ms":12400,"outcome":"passed"}}
 ```
 
+## 在 OMP 和 OMO 里使用
+
+OMP（oh-my-pi）和 OMO（底层是 pi 的分叉 senpi）的扩展加载器都能加载这个扩展。下面是它们和 Pi 的差别。
+
+```sh
+omp plugin install git:github.com/nerdneilsfield/pi-counterweight
+```
+
+OMO 的安装方式未核实；它的加载器和 pi 同源，可以先用 `--extension <路径>` 试。
+
+- **结束检查。** OMP 没有 `agent_before_settle`，改用它的 `session_stop`：失败时把摘要作为续跑上下文交回一次，报告通过通知显示，而不是写入对话记录。额度规则不变。
+- **角色子进程。** OMP 的 CLI 不认 `--offline`、`--no-context-files`、`--no-prompt-templates`、`--no-themes`、`--no-approve`，所以对它用另一份参数；只读仍靠 `--tools read,grep`。从 omp 以外的方式启动的 OMP（例如单文件编译版）找不到 CLI，角色工具会返回不可用。
+- **工具可见性。** OMP 默认把扩展工具放进“可发现”层、审批级别按 exec。五个工具都显式声明为顶层可见，只读角色按 read 审批，史官按 write。
+- **配置校验。** OMP 把 `typebox` 换成自己的兼容层，会丢掉 `pattern`；配置校验因此改用字面量 JSON Schema。
+- 已验证：OMP 18.12.6 和 senpi 2026.10.21-3 的加载器能加载本扩展，OMP 上系统提示注入和 `session_stop` 流程按预期工作。未验证：在它们里面用真实模型跑完整会话，以及 OMO 的安装命令。
+
 ## 四个只读角色
 
 模型名写成 `provider/model`。Pi 按第一个斜杠区分提供商，所以 `openrouter/anthropic/claude` 这种多个斜杠的名字可用。上面配置里的名字都是占位，换成你账号里真实有的模型，保存后重启。
@@ -296,7 +312,7 @@ historian = "gateway/cheap-model"
 - **检查只按退出码判定。** 不解析测试身份、不核对产物哈希、不检查模型是否新增了 skip 或弱化测试；模型自写的测试不能当权威结论。
 - **四个角色的只读是工具白名单。** 不是沙箱。
 - **两个 review 不自动运行。** 主模型不做调用，就没有这份报告。结束仍只看检查命令。
-- **真实模型未在本仓库测试中执行。** `npm test` 用真实 pi RPC 加载扩展，不需要模型凭据。
+- **真实模型未在本仓库测试中执行。** `npm test` 不需要模型凭据。
 - **严格流程在 tag 里。** `v1-strict` 保留了契约/先红/证据/门禁的完整实现，需要时 `git switch --detach v1-strict` 查看或移植。
 
 ## 开发与验证

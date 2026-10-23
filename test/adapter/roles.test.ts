@@ -9,6 +9,7 @@ import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-codi
 import { loadProjectConfig, type ProjectConfig } from "../../src/core/config.ts";
 import { registerTools } from "../../src/adapters/pi/tools.ts";
 import { rolePromptPath } from "../../src/roles/prompts.ts";
+import { roleArgv } from "../../src/roles/run.ts";
 
 const fakeCli = path.join(import.meta.dirname, "../fixtures/role/fake-pi.mjs");
 
@@ -137,4 +138,29 @@ test("史官：整份文档写入 HISTORY.md；ASK 和非文档回答不改文�
     delete process.env.CW_FAKE_ROLE_TEXT;
     await cleanup();
   }
+});
+
+// OMP 不认 pi 的几个开关，传了就报错退出，且 `--` 之后的 @file 会被当成文本。
+// OMP rejects several pi flags and treats an @file after `--` as text.
+test("子进程参数按宿主区分", () => {
+  const pi = roleArgv("pi", "review", "g/m", "/t/message.md");
+  expect(pi).toContain("--offline");
+  expect(pi.slice(-2)).toEqual(["--", "@/t/message.md"]);
+
+  const omp = roleArgv("omp", "review", "g/m", "/t/message.md");
+  for (const flag of ["--offline", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-approve", "--"]) {
+    expect(omp).not.toContain(flag);
+  }
+  expect(omp.at(-1)).toBe("@/t/message.md");
+  expect(omp[omp.indexOf("--tools") + 1]).toBe("read,grep");
+});
+
+test("OMP 专用字段：工具留在顶层，只读角色按 read 审批，史官按 write", async () => {
+  const seen = new Map<string, { loadMode?: string; approval?: string }>();
+  registerTools({ registerTool: (tool: { name: string; loadMode?: string; approval?: string }) => seen.set(tool.name, tool) } as unknown as ExtensionAPI, {
+    getProject: () => null, getRepo: () => null,
+  });
+  expect([...seen.values()].every((tool) => tool.loadMode === "essential")).toBe(true);
+  expect(seen.get("cw_review")?.approval).toBe("read");
+  expect(seen.get("cw_chronicle")?.approval).toBe("write");
 });

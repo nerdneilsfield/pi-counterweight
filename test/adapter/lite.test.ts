@@ -450,3 +450,49 @@ function psOutput(): Promise<string> {
     child.once("close", () => resolve(out));
   });
 }
+
+// OMP 不发 agent_before_settle，发 session_stop：失败走 additionalContext 续跑一次，再失败只通知，通过只通知。
+// OMP sends session_stop instead of agent_before_settle: a failure continues once through additionalContext,
+// a second failure and a pass only notify.
+test("OMP 的 session_stop：失败续跑一次、再失败如实结束、通过", async () => {
+  const repo = await repoWith(CHECK_TOML);
+  try {
+    const fake = fakePi(repo);
+    await start(fake);
+    const stop = () => fake.handlers.get("session_stop")!({ signal: new AbortController().signal }, fake.ctx) as
+      Promise<{ continue?: boolean; additionalContext?: string } | undefined>;
+
+    const first = await stop();
+    expect(first?.continue).toBe(true);
+    expect(first?.additionalContext).toContain("退出码 1");
+
+    expect(await stop()).toBeUndefined();
+    expect(fake.notifications.at(-1)).toContain("结束检查未通过");
+
+    await fake.handlers.get("before_agent_start")!({ systemPrompt: ["base"] }, fake.ctx);
+    await writeFile(path.join(repo, "fixed.txt"), "ok\n");
+    expect(await stop()).toBeUndefined();
+    expect(fake.notifications.at(-1)).toContain("结束检查通过");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+// 两种宿主的系统提示入口不同：pi 写 sections，OMP 返回追加后的 systemPrompt 数组。
+// The two hosts take the prompt differently: pi writes sections, OMP returns the extended array.
+test("before_agent_start：pi 写 sections，OMP 返回替换数组", async () => {
+  const repo = await repoWith(null);
+  try {
+    const fake = fakePi(repo);
+    const handler = fake.handlers.get("before_agent_start")!;
+    const sections: Record<string, string> = {};
+    expect(await handler({ systemPromptOptions: { sections } }, fake.ctx)).toBeUndefined();
+    expect(sections.counterweight).toContain("INTJ");
+
+    const omp = await handler({ systemPrompt: ["base"] }, fake.ctx) as { systemPrompt: string[] };
+    expect(omp.systemPrompt[0]).toBe("base");
+    expect(omp.systemPrompt).toHaveLength(2);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});

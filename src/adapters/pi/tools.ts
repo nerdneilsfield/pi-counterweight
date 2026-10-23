@@ -68,6 +68,16 @@ const ROLES: Array<{
 
 const HISTORY_FILE = "HISTORY.md";
 
+/**
+ * OMP 专用的工具字段，pi 不认也不读。OMP 默认把扩展工具放进“可发现”层，模型在顶层看不到；
+ * 默认审批级别是 exec，每次调用都可能弹确认。五个角色子进程都只读，只有史官的结果会写 `.cw/HISTORY.md`。
+ *
+ * OMP-only tool fields that pi ignores. OMP hides extension tools in a "discoverable" tier by default
+ * and approves at the exec tier, so each call may prompt. The roles are read-only children; only the
+ * historian's result is written to `.cw/HISTORY.md`.
+ */
+const ompHints = (tool: string) => ({ loadMode: "essential", approval: tool === "cw_chronicle" ? "write" : "read" });
+
 function text(message: string) {
   return { content: [{ type: "text" as const, text: message }], details: undefined };
 }
@@ -89,6 +99,7 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
       label: role.label,
       description: role.description,
       parameters,
+      ...ompHints(role.tool),
       execute: async (_id, params, signal, _onUpdate, ctx: ExtensionToolContext) => {
         const model = registration.getProject()?.models[role.name] ?? null;
         if (model === null) {

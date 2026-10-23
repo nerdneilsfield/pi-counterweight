@@ -5,7 +5,6 @@
  * `ValidationError` labelled with the caller's `kind`. Callers author schemas
  * with `additionalProperties: false`, so unknown keys are rejected, not ignored.
  */
-import { Type } from "typebox";
 import Value from "typebox/value";
 
 /**
@@ -44,7 +43,7 @@ export class ValidationError extends Error {
  * @returns 通过时静默返回 `void` / Returns `void` on success.
  * @throws {ValidationError} 存在任何校验错误时 / When any validation error exists.
  */
-export function rejectUnknown(schema: Type.TSchema, value: unknown, kind: string): void {
+export function rejectUnknown(schema: object, value: unknown, kind: string): void {
   const issues = Value.Errors(schema, value).map((error) => {
     const at = error.instancePath === "" ? "" : ` at ${error.instancePath}`;
     return `${error.message}${at}`;

@@ -45,19 +45,27 @@ export interface RoleRequest {
   /** 交给子进程的正文。review 的 diff 写进临时文件，避免命令行长度和 `@@`。 */
   message: string;
   signal?: AbortSignal;
+  /** 测试用：覆盖宿主 CLI，按 pi 的参数表调用。 */
   cliPath?: string;
   timeoutMs?: number;
 }
 
+export type Host = "pi" | "omp";
+
 /**
- * 从本模块向上找 pi CLI；找不到就用当前进程入口（`pi install` 不带宿主包）。
+ * 找宿主的 CLI。先从本模块向上找 pi 的 CLI；找不到就看当前进程入口是不是 pi、OMP 或 OMO 底层的 senpi。
+ * OMP 是 bun 上的 pi 分叉，入口是 `@oh-my-pi/pi-coding-agent/dist/cli.js`；编译成单文件的 OMP 没有这个入口，找不到。
+ *
+ * Find the host CLI: first pi's CLI above this module, then the running process entry,
+ * which may be pi or OMP (a pi fork on bun, entry `@oh-my-pi/pi-coding-agent/dist/cli.js`).
+ * A single-file compiled OMP has no such entry and is not found.
  */
-export function findPiCli(from: string = path.dirname(fileURLToPath(import.meta.url))): string | null {
+export function findHostCli(from: string = path.dirname(fileURLToPath(import.meta.url))): { cli: string; host: Host } | null {
   let dir = from;
   for (;;) {
     const candidate = path.join(
       dir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) return { cli: candidate, host: "pi" };
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -66,17 +74,48 @@ export function findPiCli(from: string = path.dirname(fileURLToPath(import.meta.
   if (entry === undefined) return null;
   try {
     const resolved = realpathSync(entry);
-    const suffix = path.join("@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
-    return resolved.endsWith(path.sep + suffix) ? resolved : null;
+    const pi = path.join("@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+    const omp = path.join("@oh-my-pi", "pi-coding-agent", "dist", "cli.js");
+    // OMO 启动的是 senpi，一个 pi 的分叉，参数表和 pi 一致（已用 senpi 的 CLI 核对）。
+    const senpi = path.join("@code-yeongyu", "senpi", "dist", "bundle", "cli.js");
+    if (resolved.endsWith(path.sep + pi) || resolved.endsWith(path.sep + senpi)) return { cli: resolved, host: "pi" };
+    if (resolved.endsWith(path.sep + omp)) return { cli: resolved, host: "omp" };
+    return null;
   } catch {
     return null;
   }
 }
 
+/**
+ * 子进程参数。只读靠 `--tools read,grep` 和关闭自动发现。两个宿主的参数表不同：
+ * OMP 没有 `--offline`、`--no-context-files`、`--no-prompt-templates`、`--no-themes`、`--no-approve`，传了就报错退出；
+ * OMP 在 `--` 之后把一切当文本，所以 `@file` 要放在前面，且不用 `--`。
+ *
+ * Child argv. Read-only comes from `--tools read,grep` and the disabled discovery flags.
+ * The two hosts accept different flags: OMP rejects `--offline`, `--no-context-files`,
+ * `--no-prompt-templates`, `--no-themes` and `--no-approve`, and treats everything after
+ * `--` as text, so `@file` goes first and `--` is left out.
+ */
+export function roleArgv(host: Host, role: RoleName, model: string, messagePath: string): string[] {
+  const common = [
+    "--mode", "json",
+    "--no-session",
+    "--model", model,
+    "--tools", "read,grep",
+    "--system-prompt", rolePromptPath(role),
+    "--no-extensions",
+    "--no-skills",
+  ];
+  return host === "omp"
+    ? [...common, "--no-rules", "--no-title", "--no-lsp", `@${messagePath}`]
+    : [...common, "--offline", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
+      "--", `@${messagePath}`];
+}
+
 export async function runRole(request: RoleRequest): Promise<RoleRun> {
-  const cli = request.cliPath ?? findPiCli();
-  if (cli === null) {
-    return { answer: null, error: "找不到 pi CLI", usage: [], timedOut: false, cancelled: false };
+  const found = request.cliPath !== undefined ? { cli: request.cliPath, host: "pi" as Host } : findHostCli();
+  if (found === null) {
+    return { answer: null, error: "找不到 pi 或 omp 的 CLI", usage: [], timedOut: false, cancelled: false };
   }
   const slash = request.model.indexOf("/");
   if (slash <= 0 || slash === request.model.length - 1 || /\s/.test(request.model)) {
@@ -84,27 +123,13 @@ export async function runRole(request: RoleRequest): Promise<RoleRun> {
   }
   const scratch = await mkdtemp(path.join(tmpdir(), "cw-role-"));
   try {
-    // `--` 后的 @file 会被读入。绝对路径，cwd 保持仓库根，read/grep 才能读到代码。
+    // 绝对路径，cwd 保持仓库根，read/grep 才能读到代码。
     const messagePath = path.join(scratch, "message.md");
     await writeFile(messagePath, request.message);
-    const argv = [
-      "--mode", "json",
-      "--no-session",
-      "--offline",
-      "--model", request.model,
-      "--tools", "read,grep",
-      "--system-prompt", rolePromptPath(request.role),
-      "--no-extensions",
-      "--no-skills",
-      "--no-prompt-templates",
-      "--no-themes",
-      "--no-context-files",
-      "--no-approve",
-      "--", `@${messagePath}`,
-    ];
+    const argv = roleArgv(found.host, request.role, request.model, messagePath);
     const outcome = await runProcess({
       cwd: request.workRoot,
-      cmd: [process.execPath, cli, ...argv],
+      cmd: [process.execPath, found.cli, ...argv],
       env: { ...process.env },
       timeoutMs: request.timeoutMs ?? roleTimeoutMs(request.role),
       stdoutPath: path.join(scratch, "stdout.jsonl"),
