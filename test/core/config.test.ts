@@ -42,6 +42,7 @@ test("最小配置不启用任何行为", async () => {
       check: null,
       protect: { paths: [] },
       models: { explorer: null, review: null, over_review: null, research: null, historian: null },
+      router: null,
     });
   } finally {
     await rm(repo, { recursive: true, force: true });
@@ -77,6 +78,7 @@ over_review = "gateway/blunt"
         research: null,
         historian: null,
       },
+      router: null,
     });
   } finally {
     await rm(repo, { recursive: true, force: true });

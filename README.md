@@ -228,6 +228,14 @@ review = "gateway/careful"
 over_review = "gateway/blunt"
 research = "openrouter/anthropic/claude"   # 只按第一个斜杠分 provider
 historian = "gateway/cheap-model"
+
+[router]                    # 审查闸门；不写这一节就不预判，review / over_review 每次都起子进程
+url = "http://localhost:11434/v1/systemone"   # System One 接口：Jev 官方、Ollama（0.35+）、OpenJev 通用
+model = "nimble"            # 该服务上的决策模型名
+api_key_env = "TYPESAFE_API_KEY"   # 存 key 的环境变量名，不是 key 本身；本地 Ollama 不写
+timeout_ms = 5000           # 缺省 5000
+skip_below = 0.1            # 缺省 0.1：判“有问题”的概率不高于它就放行
+audit_rate = 0.1            # 缺省 0.1：放行的里面随机抽这个比例仍去审查，用来量漏判
 ```
 
 ### 结束检查怎么跑
@@ -255,6 +263,24 @@ historian = "gateway/cheap-model"
 {"kind":"usage","time":"…","session":"…","model":"gateway/medium-model","input":12000,"output":800,"cache_read":9000,"cache_write":0,"cost_total":0.03}
 {"kind":"event","time":"…","session":"…","event":"check","detail":{"exit_code":0,"timed_out":false,"spawn_error":null,"ms":12400,"outcome":"passed"}}
 ```
+
+### 审查闸门
+
+`[router]` 配了之后，`cw_review` 和 `cw_over_review` 在起子进程前先问决策模型一个是非题：“这次改动是否存在行为错误”（over_review 问“是否包含没有需求支撑的抽象、兜底、配置项或多余测试”），状态是传给角色的那段要求加 diff。返回的 `noul` 是“有问题”的概率：
+
+- 不高于 `skip_below`：不起审查模型，直接返回 `none`，并注明是预判放行。
+- 高于 `skip_below`：照常起审查模型。
+- 放行的里面按 `audit_rate` 随机抽一部分仍去审查，抽查的结果就是漏判率的样本。
+
+**闸门只能省调用，不能让审查少跑。** 请求失败、超时、HTTP 错误（本地 Ollama 的请求文本超过 64 KiB 会返回 413）、响应格式不对、环境变量没设，都按“不放行”处理，审查照常跑。
+
+三个数值（`skip_below`、`audit_rate`、`timeout_ms`）的缺省值是起点，没有经过实测校准。每次闸门都写一条 `gate` 事件到 `.cw/meter.jsonl`：
+
+```json
+{"kind":"event","time":"…","session":"…","event":"gate","detail":{"role":"review","model":"nimble","p":0.03,"skipped":true,"audited":false,"error":null,"ms":180}}
+```
+
+校准方法：把 `audit_rate` 调到 1，让每次放行都去审查，再对照 `gate`（`p`）与随后 `review`/`over_review` 事件的 `result`（`none` 或 `answer`）。`p` 低而 `result` 是 `answer` 的就是漏判。`confidence` 字段没有用：Ollama 文档说明它只是概率分布的集中度，不是校准过的正确率。
 
 ## 在 OMP 和 OMO 里使用
 

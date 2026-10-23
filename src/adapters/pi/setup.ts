@@ -71,6 +71,8 @@ export async function runSetup(ctx: ExtensionCommandContext, repo: string): Prom
     doc.protect = { paths: paths.split(",").map((item) => item.trim()).filter((item) => item !== "") };
   }
   if (Object.keys(models).length > 0) doc.models = models;
+  // /cw-setup 不问 router，重写时原样带上，不能丢。
+  if (existing?.router) doc.router = existing.router;
 
   const text = stringify(doc);
   try {

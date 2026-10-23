@@ -10,6 +10,7 @@ import { Type } from "typebox";
 import type { ProjectConfig } from "../../core/config.js";
 import { writeCwFile } from "../../core/cwfile.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
+import { gate } from "../../core/router.js";
 import { rolePromptPath, type RoleName } from "../../roles/prompts.js";
 import { runRole } from "../../roles/run.js";
 
@@ -116,6 +117,17 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
         const message = role.input === "question"
           ? (params as { question: string }).question
           : reviewMessage(params as { request: string; diff: string });
+        const router = registration.getProject()?.router ?? null;
+        if (router !== null && (role.name === "review" || role.name === "over_review")) {
+          const verdict = await gate(router, role.name, message, signal);
+          await recordEvent(repo, ctx.sessionManager.getSessionId(), "gate", {
+            role: role.name, model: router.model, p: verdict.p, skipped: verdict.skip,
+            audited: verdict.audited, error: verdict.error, ms: verdict.ms,
+          });
+          if (verdict.skip) {
+            return text(`[counterweight] ${role.tool}（预判放行：${router.model} 判有问题的概率 ${verdict.p} ≤ ${router.skip_below}，未起审查模型）：\nnone`);
+          }
+        }
         return text((await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration)).text);
       },
     });

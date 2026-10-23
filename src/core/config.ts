@@ -1,5 +1,5 @@
 /**
- * 读取并校验 `.cw/project.toml`：`[check]` 结束检查、`[protect]` 受保护路径、`[models]` 五个角色。
+ * 读取并校验 `.cw/project.toml`：`[check]` 结束检查、`[protect]` 受保护路径、`[models]` 五个角色、`[router]` 审查闸门。
  * 文件和每个小节都可选。解析或校验失败一律抛错，不返回半套配置。
  * 旧的 `[explorer]`、`[observe]` 是未知字段，会让整份配置失败，检查和保护一起停。
  */
@@ -24,6 +24,23 @@ export interface RoleModels {
   historian: string | null;
 }
 
+/**
+ * Jev 这类决策模型（System One 接口）的端点，给 cw_review / cw_over_review 当闸门。
+ * `api_key_env` 是存 key 的环境变量名，本地无需鉴权的服务可不设。
+ * 三个数值的默认值是起点，不是实测结论；要靠 `.cw/meter.jsonl` 里的 gate 事件校准。
+ */
+export interface RouterConfig {
+  url: string;
+  api_key_env: string | null;
+  model: string;
+  /** 请求超时，毫秒。 */
+  timeout_ms: number;
+  /** 模型判“有问题”的概率不高于它才放行（不起审查模型）。 */
+  skip_below: number;
+  /** 判放行后仍随机抽这个比例去跑审查，用来量漏判。 */
+  audit_rate: number;
+}
+
 export interface ProjectConfig {
   version: 1;
   /** 结束检查；未配置时为 null。 */
@@ -35,6 +52,8 @@ export interface ProjectConfig {
    * 值是 `provider/model`，只按第一个斜杠分，model 里可以再有斜杠。
    */
   models: RoleModels;
+  /** 审查闸门用的决策模型；未配置为 null，review / over_review 不预判。 */
+  router: RouterConfig | null;
 }
 
 /**
@@ -68,6 +87,19 @@ const projectSchema = {
       additionalProperties: false,
       required: ["paths"],
       properties: { paths: { type: "array", items: { type: "string", minLength: 1 } } },
+    },
+    router: {
+      type: "object",
+      additionalProperties: false,
+      required: ["url", "model"],
+      properties: {
+        url: { type: "string", pattern: "^https?://[^\\s]+$" },
+        api_key_env: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]*$" },
+        model: { type: "string", minLength: 1 },
+        timeout_ms: { type: "integer", minimum: 1 },
+        skip_below: { type: "number", minimum: 0, maximum: 1 },
+        audit_rate: { type: "number", minimum: 0, maximum: 1 },
+      },
     },
     models: {
       type: "object",
@@ -108,6 +140,10 @@ export function parseProjectConfig(text: string): ProjectConfig {
   const value = parsed as {
     check?: { cmd: string[]; timeout_s?: number; env?: Record<string, string> };
     protect?: { paths: string[] };
+    router?: {
+      url: string; api_key_env?: string; model: string;
+      timeout_ms?: number; skip_below?: number; audit_rate?: number;
+    };
     models?: { explorer?: string; review?: string; over_review?: string; research?: string; historian?: string };
   };
   return {
@@ -124,6 +160,14 @@ export function parseProjectConfig(text: string): ProjectConfig {
       over_review: value.models?.over_review ?? null,
       research: value.models?.research ?? null,
       historian: value.models?.historian ?? null,
+    },
+    router: value.router === undefined ? null : {
+      url: value.router.url,
+      api_key_env: value.router.api_key_env ?? null,
+      model: value.router.model,
+      timeout_ms: value.router.timeout_ms ?? 5000,
+      skip_below: value.router.skip_below ?? 0.1,
+      audit_rate: value.router.audit_rate ?? 0.1,
     },
   };
 }
