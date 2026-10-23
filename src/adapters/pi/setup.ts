@@ -43,27 +43,29 @@ export async function runSetup(ctx: ExtensionCommandContext, repo: string): Prom
     else if (picked !== SKIP) models[role] = picked;
   }
 
+  // 标题里带说明：TUI 的 input 不显示 placeholder；RPC 客户端可能不允许提交空值，所以 = 也表示保持。
+  // Hints live in the title: the TUI input ignores the placeholder, and an RPC client may refuse an empty submit, so = also means keep.
   const checkLine = await ctx.ui.input(
-    "结束检查命令（每轮结束跑一次，退出码非 0 算失败）",
-    existing?.check === null || existing === null ? "例如 npm test；留空不设" : `现为 ${existing.check.cmd.join(" ")}；留空保持，- 清除`,
+    `结束检查命令（每轮结束跑一次，退出码非 0 算失败）\n${existing?.check ? `现为 ${existing.check.cmd.join(" ")}；= 保持，- 清除` : "例如 npm test；- 表示不设"}`,
+    "npm test",
   );
   if (checkLine === undefined) return false;
   const pathsLine = await ctx.ui.input(
-    "受保护路径（逗号分隔，agent 不能直接改）",
-    existing === null || existing.protect.paths.length === 0 ? "例如 tests/, package.json；留空不设" : `现为 ${existing.protect.paths.join(", ")}；留空保持，- 清除`,
+    `受保护路径（逗号分隔，agent 不能直接改）\n${existing && existing.protect.paths.length > 0 ? `现为 ${existing.protect.paths.join(", ")}；= 保持，- 清除` : "例如 tests/, package.json；- 表示不设"}`,
+    "tests/, package.json",
   );
   if (pathsLine === undefined) return false;
 
   const doc: Record<string, unknown> = { version: 1 };
   const check = checkLine.trim();
-  if (check === "") {
+  if (check === "" || check === "=") {
     if (existing?.check) doc.check = existing.check;
   } else if (check !== "-") {
     // shortcut: 按空白切 argv，不识别引号，需要引号的命令请手写 project.toml。
     doc.check = { ...existing?.check, cmd: check.split(/\s+/) };
   }
   const paths = pathsLine.trim();
-  if (paths === "") {
+  if (paths === "" || paths === "=") {
     if (existing && existing.protect.paths.length > 0) doc.protect = { paths: existing.protect.paths };
   } else if (paths !== "-") {
     doc.protect = { paths: paths.split(",").map((item) => item.trim()).filter((item) => item !== "") };
