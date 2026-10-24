@@ -27,8 +27,9 @@ export interface RoleModels {
 }
 
 /**
- * 各角色子进程的超时，秒。没写的角色用内置默认（research 1800，其余 300）。
- * 大 diff、慢模型会撞上默认值，所以这里可调；到点整个进程组被终止，工具返回“超时”。
+ * 各角色子进程在“调用方没传 timeout_s”时的超时，秒。没写的角色用内置默认（research 1800，其余 300）。
+ * 工具调用自己传 `timeout_s`（300–1800）时以调用方为准；自动运行（[auto]）和 PAUSE 没有调用方，只看这里。
+ * 到点整个进程组被终止，工具返回“超时”并给出下一档。
  */
 export type RoleTimeouts = Partial<Record<keyof RoleModels, number>>;
 
@@ -142,12 +143,12 @@ const projectSchema = {
       type: "object",
       additionalProperties: false,
       properties: {
-        explorer: { type: "integer", minimum: 1 },
-        review: { type: "integer", minimum: 1 },
-        over_review: { type: "integer", minimum: 1 },
-        research: { type: "integer", minimum: 1 },
-        historian: { type: "integer", minimum: 1 },
-        planner: { type: "integer", minimum: 1 },
+        explorer: { type: "integer", minimum: 300, maximum: 1800 },
+        review: { type: "integer", minimum: 300, maximum: 1800 },
+        over_review: { type: "integer", minimum: 300, maximum: 1800 },
+        research: { type: "integer", minimum: 300, maximum: 1800 },
+        historian: { type: "integer", minimum: 300, maximum: 1800 },
+        planner: { type: "integer", minimum: 300, maximum: 1800 },
       },
     },
     auto: {

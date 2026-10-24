@@ -79,3 +79,18 @@ test("workingDiff：已跟踪的改动给 diff，未跟踪只列名字，.cw 不
     await rm(plain, { recursive: true, force: true });
   }
 });
+
+test("超时档位：夹进 [300, 1800]，下一档翻倍并封顶，用满上限返回 null", async () => {
+  const { clampTimeoutS, nextTimeoutS } = await import("../../src/roles/run.ts");
+  expect(clampTimeoutS(600)).toBe(600);
+  expect(clampTimeoutS(1)).toBe(300);
+  expect(clampTimeoutS(99_999)).toBe(1_800);
+  expect(clampTimeoutS(450.6)).toBe(451);
+  for (const bad of [undefined, null, "600", NaN, Infinity]) expect(clampTimeoutS(bad)).toBeUndefined();
+
+  expect(nextTimeoutS(300_000)).toBe(600);
+  expect(nextTimeoutS(600_000)).toBe(1_200);
+  expect(nextTimeoutS(1_200_000)).toBe(1_800);
+  expect(nextTimeoutS(1_800_000)).toBeNull();
+  expect(nextTimeoutS(2_000_000)).toBeNull();
+});

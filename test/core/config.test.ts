@@ -195,14 +195,14 @@ pause = true
   }
 });
 
-test("[timeouts] 读出秒数；0、负数、小数和未知角色被拒绝", async () => {
-  const ok = await repoWith("version = 1\n[timeouts]\nreview = 900\nresearch = 3600\n");
+test("[timeouts] 读出秒数；范围 300–1800，之外、小数、字符串和未知角色被拒绝", async () => {
+  const ok = await repoWith("version = 1\n[timeouts]\nreview = 900\nresearch = 1800\nplanner = 300\n");
   try {
-    expect((await loadProjectConfig(ok))!.timeouts).toEqual({ review: 900, research: 3600 });
+    expect((await loadProjectConfig(ok))!.timeouts).toEqual({ review: 900, research: 1800, planner: 300 });
   } finally {
     await rm(ok, { recursive: true, force: true });
   }
-  for (const body of ["review = 0", "review = -5", "review = 1.5", 'review = "300"', "reviewer = 300"]) {
+  for (const body of ["review = 299", "review = 1801", "review = 0", "review = -5", "review = 450.5", 'review = "300"', "reviewer = 300"]) {
     const repo = await repoWith(`version = 1\n[timeouts]\n${body}\n`);
     try {
       await expect(loadProjectConfig(repo), body).rejects.toThrow(/project\.toml/);

@@ -178,3 +178,39 @@ test("审查者以 ASK 提问：返回补充指引，统计记为 ask", async ()
     await cleanup();
   }
 });
+
+// 调用方按输入大小自己定超时；最短 300，最长 1800；超时后返回里直接给下一档。
+test("timeout_s：声明范围 300–1800；超时后按翻倍给下一档，用满上限则说拆小", async () => {
+  const { repo, cleanup } = await setup();
+  try {
+    const project = await loadProjectConfig(repo);
+    const local = new Map<string, { execute: ToolExecute; parameters: unknown }>();
+    registerTools({ registerTool: (tool: { name: string; execute: ToolExecute; parameters: unknown }) => local.set(tool.name, tool) } as unknown as ExtensionAPI, {
+      getProject: () => project, getRepo: () => repo, cliPath: fakeCli,
+      realWaitMs: 400, // 真实只等 0.4 秒；档位和建议仍按 timeout_s 算
+    });
+    const schema = JSON.stringify(local.get("cw_review")!.parameters);
+    expect(schema).toContain("timeout_s");
+    expect(schema).toContain('"minimum":300');
+    expect(schema).toContain('"maximum":1800');
+
+    process.env.CW_FAKE_ROLE = "hang"; // 子进程不退出，只能靠超时终止
+    const review = (extra: Record<string, unknown>) =>
+      local.get("cw_review")!.execute("1", { request: "r", diff: "@@\n+x\n", ...extra } as Record<string, string>, undefined, undefined, ctx);
+
+    // 不传：默认 300 秒这一档 -> 建议 600
+    expect((await review({})).content[0]!.text).toContain("timeout_s=600");
+    // 传 300 -> 600；传 1200 -> 1800；传 1800 -> 不再加，说拆小
+    expect((await review({ timeout_s: 300 })).content[0]!.text).toContain("timeout_s=600");
+    expect((await review({ timeout_s: 1200 })).content[0]!.text).toContain("timeout_s=1800");
+    const full = (await review({ timeout_s: 1800 })).content[0]!.text;
+    expect(full).toContain("拆小");
+    expect(full).not.toContain("timeout_s=");
+    // 越界被夹住：传 50 按 300 算，传 99999 按 1800 算
+    expect((await review({ timeout_s: 50 })).content[0]!.text).toContain("timeout_s=600");
+    expect((await review({ timeout_s: 99_999 })).content[0]!.text).toContain("拆小");
+  } finally {
+    delete process.env.CW_FAKE_ROLE;
+    await cleanup();
+  }
+}, 30_000);

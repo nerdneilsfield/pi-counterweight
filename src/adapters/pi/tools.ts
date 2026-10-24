@@ -12,7 +12,18 @@ import { writeCwFile } from "../../core/cwfile.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { gate } from "../../core/router.js";
 import { rolePromptPath, type RoleName } from "../../roles/prompts.js";
-import { runRole } from "../../roles/run.js";
+import { clampTimeoutS, MAX_TIMEOUT_S, MIN_TIMEOUT_S, nextTimeoutS, roleTimeoutMs, runRole } from "../../roles/run.js";
+
+/**
+ * 超时后给调用方的下一步：翻倍重试，封顶 1800；已经用满 1800 就别再加，该拆小输入。
+ * 写在返回文本里，调用方不用记规则。
+ */
+function timeoutAdvice(tool: string, usedMs: number): string {
+  const next = nextTimeoutS(usedMs);
+  return next === null
+    ? `已经用满 ${MAX_TIMEOUT_S} 秒上限，再加没有用：把输入拆小（分文件、分提交）后再调用 ${tool}。`
+    : `下一档：用 timeout_s=${next} 重新调用 ${tool}（每次翻倍，上限 ${MAX_TIMEOUT_S}）。`;
+}
 
 /** 记账只需要会话 id，所以结算时的 ExtensionContext 也能用。 */
 export interface SessionCtx {
@@ -26,6 +37,8 @@ export interface ToolRegistration {
   cliPath?: string;
   /** 测试用：覆盖该角色的超时。 */
   timeoutMs?: Partial<Record<RoleName, number>>;
+  /** 测试用：只压短真实等待（毫秒），申报的档位和“下一档”建议仍按调用方给的 timeout_s 算。 */
+  realWaitMs?: number;
 }
 
 const ROLES: Array<{
@@ -101,13 +114,21 @@ export function queueChronicle<T>(turn: () => Promise<T>): Promise<T> {
 
 export function registerTools(pi: ExtensionAPI, registration: ToolRegistration): void {
   for (const role of ROLES) {
+    // 每个工具都带一个可选的 timeout_s：调用方按输入大小估。不传用默认，最短 300，最长 1800。
+    const timeoutField = {
+      timeout_s: Type.Optional(Type.Integer({
+        minimum: MIN_TIMEOUT_S, maximum: MAX_TIMEOUT_S,
+        description: `本次调用的超时秒数（${MIN_TIMEOUT_S}–${MAX_TIMEOUT_S}，越界会被夹住）。按输入大小估：小输入不传，用默认 ${MIN_TIMEOUT_S}；明显很大（长 diff、跨很多文件）就先设长一些。超时后返回里会给下一档（每次翻倍），照着重试；已到 ${MAX_TIMEOUT_S} 还超时就拆小输入，别再加。`,
+      })),
+    };
     const parameters = role.input === "question"
-      ? Type.Object({ question: Type.String({ minLength: 1 }) }, { additionalProperties: false })
+      ? Type.Object({ question: Type.String({ minLength: 1 }), ...timeoutField }, { additionalProperties: false })
       : role.input === "report"
-      ? Type.Object({ report: Type.String({ minLength: 1 }) }, { additionalProperties: false })
+      ? Type.Object({ report: Type.String({ minLength: 1 }), ...timeoutField }, { additionalProperties: false })
       : Type.Object({
           request: Type.String({ minLength: 1 }),
           diff: Type.String({ minLength: 1 }),
+          ...timeoutField,
         }, { additionalProperties: false });
     pi.registerTool({
       name: role.tool,
@@ -122,9 +143,10 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
         }
         const repo = registration.getRepo();
         if (repo === null) return text(`[counterweight] 会话尚未确定仓库根，${role.tool} 不可用。`);
+        const askedS = clampTimeoutS((params as { timeout_s?: unknown }).timeout_s);
         if (role.input === "report") {
           const report = (params as { report: string }).report;
-          return text(await queueChronicle(() => chronicle(ctx, repo, model, report, signal, registration)));
+          return text(await queueChronicle(() => chronicle(ctx, repo, model, report, signal, registration, askedS)));
         }
         const message = role.input === "question"
           ? (params as { question: string }).question
@@ -140,10 +162,10 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
             return text(`[counterweight] ${role.tool}（预判放行：${router.model} 判有问题的概率 ${verdict.p} ≤ ${router.skip_below}，未起审查模型）：\nnone`);
           }
         }
-        const run = await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration);
+        const run = await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration, askedS);
         // 审查者问问题时，补充信息写进 request 再调一次；子进程是一次性的，不会记得上次。
-        const asked = role.input === "review" && run.answer?.trim().startsWith("ASK:");
-        return text(asked ? `${run.text}\n审查者需要补充信息：回答上面的问题，把答案写进 request，再调用 ${role.tool} 一次。` : run.text);
+        const asking = role.input === "review" && run.answer?.trim().startsWith("ASK:");
+        return text(asking ? `${run.text}\n审查者需要补充信息：回答上面的问题，把答案写进 request，再调用 ${role.tool} 一次。` : run.text);
       },
     });
   }
@@ -156,9 +178,15 @@ export function reviewMessage(params: { request: string; diff: string }): string
 export async function runAndMeter(
   ctx: SessionCtx, repo: string, role: RoleName, tool: string, model: string,
   message: string, signal: AbortSignal | undefined, registration: ToolRegistration,
+  askedS?: number,
 ): Promise<{ text: string; answer: string | null }> {
   const session = ctx.sessionManager.getSessionId();
   const started = Date.now();
+  // 调用方这次要求的优先；其次是测试覆盖、[timeouts] 里用户配的，最后是内置默认。
+  const configured = registration.getProject()?.timeouts[role];
+  const timeoutMs = askedS !== undefined ? askedS * 1000
+    : registration.timeoutMs?.[role] ?? (configured !== undefined ? configured * 1000 : roleTimeoutMs(role));
+  const waitMs = registration.realWaitMs ?? timeoutMs;
   const run = await runRole({
     role,
     workRoot: repo,
@@ -166,9 +194,7 @@ export async function runAndMeter(
     message,
     signal,
     cliPath: registration.cliPath,
-    // 测试覆盖优先，其次是 [timeouts] 里用户配的秒数，都没有就用 runRole 的默认。
-    timeoutMs: registration.timeoutMs?.[role]
-      ?? (() => { const seconds = registration.getProject()?.timeouts[role]; return seconds === undefined ? undefined : seconds * 1000; })(),
+    timeoutMs: waitMs,
   });
   let spent = 0;
   let meterError: string | null = null;
@@ -197,7 +223,7 @@ export async function runAndMeter(
       outcome: "failed", error: run.error, tokens: spent, ms: Date.now() - started,
       timed_out: run.timedOut, cancelled: run.cancelled,
     });
-    return { answer: null, text: `[counterweight] ${tool} 未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。` };
+    return { answer: null, text: `[counterweight] ${tool} 未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。${run.timedOut ? timeoutAdvice(tool, timeoutMs) : ""}` };
   }
   // result 区分白跑（none）、史官提问（ask）和有内容的回答，供判断这个角色值不值得自动跑。
   const head = run.answer!.trim();
@@ -217,7 +243,7 @@ export async function runAndMeter(
  */
 export async function chronicle(
   ctx: SessionCtx, repo: string, model: string, report: string,
-  signal: AbortSignal | undefined, registration: ToolRegistration,
+  signal: AbortSignal | undefined, registration: ToolRegistration, askedS?: number,
 ): Promise<string> {
   let current = "";
   try {
@@ -228,7 +254,7 @@ export async function chronicle(
     }
   }
   const message = `当前文档：\n${current === "" ? "（空）" : current}\n\n汇报：\n${report}\n`;
-  const { text: note, answer } = await runAndMeter(ctx, repo, "historian", "cw_chronicle", model, message, signal, registration);
+  const { text: note, answer } = await runAndMeter(ctx, repo, "historian", "cw_chronicle", model, message, signal, registration, askedS);
   if (answer === null) return note;
   const body = answer.trim();
   if (body.startsWith("ASK:")) return `${note}\n史官需要你协调后再汇报，文档未改动。`;

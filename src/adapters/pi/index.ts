@@ -158,8 +158,9 @@ async function withTimeout<R>(
  * @param pi - pi 扩展 API 句柄 / The pi extension API handle
  * @param timeouts - 覆盖默认的事件超时 / Overrides for the default timeouts
  * @param roleCli - 测试用：覆盖角色子进程的 pi CLI / Test only: override the CLI role children run
+ * @param realWaitMs - 测试用：只压短角色子进程的真实等待，配置里的超时和外层预算推导不变 / Test only: shorten the real wait only
  */
-export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<AdapterTimeouts>, roleCli?: string): void {
+export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<AdapterTimeouts>, roleCli?: string, realWaitMs?: number): void {
   const limits: AdapterTimeouts = { ...DEFAULT_TIMEOUTS, ...timeouts };
   let repo: string | null = null;
   let project: ProjectConfig | null = null;
@@ -252,7 +253,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     return await withTimeout(pauseBudget(), async (signal) => {
       const messages = ctx.sessionManager.buildSessionProjection().messages as unknown as TranscriptMessage[];
       const message = plannerMessage(renderTranscript(messages), relative!, event.toolName, event.input as Record<string, unknown>);
-      const run = await runAndMeter(ctx, root, "planner", "cw_pause", planner, message, signal, { getProject: () => project, getRepo: () => repo, cliPath: roleCli });
+      const run = await runAndMeter(ctx, root, "planner", "cw_pause", planner, message, signal, { getProject: () => project, getRepo: () => repo, cliPath: roleCli, realWaitMs });
       await recordEvent(root, session, "pause", {
         outcome: run.answer === null ? "failed" : "planned", ms: Date.now() - started, tool: event.toolName,
       });
@@ -394,7 +395,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     if (!plan.review && !plan.chronicle) return { text: null, continueRun: false };
     const lines: string[] = [];
     let continueRun = false;
-    const registration = { getProject: () => project, getRepo: () => repo, cliPath: roleCli };
+    const registration = { getProject: () => project, getRepo: () => repo, cliPath: roleCli, realWaitMs };
 
     if (plan.review) {
       const message = reviewMessage({ request: turnRequest, diff: diff! });
@@ -524,6 +525,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     getProject: () => project,
     getRepo: () => repo,
     cliPath: roleCli,
+    realWaitMs,
   });
 
   // RPC 客户端（如 Paseo）要等命令处理函数返回才收到 prompt 的响应，并按 60 秒判超时；

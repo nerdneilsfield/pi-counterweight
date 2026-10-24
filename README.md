@@ -230,10 +230,9 @@ research = "openrouter/anthropic/claude"   # 只按第一个斜杠分 provider
 historian = "gateway/cheap-model"
 planner = "openrouter/strong/model"        # 无工具；要比主模型更强才有用，同款模型几乎没有收益
 
-[timeouts]                  # 各角色子进程的超时，秒；没写的角色用默认（research 1800，其余 300）
-# review = 900              # 大 diff 或慢模型时调大；到点整个进程组被终止
-# over_review = 900
-# planner = 600             # PAUSE 的 planner 也用它；超时则放行那次编辑
+[timeouts]                  # 没人指定 timeout_s 时的默认（秒），范围 300–1800；没写的角色：research 1800，其余 300
+# review = 600              # 自动运行（[auto]）和 PAUSE 没有调用方，只看这里
+# planner = 600             # PAUSE 的 planner；超时则放行那次编辑
 
 [auto]                      # 强制启用；不写这一节，三项都由主模型自己决定调不调用
 review = false              # 每次正常结束，对工作树相对 HEAD 的改动自动跑 review 与 over_review
@@ -344,7 +343,9 @@ omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 
 | `cw_chronicle` | 一段阶段性汇报 | 重写 `.cw/HISTORY.md`；写不下去时返回 `ASK:` 问题，文档不动 | 300 秒 |
 | （PAUSE 内部） | 调查记录 + 被拦下的编辑 | planner 写四段修复计划，无工具 | 300 秒 |
 
-各角色的超时是默认值，不是上限：大 diff 或慢模型会撞上，在 `[timeouts]` 里按角色调（单位秒），见上面的配置参考。
+**超时由调用方定。** 每个角色工具都有一个可选参数 `timeout_s`（秒），范围 300–1800，越界会被夹住。输入小就不传，用默认 300；输入明显大（长 diff、跨很多文件）就先设长一点。超时之后，返回文本里直接给出下一档（每次翻倍：300 → 600 → 1200 → 1800），照着重试即可。已经用满 1800 还超时，说明该拆小输入，工具会这样说，不会再建议加。
+
+没人指定 `timeout_s` 的场景（`[auto]` 自动审查、PAUSE 的 planner）读 `[timeouts]` 里按角色配的默认值，同样是 300–1800。
 
 五个只读子进程只有 `read` 和 `grep`，不能改文件；planner（`cw_pause`，只由 PAUSE 内部触发，不是工具）用 `--no-tools`，一个工具也没有。review 不自己跑 `git diff`，diff 由主模型传入。它们不在结束时自动运行，也不决定检查是否通过。没配模型的工具仍在列表里，调用时返回不可用。用量写失败时，已经拿到的回答仍返回。
 
@@ -364,7 +365,7 @@ omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 
 | 模型改不了 `tests/xxx` | 受保护路径拦截。需要改就由你手动改，或调整 `[protect].paths` |
 | bash 改了受保护文件但没被拦 | 设计如此：只拦 `edit`/`write`，bash 不拦截、也不在结算时报告 |
 | 检查失败后模型没被反馈 | 每个失败链只反馈一次；再次失败如实报告。新的一轮用户消息会重新给一次额度 |
-| 审查/汇报返回“超时，子进程组已终止” | 默认只给 300 秒。在 `[timeouts]` 里给对应角色调大（秒），重启生效。自动运行的外层预算会跟着一起加长 |
+| 审查/汇报返回“超时，子进程组已终止” | 主模型手动调用时，照返回里的“下一档”重试（每次翻倍，上限 1800）；到 1800 还超时就拆小 diff。自动运行（`[auto]`）没有调用方，在 `[timeouts]` 里给对应角色调大，重启生效 |
 | 角色工具说未配置 | `[models]` 里没有这个角色。补上 `provider/model` 后重启 |
 | 配置加载失败，提示 `auto.xxx 需要 models.yyy` | 开了强制启用却没配对应模型。补上模型或关掉那一项 |
 | PAUSE 没有出现 | 没开 `[auto].pause`、没配 `planner`、本回合已经拦过一次，或写入的是 `.cw/`、`tmp/` 下的草稿；用 bash 改的也不触发 |

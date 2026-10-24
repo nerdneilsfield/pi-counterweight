@@ -28,7 +28,7 @@ interface Setup {
   calls: () => Promise<Array<{ role: string; argv: string[]; message: string }>>;
 }
 
-async function setup(toml: string, timeouts?: Partial<AdapterTimeouts>): Promise<Setup> {
+async function setup(toml: string, timeouts?: Partial<AdapterTimeouts>, realWaitMs?: number): Promise<Setup> {
   const repo = await realpath(await mkdtemp(path.join(tmpdir(), "cw-auto-")));
   await git(repo, ["init"]);
   await writeFile(path.join(repo, "tracked.txt"), "base\n");
@@ -44,7 +44,7 @@ async function setup(toml: string, timeouts?: Partial<AdapterTimeouts>): Promise
     registerTool: () => undefined,
     registerCommand: () => undefined,
   } as unknown as ExtensionAPI;
-  counterweight(pi, { ...timeouts }, fakeCli);
+  counterweight(pi, { ...timeouts }, fakeCli, realWaitMs);
   const ctx = {
     cwd: repo,
     signal: undefined,
@@ -278,17 +278,16 @@ test("提示按 [auto] 裁剪：强制启用的角色不再叫主模型自己调
   expect(tellsToReportChronicle(half)).toBe(true);
 });
 
-test("[timeouts] 真的限制角色子进程：配 1 秒的 review 在约 1 秒内被终止，不是默认的 300 秒", async () => {
-  const s = await setup(`${MODELS}\n[timeouts]\nreview = 1\nover_review = 1\n\n[auto]\nreview = true\n`);
+test("[timeouts] 到达角色子进程：配 300 秒的 review 挂住时，在真实等待到点后被终止并记 timed_out", async () => {
+  // 配置值是合法的 300 秒；realWaitMs 只把真实等待压到 1 秒，让测试能在秒级结束。
+  const s = await setup(`${MODELS}\n[timeouts]\nreview = 300\nover_review = 300\n\n[auto]\nreview = true\n`, undefined, 1_000);
   cleanup.push(s.repo);
   await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   process.env.CW_FAKE_ROLE = "hang";
   await newTurn(s);
   const started = Date.now();
   const result = await settle(s);
-  const elapsed = Date.now() - started;
-  // 两个审查都挂住；1 秒超时到点后子进程组被终止，结算很快返回，且没有把超时当成发现。
-  expect(elapsed).toBeLessThan(15_000);
+  expect(Date.now() - started).toBeLessThan(15_000);
   expect(result?.continue).toBeUndefined();
   const meter = await readFile(path.join(s.repo, ".cw", "meter.jsonl"), "utf8");
   expect(meter).toMatch(/"event":"review".*"outcome":"failed".*"timed_out":true/);
@@ -301,16 +300,17 @@ test("没配 [timeouts] 时用内置默认", async () => {
   expect(roleTimeoutMs("research")).toBe(1_800_000);
 });
 
-test("外层预算跟随角色超时：审查配得比默认长，外层不会先把它掐掉", async () => {
-  // review 配 5 秒、假审查 2 秒后才回答。如果外层预算仍是固定的 1 秒余量，会在 2 秒前被掐断。
+test("外层预算跟随角色超时：配得比外层默认余量长的审查不会被外层先掐掉", async () => {
+  // review 配 1800 秒（合法上限），假审查 2 秒后才回答。外层预算由 1800 秒推出，远大于 2 秒；
+  // 若外层预算是固定的短值，这里会在审查回答之前被掐断。
   const s = await setup(`${MODELS}
 [check]
 cmd = ["/bin/sh", "-c", "true"]
 timeout_s = 5
 
 [timeouts]
-review = 5
-over_review = 5
+review = 1800
+over_review = 1800
 
 [auto]
 review = true
