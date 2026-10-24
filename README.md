@@ -183,13 +183,13 @@ Counterweight 不要求模型先填任务表、签契约或等待批准。你直
 
 这个取舍让行为更容易预测：配置的检查每轮都执行，命中的直接写入就拒绝。代价也很明确：问答轮同样有检查开销，bash 旁路修改不会被检测。需要严格隔离时，应使用独立的系统权限或运行环境。
 
-### 用别的模型做五件事，主模型继续写
+### 用别的模型做六件事，主模型继续写
 
 运行 `/cw-setup`，按提示从 pi 当前可用的模型里选、填检查命令和保护路径，它替你写 `.cw/project.toml`。
 
-五个角色都是只读子进程，模型各自配置。explorer 找代码，review 只看这段改动有没有做错，over_review 只看这段改动有没有多做，research 处理主模型读代码仍定不下来的问题，historian（赛博史官）维护 `.cw/HISTORY.md`：主模型把阶段性成果用 `cw_chronicle` 汇报给它，它重写整份项目开发史，英文按 ASD-STE100，中文按新华社电讯稿体；它定不下来的事以 `ASK:` 开头发回主模型协调。做完一块改动后，主模型把要求和 diff 交给两个 review；它们只报告，不拦截结束，结束仍只看检查命令的退出码。
+六个角色都是子进程，模型各自配置，除 planner 外只读。explorer 找代码，review 只看这段改动有没有做错，over_review 只看这段改动有没有多做，research 处理主模型读代码仍定不下来的问题，historian（赛博史官）维护 `.cw/HISTORY.md`：主模型把阶段性成果用 `cw_chronicle` 汇报给它，它重写整份项目开发史，英文按 ASD-STE100，中文按新华社电讯稿体；它定不下来的事以 `ASK:` 开头发回主模型协调。planner 没有任何工具，只读会话记录，用于下面的 PAUSE。默认由主模型自己想起来调用 review、over_review 和史官；想让扩展替它做，见下面的「强制启用」。它们只报告，不拦截结束，结束仍只看检查命令的退出码。
 
-`.cw/meter.jsonl` 记录主模型用量、检查和这四个角色的用量。扩展不据此换模型。
+`.cw/meter.jsonl` 记录主模型用量、检查、角色调用和 PAUSE 的用量。扩展不据此换模型。
 
 每次用户回合，扩展还会往系统提示里加一段：少加没有当前调用方的抽象和兜底，用中文先给结论，不写防御性声明。没有项目配置时这段仍然会加。
 
@@ -228,6 +228,17 @@ review = "gateway/careful"
 over_review = "gateway/blunt"
 research = "openrouter/anthropic/claude"   # 只按第一个斜杠分 provider
 historian = "gateway/cheap-model"
+planner = "openrouter/strong/model"        # 无工具；要比主模型更强才有用，同款模型几乎没有收益
+
+[timeouts]                  # 各角色子进程的超时，秒；没写的角色用默认（research 1800，其余 300）
+# review = 900              # 大 diff 或慢模型时调大；到点整个进程组被终止
+# over_review = 900
+# planner = 600             # PAUSE 的 planner 也用它；超时则放行那次编辑
+
+[auto]                      # 强制启用；不写这一节，三项都由主模型自己决定调不调用
+review = false              # 每次正常结束，对工作树相对 HEAD 的改动自动跑 review 与 over_review
+chronicle = false           # 每次正常结束且有改动，自动汇报给史官
+pause = false               # 每个回合第一次改源码前，让 planner 出一次计划（PAUSE）
 
 [router]                    # 审查闸门；不写这一节就不预判，review / over_review 每次都起子进程
 url = "http://localhost:11434/v1/systemone"   # System One 接口：Jev 官方、Ollama（0.35+）、OpenJev 通用
@@ -257,12 +268,33 @@ audit_rate = 0.1            # 缺省 0.1：放行的里面随机抽这个比例�
 
 ### 计量
 
-每条 assistant 消息的 usage、结束检查和四个角色的记录都追加到 `.cw/meter.jsonl`（只增不减）。示例：
+每条 assistant 消息的 usage、结束检查、角色调用和 PAUSE 的记录都追加到 `.cw/meter.jsonl`（只增不减）。示例：
 
 ```json
 {"kind":"usage","time":"…","session":"…","model":"gateway/medium-model","input":12000,"output":800,"cache_read":9000,"cache_write":0,"cost_total":0.03}
 {"kind":"event","time":"…","session":"…","event":"check","detail":{"exit_code":0,"timed_out":false,"spawn_error":null,"ms":12400,"outcome":"passed"}}
 ```
+
+### 强制启用
+
+默认情况下，review、over_review 和史官只在主模型自己调用时才运行，提示里写了让它调用，但它可以不调。`[auto]` 把这三件事改成扩展触发，每一项都单独开关，且要求对应的 `[models]` 角色已配置，否则整份配置加载失败（不会等到运行时才静默不工作）。
+
+- **`review = true`**：每次正常结束、检查定稿后，把工作树相对 `HEAD` 的 diff（含未跟踪文件名）连同本回合的用户原话交给 review 和 over_review 并行审查。两边都回 `none` 或 `ASK:` 就不打扰主模型；有发现就把原文作为结算消息交回，并续跑一轮，**每个用户回合最多一次**，续跑后的结算不再审查。结束检查要求修复时先修复，不审查。
+- **`chronicle = true`**：每次正常结束且工作树有改动，自动把本回合的请求、改动文件和检查结果汇报给史官，走和 `cw_chronicle` 同一条队列。审查有发现的那一轮不汇报，等修复后再说。
+- 自动运行不改变检查结论：它们的失败、超时或空回答只是不产出文字。diff 超过 80000 字符会截断并注明。
+
+用量和事件照常写入 `.cw/meter.jsonl`。
+
+### PAUSE：第一次改源码前先出一份计划
+
+`pause = true` 且配了 `planner` 时：每个用户回合，agent 第一次对源码的 `edit`/`write` 会被拦下，planner 读完前面的整段调查，写一份四段式修复计划（根因、位置、做法、理由），作为拒绝理由交回；主模型可以照做，也可以说明不同意再自行重发。**每个回合只拦这一次**。
+
+- 草稿不算：`.cw/`、`tmp/` 下的写入放行，不耗额度。受保护路径先拦，不会白白请 planner。
+- **失败一律放行**：planner 超时（跟随 `[timeouts].planner`，默认 300 秒）、没有回答、读不出会话记录，这次编辑照常执行。计划是建议，不是闸门。
+- bash 不拦：用 `sed -i` 之类改源码的旁路不会触发 PAUSE。
+- 每次介入记一条 `pause` 事件（`planned` / `failed` / `timeout`、耗时、被拦的工具），用它判断值不值，不要凭感觉。
+
+依据只有一篇论文：弱执行者（Qwen3-Coder-30B）加强规划者（GPT-5.6 Sol），SWE-bench 上 OpenHands 从 45.4% 升到 62.2%；规划者和执行者用同一个模型时只救回 5.4% 的失败轨迹。**没有在强主模型上测过**，所以默认关闭。planner 应该选比主模型更强的模型，否则大概率只是多花一次调用。
 
 ### 审查闸门
 
@@ -299,7 +331,7 @@ omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 
 - **配置校验。** OMP 把 `typebox` 换成自己的兼容层，会丢掉 `pattern`；配置校验因此改用字面量 JSON Schema。
 - 已验证：OMP 18.12.6 和 senpi 2026.10.21-3 的加载器能加载本扩展，OMP 上系统提示注入和 `session_stop` 流程按预期工作。未验证：在它们里面用真实模型跑完整会话，以及 `omo install` 本身（只读了 omo-ai 5.1.44 的源码确认它转给 senpi，没实际执行）。
 
-## 四个只读角色
+## 六个角色
 
 模型名写成 `provider/model`。Pi 按第一个斜杠区分提供商，所以 `openrouter/anthropic/claude` 这种多个斜杠的名字可用。上面配置里的名字都是占位，换成你账号里真实有的模型，保存后重启。
 
@@ -310,8 +342,11 @@ omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 
 | `cw_over_review` | 这次的要求，和 diff | 只报没资格留下的抽象、兜底、多余测试、防御性分支 | 300 秒 |
 | `cw_research` | 一个问题 | 结论在前。没读到的写 `未核实` | 1800 秒 |
 | `cw_chronicle` | 一段阶段性汇报 | 重写 `.cw/HISTORY.md`；写不下去时返回 `ASK:` 问题，文档不动 | 300 秒 |
+| （PAUSE 内部） | 调查记录 + 被拦下的编辑 | planner 写四段修复计划，无工具 | 300 秒 |
 
-五个子进程都只有 `read` 和 `grep`，不能改文件。review 不自己跑 `git diff`，diff 由主模型传入。它们不在结束时自动运行，也不决定检查是否通过。没配模型的工具仍在列表里，调用时返回不可用。用量写失败时，已经拿到的回答仍返回。
+各角色的超时是默认值，不是上限：大 diff 或慢模型会撞上，在 `[timeouts]` 里按角色调（单位秒），见上面的配置参考。
+
+五个只读子进程只有 `read` 和 `grep`，不能改文件；planner（`cw_pause`，只由 PAUSE 内部触发，不是工具）用 `--no-tools`，一个工具也没有。review 不自己跑 `git diff`，diff 由主模型传入。它们不在结束时自动运行，也不决定检查是否通过。没配模型的工具仍在列表里，调用时返回不可用。用量写失败时，已经拿到的回答仍返回。
 
 扩展不核对引用，也不限制回答行数。只读靠工具白名单，不是沙箱。
 
@@ -329,7 +364,10 @@ omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 
 | 模型改不了 `tests/xxx` | 受保护路径拦截。需要改就由你手动改，或调整 `[protect].paths` |
 | bash 改了受保护文件但没被拦 | 设计如此：只拦 `edit`/`write`，bash 不拦截、也不在结算时报告 |
 | 检查失败后模型没被反馈 | 每个失败链只反馈一次；再次失败如实报告。新的一轮用户消息会重新给一次额度 |
+| 审查/汇报返回“超时，子进程组已终止” | 默认只给 300 秒。在 `[timeouts]` 里给对应角色调大（秒），重启生效。自动运行的外层预算会跟着一起加长 |
 | 角色工具说未配置 | `[models]` 里没有这个角色。补上 `provider/model` 后重启 |
+| 配置加载失败，提示 `auto.xxx 需要 models.yyy` | 开了强制启用却没配对应模型。补上模型或关掉那一项 |
+| PAUSE 没有出现 | 没开 `[auto].pause`、没配 `planner`、本回合已经拦过一次，或写入的是 `.cw/`、`tmp/` 下的草稿；用 bash 改的也不触发 |
 | 升级后检查和保护都不跑了 | 配置里还留着 `[explorer]` 或 `[observe]`。未知字段会让整份配置失败。按上面的迁移改完重启 |
 
 ## 使用边界
@@ -337,8 +375,9 @@ omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 
 - **同账户下不是强安全边界。** 拦截靠进程内的路径检查，不能抵抗同账户下的恶意进程或模型伪造。
 - **bash 是旁路。** 只拦 `edit`/`write`；其他途径的修改不会被拦截，也不会被报告。
 - **检查只按退出码判定。** 不解析测试身份、不核对产物哈希、不检查模型是否新增了 skip 或弱化测试；模型自写的测试不能当权威结论。
-- **四个角色的只读是工具白名单。** 不是沙箱。
-- **两个 review 不自动运行。** 主模型不做调用，就没有这份报告。结束仍只看检查命令。
+- **角色的只读是工具白名单。** 不是沙箱。
+- **review 默认不自动运行。** 不开 `[auto].review`、主模型又不调用，就没有这份报告。开了也只报告，结束仍只看检查命令。
+- **PAUSE 只拦 `edit`/`write`，且只在 SWE-bench 的弱执行者设置下有数据。** bash 旁路不触发。
 - **真实模型未在本仓库测试中执行。** `npm test` 不需要模型凭据。
 - **严格流程在 tag 里。** `v1-strict` 保留了契约/先红/证据/门禁的完整实现，需要时 `git switch --detach v1-strict` 查看或移植。
 

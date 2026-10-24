@@ -14,6 +14,11 @@ import { gate } from "../../core/router.js";
 import { rolePromptPath, type RoleName } from "../../roles/prompts.js";
 import { runRole } from "../../roles/run.js";
 
+/** 记账只需要会话 id，所以结算时的 ExtensionContext 也能用。 */
+export interface SessionCtx {
+  sessionManager: { getSessionId(): string };
+}
+
 export interface ToolRegistration {
   getProject: () => ProjectConfig | null;
   getRepo: () => string | null;
@@ -83,9 +88,18 @@ function text(message: string) {
   return { content: [{ type: "text" as const, text: message }], details: undefined };
 }
 
+/**
+ * 并发汇报排队：史官每次重写整份文档，并行会互相覆盖。模型自己调 `cw_chronicle` 和结算时自动汇报
+ * 走同一条队列，所以放在模块级。
+ */
+let chronicleTail: Promise<unknown> = Promise.resolve();
+export function queueChronicle<T>(turn: () => Promise<T>): Promise<T> {
+  const next = chronicleTail.then(turn);
+  chronicleTail = next.catch(() => undefined);
+  return next;
+}
+
 export function registerTools(pi: ExtensionAPI, registration: ToolRegistration): void {
-  // 并发汇报排队：史官每次重写整份文档，并行会互相覆盖。
-  let chronicleTail: Promise<unknown> = Promise.resolve();
   for (const role of ROLES) {
     const parameters = role.input === "question"
       ? Type.Object({ question: Type.String({ minLength: 1 }) }, { additionalProperties: false })
@@ -110,9 +124,7 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
         if (repo === null) return text(`[counterweight] 会话尚未确定仓库根，${role.tool} 不可用。`);
         if (role.input === "report") {
           const report = (params as { report: string }).report;
-          const turn = chronicleTail.then(() => chronicle(ctx, repo, model, report, signal, registration));
-          chronicleTail = turn.catch(() => undefined);
-          return text(await turn);
+          return text(await queueChronicle(() => chronicle(ctx, repo, model, report, signal, registration)));
         }
         const message = role.input === "question"
           ? (params as { question: string }).question
@@ -137,12 +149,12 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
   }
 }
 
-function reviewMessage(params: { request: string; diff: string }): string {
+export function reviewMessage(params: { request: string; diff: string }): string {
   return `要求：\n${params.request}\n\ndiff：\n${params.diff}\n`;
 }
 
-async function runAndMeter(
-  ctx: ExtensionToolContext, repo: string, role: RoleName, tool: string, model: string,
+export async function runAndMeter(
+  ctx: SessionCtx, repo: string, role: RoleName, tool: string, model: string,
   message: string, signal: AbortSignal | undefined, registration: ToolRegistration,
 ): Promise<{ text: string; answer: string | null }> {
   const session = ctx.sessionManager.getSessionId();
@@ -154,7 +166,9 @@ async function runAndMeter(
     message,
     signal,
     cliPath: registration.cliPath,
-    timeoutMs: registration.timeoutMs?.[role],
+    // 测试覆盖优先，其次是 [timeouts] 里用户配的秒数，都没有就用 runRole 的默认。
+    timeoutMs: registration.timeoutMs?.[role]
+      ?? (() => { const seconds = registration.getProject()?.timeouts[role]; return seconds === undefined ? undefined : seconds * 1000; })(),
   });
   let spent = 0;
   let meterError: string | null = null;
@@ -201,8 +215,8 @@ async function runAndMeter(
  * 把汇报连同当前文档交给史官。回答以 `ASK:` 开头就原样交还主模型，不写文件；
  * 不是以 `# ` 开头的整份文档也不写，免得一句闲话覆盖掉全部历史。
  */
-async function chronicle(
-  ctx: ExtensionToolContext, repo: string, model: string, report: string,
+export async function chronicle(
+  ctx: SessionCtx, repo: string, model: string, report: string,
   signal: AbortSignal | undefined, registration: ToolRegistration,
 ): Promise<string> {
   let current = "";

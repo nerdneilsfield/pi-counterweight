@@ -10,7 +10,7 @@ export async function repoToplevel(dir: string): Promise<string | null> {
   return result.stdout.trim();
 }
 
-function git(repo: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+export function git(repo: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {
       cwd: repo,

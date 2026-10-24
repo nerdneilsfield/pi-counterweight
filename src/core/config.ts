@@ -1,5 +1,5 @@
 /**
- * 读取并校验 `.cw/project.toml`：`[check]` 结束检查、`[protect]` 受保护路径、`[models]` 五个角色、`[router]` 审查闸门。
+ * 读取并校验 `.cw/project.toml`：`[check]` 结束检查、`[protect]` 受保护路径、`[models]` 六个角色、`[timeouts]` 各角色的超时、`[auto]` 强制启用、`[router]` 审查闸门。
  * 文件和每个小节都可选。解析或校验失败一律抛错，不返回半套配置。
  * 旧的 `[explorer]`、`[observe]` 是未知字段，会让整份配置失败，检查和保护一起停。
  */
@@ -22,6 +22,27 @@ export interface RoleModels {
   over_review: string | null;
   research: string | null;
   historian: string | null;
+  /** 首次改源码前出一次修复计划的无工具角色；没配就不介入。 */
+  planner: string | null;
+}
+
+/**
+ * 各角色子进程的超时，秒。没写的角色用内置默认（research 1800，其余 300）。
+ * 大 diff、慢模型会撞上默认值，所以这里可调；到点整个进程组被终止，工具返回“超时”。
+ */
+export type RoleTimeouts = Partial<Record<keyof RoleModels, number>>;
+
+/**
+ * 哪些角色由扩展强制启用，而不是等模型自己想起来调用。每一项要求对应的 `[models]` 角色已配置，
+ * 否则加载期报错。默认全为 false：不写 `[auto]` 时行为和以前完全一致。
+ */
+export interface AutoConfig {
+  /** 每次正常结束时，对本会话的改动自动跑 review 与 over_review。 */
+  review: boolean;
+  /** 每次正常结束时，自动把本轮摘要交给史官。 */
+  chronicle: boolean;
+  /** 每个用户回合第一次改源码前，自动让 planner 出一次计划。 */
+  pause: boolean;
 }
 
 /**
@@ -52,6 +73,10 @@ export interface ProjectConfig {
    * 值是 `provider/model`，只按第一个斜杠分，model 里可以再有斜杠。
    */
   models: RoleModels;
+  /** 各角色子进程的超时（秒），没写的角色用默认。 */
+  timeouts: RoleTimeouts;
+  /** 强制启用哪些角色。 */
+  auto: AutoConfig;
   /** 审查闸门用的决策模型；未配置为 null，review / over_review 不预判。 */
   router: RouterConfig | null;
 }
@@ -110,6 +135,28 @@ const projectSchema = {
         over_review: ModelName,
         research: ModelName,
         historian: ModelName,
+        planner: ModelName,
+      },
+    },
+    timeouts: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        explorer: { type: "integer", minimum: 1 },
+        review: { type: "integer", minimum: 1 },
+        over_review: { type: "integer", minimum: 1 },
+        research: { type: "integer", minimum: 1 },
+        historian: { type: "integer", minimum: 1 },
+        planner: { type: "integer", minimum: 1 },
+      },
+    },
+    auto: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        review: { type: "boolean" },
+        chronicle: { type: "boolean" },
+        pause: { type: "boolean" },
       },
     },
   },
@@ -144,8 +191,34 @@ export function parseProjectConfig(text: string): ProjectConfig {
       url: string; api_key_env?: string; model: string;
       timeout_ms?: number; skip_below?: number; audit_rate?: number;
     };
-    models?: { explorer?: string; review?: string; over_review?: string; research?: string; historian?: string };
+    models?: {
+      explorer?: string; review?: string; over_review?: string; research?: string;
+      historian?: string; planner?: string;
+    };
+    timeouts?: RoleTimeouts;
+    auto?: { review?: boolean; chronicle?: boolean; pause?: boolean };
   };
+  const models = {
+    explorer: value.models?.explorer ?? null,
+    review: value.models?.review ?? null,
+    over_review: value.models?.over_review ?? null,
+    research: value.models?.research ?? null,
+    historian: value.models?.historian ?? null,
+    planner: value.models?.planner ?? null,
+  };
+  const auto = {
+    review: value.auto?.review ?? false,
+    chronicle: value.auto?.chronicle ?? false,
+    pause: value.auto?.pause ?? false,
+  };
+  // 强制启用却没配模型是配置错误：加载期就说出来，不要到运行时才静默不工作。
+  const missing = [
+    auto.review && (models.review === null || models.over_review === null)
+      ? "auto.review 需要 models.review 与 models.over_review" : null,
+    auto.chronicle && models.historian === null ? "auto.chronicle 需要 models.historian" : null,
+    auto.pause && models.planner === null ? "auto.pause 需要 models.planner" : null,
+  ].filter((item): item is string => item !== null);
+  if (missing.length > 0) throw new Error(`project.toml: ${missing.join("；")}`);
   return {
     version: 1,
     check: value.check === undefined ? null : {
@@ -154,13 +227,9 @@ export function parseProjectConfig(text: string): ProjectConfig {
       env: value.check.env ?? {},
     },
     protect: { paths: (value.protect?.paths ?? []).map(normalizeProtectedPath) },
-    models: {
-      explorer: value.models?.explorer ?? null,
-      review: value.models?.review ?? null,
-      over_review: value.models?.over_review ?? null,
-      research: value.models?.research ?? null,
-      historian: value.models?.historian ?? null,
-    },
+    models,
+    timeouts: { ...value.timeouts },
+    auto,
     router: value.router === undefined ? null : {
       url: value.router.url,
       api_key_env: value.router.api_key_env ?? null,

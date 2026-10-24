@@ -87,7 +87,7 @@ export function findHostCli(from: string = path.dirname(fileURLToPath(import.met
 }
 
 /**
- * 子进程参数。只读靠 `--tools read,grep` 和关闭自动发现。两个宿主的参数表不同：
+ * 子进程参数。只读靠 `--tools read,grep` 和关闭自动发现；planner 没有任何工具，用 `--no-tools`（pi 与 OMP 的 CLI 都有）。两个宿主的参数表不同：
  * OMP 没有 `--offline`、`--no-context-files`、`--no-prompt-templates`、`--no-themes`、`--no-approve`，传了就报错退出；
  * OMP 在 `--` 之后把一切当文本，所以 `@file` 要放在前面，且不用 `--`。
  *
@@ -101,7 +101,7 @@ export function roleArgv(host: Host, role: RoleName, model: string, messagePath:
     "--mode", "json",
     "--no-session",
     "--model", model,
-    "--tools", "read,grep",
+    ...(role === "planner" ? ["--no-tools"] : ["--tools", "read,grep"]),
     "--system-prompt", rolePromptPath(role),
     "--no-extensions",
     "--no-skills",

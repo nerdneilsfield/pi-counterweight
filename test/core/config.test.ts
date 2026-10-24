@@ -41,7 +41,9 @@ test("最小配置不启用任何行为", async () => {
       version: 1,
       check: null,
       protect: { paths: [] },
-      models: { explorer: null, review: null, over_review: null, research: null, historian: null },
+      models: { explorer: null, review: null, over_review: null, research: null, historian: null, planner: null },
+      timeouts: {},
+      auto: { review: false, chronicle: false, pause: false },
       router: null,
     });
   } finally {
@@ -77,7 +79,10 @@ over_review = "gateway/blunt"
         over_review: "gateway/blunt",
         research: null,
         historian: null,
+        planner: null,
       },
+      timeouts: {},
+      auto: { review: false, chronicle: false, pause: false },
       router: null,
     });
   } finally {
@@ -147,5 +152,62 @@ test("其余校验规则", async () => {
     await expect(loadProjectConfig(broken)).rejects.toThrow(/project\.toml/);
   } finally {
     await rm(broken, { recursive: true, force: true });
+  }
+});
+
+// 强制启用要求对应的模型已配置：缺了就在加载期报错，而不是运行时静默不工作。
+test("[auto] 缺少对应模型时加载期报错", async () => {
+  const cases: Array<[string, RegExp]> = [
+    ["version = 1\n[auto]\nreview = true\n[models]\nreview = \"g/r\"\n", /auto\.review 需要/],
+    ["version = 1\n[auto]\nchronicle = true\n", /auto\.chronicle 需要 models\.historian/],
+    ["version = 1\n[auto]\npause = true\n", /auto\.pause 需要 models\.planner/],
+    ["version = 1\n[auto]\nreveiw = true\n", /project\.toml/],
+  ];
+  for (const [text, message] of cases) {
+    const repo = await repoWith(text);
+    try {
+      await expect(loadProjectConfig(repo)).rejects.toThrow(message);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  }
+});
+
+test("[auto] 模型到位后读出开关与 planner", async () => {
+  const repo = await repoWith(`version = 1
+
+[models]
+review = "g/r"
+over_review = "g/o"
+historian = "g/h"
+planner = "openrouter/strong/model"
+
+[auto]
+review = true
+pause = true
+`);
+  try {
+    const config = await loadProjectConfig(repo);
+    expect(config?.auto).toEqual({ review: true, chronicle: false, pause: true });
+    expect(config?.models.planner).toBe("openrouter/strong/model");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("[timeouts] 读出秒数；0、负数、小数和未知角色被拒绝", async () => {
+  const ok = await repoWith("version = 1\n[timeouts]\nreview = 900\nresearch = 3600\n");
+  try {
+    expect((await loadProjectConfig(ok))!.timeouts).toEqual({ review: 900, research: 3600 });
+  } finally {
+    await rm(ok, { recursive: true, force: true });
+  }
+  for (const body of ["review = 0", "review = -5", "review = 1.5", 'review = "300"', "reviewer = 300"]) {
+    const repo = await repoWith(`version = 1\n[timeouts]\n${body}\n`);
+    try {
+      await expect(loadProjectConfig(repo), body).rejects.toThrow(/project\.toml/);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
   }
 });

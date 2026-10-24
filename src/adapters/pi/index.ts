@@ -2,7 +2,8 @@
  * Counterweight 的 pi 扩展入口。没有任务、契约或批准。
  *
  * `[check]` 在每轮正常结束时跑一次，失败把输出交回一次。`[protect]` 拦截 `edit`/`write`。
- * `[models]` 决定四个只读角色用哪个模型，没配的角色调用时返回不可用。
+ * `[models]` 决定六个角色用哪个模型，没配的角色调用时返回不可用。
+ * `[auto]` 让 review / over_review、史官、PAUSE 由扩展自己触发，而不是等模型想起来调用；默认全关。
  * 没有配置或配置非法时，不检查、不拦截。助手用量仍写入 `.cw/meter.jsonl`。
  * 每次用户回合都往系统提示的 `counterweight` 段写一段说话和构建约束，不管有没有配置。
  */
@@ -19,15 +20,18 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
+import { changedFiles, chronicleReport, workingDiff } from "../../core/auto.js";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
 import { loadProjectConfig, type ProjectConfig } from "../../core/config.js";
 import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
+import { isSourceEdit, pauseReason, plannerMessage, renderTranscript, type TranscriptMessage } from "../../core/pause.js";
 import { isProtected } from "../../core/protect.js";
-import { SESSION_SECTION } from "../../roles/prompts.js";
+import { sessionSection } from "../../roles/prompts.js";
+import { roleTimeoutMs } from "../../roles/run.js";
 import { runSetup } from "./setup.js";
-import { registerTools } from "./tools.js";
+import { chronicle, queueChronicle, registerTools, reviewMessage, runAndMeter } from "./tools.js";
 
 /**
  * 各事件处理的时间预算（毫秒）。扩展入口允许用 `timeouts` 参数局部覆盖，未覆盖的取
@@ -55,6 +59,19 @@ export interface AdapterTimeouts {
    * shutdown handler uses twice this value as its timeout.
    */
   shutdownWaitMs: number;
+  /**
+   * 测试用：覆盖 PAUSE 的外层预算。不传就由 planner 的角色超时推出（默认 300 秒加余量）。
+   * 超时就放行这次编辑：计划只是建议，不能因为规划者慢而卡住主流程。
+   *
+   * Test override for the PAUSE budget; by default it follows the planner's role timeout.
+   */
+  pauseMs?: number;
+  /**
+   * 测试用：覆盖自动审查与汇报的外层预算。不传就由各角色超时推出，在结束检查自己的预算之外另算。
+   *
+   * Test override for the automatic review and chronicle budget; by default it follows the role timeouts.
+   */
+  autoMs?: number;
 }
 
 /**
@@ -140,13 +157,20 @@ async function withTimeout<R>(
  *
  * @param pi - pi 扩展 API 句柄 / The pi extension API handle
  * @param timeouts - 覆盖默认的事件超时 / Overrides for the default timeouts
+ * @param roleCli - 测试用：覆盖角色子进程的 pi CLI / Test only: override the CLI role children run
  */
-export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<AdapterTimeouts>): void {
+export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<AdapterTimeouts>, roleCli?: string): void {
   const limits: AdapterTimeouts = { ...DEFAULT_TIMEOUTS, ...timeouts };
   let repo: string | null = null;
   let project: ProjectConfig | null = null;
   let repairUsed = false;
   let checkRun: CheckHandle | null = null;
+  // PAUSE 每个用户回合只介入一次；和结束检查的修复额度一样，只有 before_agent_start 才重置。
+  let pauseUsed = false;
+  // 本回合用户的原话，自动汇报要用。结算触发的续跑不会覆盖它。
+  let turnRequest = "";
+  // 自动审查的发现最多让主模型续跑一轮；和修复额度、PAUSE 额度一样，只有 before_agent_start 才重置。
+  let findingsUsed = false;
 
   const notifyError = (ctx: ExtensionContext, message: string): void => {
     try {
@@ -163,6 +187,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       try {
         project = await loadProjectConfig(repo);
         repairUsed = false;
+        pauseUsed = false;
         const check = project?.check ?? null;
         if (check !== null) {
           const guard = project !== null && project.protect.paths.length > 0
@@ -185,14 +210,15 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       // assignment would arm protection the fallback just called passive.
       project = null;
       repairUsed = false;
+      pauseUsed = false;
       if (repo === null) repo = await sessionRoot(ctx.cwd).catch(() => realpathOr(ctx.cwd));
       notifyError(ctx, "Counterweight: 会话初始化未能在时限内完成，本会话不拦截工具调用");
       return undefined;
     }));
 
   // ---- tool_call: block direct writes to protected paths ----
-  pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) =>
-    withTimeout(limits.toolCallMs, async (signal) => {
+  pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
+    const protectedResult = await withTimeout(limits.toolCallMs, async (signal) => {
       const root = repo;
       if (root === null || project === null || signal.aborted) return undefined;
       const raw = writeToolPath(event);
@@ -201,7 +227,41 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     }, () => {
       notifyError(ctx, "Counterweight: 写入保护检查未能在时限内完成，本次调用被拒绝");
       return { block: true, reason: "[counterweight] 保护检查超时或失败，写入被拒绝" };
-    }));
+    });
+    // 受保护的先拦；没被拦的写入才轮到 PAUSE。
+    if (protectedResult !== undefined) return protectedResult;
+    return await pauseBeforeFirstEdit(event, ctx);
+  });
+
+  /**
+   * PAUSE：本回合第一次对源码的 edit/write，拦下它，让 planner 读完调查写一份计划。
+   * 只在 `[auto].pause` 打开时介入。任何失败（超时、没拿到回答、会话记录读不出）都放行这次编辑——
+   * 计划是建议，不是闸门；而且额度先扣再请求，所以失败也不会让同一回合被反复拦。
+   */
+  async function pauseBeforeFirstEdit(event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> {
+    const root = repo;
+    const planner = project?.models.planner ?? null;
+    if (root === null || project === null || !project.auto.pause || planner === null || pauseUsed) return undefined;
+    const raw = writeToolPath(event);
+    if (raw === null) return undefined;
+    const relative = toRepoRelative(root, ctx.cwd, raw);
+    if (!isSourceEdit(relative)) return undefined;
+    pauseUsed = true;
+    const started = Date.now();
+    const session = ctx.sessionManager.getSessionId();
+    return await withTimeout(pauseBudget(), async (signal) => {
+      const messages = ctx.sessionManager.buildSessionProjection().messages as unknown as TranscriptMessage[];
+      const message = plannerMessage(renderTranscript(messages), relative!, event.toolName, event.input as Record<string, unknown>);
+      const run = await runAndMeter(ctx, root, "planner", "cw_pause", planner, message, signal, { getProject: () => project, getRepo: () => repo, cliPath: roleCli });
+      await recordEvent(root, session, "pause", {
+        outcome: run.answer === null ? "failed" : "planned", ms: Date.now() - started, tool: event.toolName,
+      });
+      return run.answer === null ? undefined : { block: true, reason: pauseReason(run.answer.trim()) };
+    }, async () => {
+      await recordEvent(root, session, "pause", { outcome: "timeout", ms: Date.now() - started, tool: event.toolName });
+      return undefined;
+    });
+  }
 
   // 新的用户回合重置一次反馈额度，并写入 counterweight 段。
   // 结算触发的续跑不发这个事件，所以失败链的额度不会被续跑重置，这段也不会叠第二次。
@@ -210,25 +270,34 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // OMP 可能对同一次提交重放整条链，每次都从事件给的基线追加，所以不会叠加。
   pi.on("before_agent_start", (event) => {
     repairUsed = false;
+    pauseUsed = false;
+    findingsUsed = false;
+    const prompt = (event as { prompt?: unknown }).prompt;
+    if (typeof prompt === "string") turnRequest = prompt;
+    const section = sessionSection(project?.auto ?? { review: false, chronicle: false });
     const options = (event as { systemPromptOptions?: { sections: Record<string, string> } }).systemPromptOptions;
     if (options !== undefined) {
-      options.sections.counterweight = SESSION_SECTION;
+      options.sections.counterweight = section;
       return undefined;
     }
     const base = (event as { systemPrompt?: unknown }).systemPrompt;
-    return Array.isArray(base) ? ({ systemPrompt: [...base, SESSION_SECTION] } as never) : undefined;
+    return Array.isArray(base) ? ({ systemPrompt: [...base, section] } as never) : undefined;
   });
 
   // ---- agent_before_settle (pi) / session_stop (OMP): run the configured end check once ----
   pi.on("agent_before_settle", (event: AgentBeforeSettleEvent, ctx: ExtensionContext) => {
     const check = project?.check ?? null;
-    const budgetMs = check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs;
+    const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + autoBudget();
     return withTimeout(budgetMs, async (signal) => {
       if (event.outcome !== "completed") return undefined;
       const report = await runCheckOnce(ctx, signal);
-      if (report === undefined) return undefined;
-      const result = { entries: [...event.entries, settleEntry(report.text)] };
-      return report.retrying ? { ...result, continue: true } : result;
+      const entries = report === undefined ? [...event.entries] : [...event.entries, settleEntry(report.text)];
+      if (report?.retrying) return { entries, continue: true };
+      // 检查还要求修复时代码会再变，审查没有意义；定稿了才自动审查与汇报。
+      const auto = await runAuto(ctx, report?.text ?? null, signal);
+      if (auto.text !== null) entries.push(settleEntry(auto.text));
+      if (report === undefined && auto.text === null) return undefined;
+      return auto.continueRun ? { entries, continue: true } : { entries };
     }, () => event.outcome === "completed" && hasCheck() ? { entries: [...event.entries, settleEntry(SETTLE_FALLBACK)] } : undefined);
   });
 
@@ -240,12 +309,14 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   (pi as unknown as { on(name: string, handler: (event: { signal?: AbortSignal }, ctx: ExtensionContext) => unknown): void })
     .on("session_stop", (event, ctx) => {
       const check = project?.check ?? null;
-      const budgetMs = check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs;
+      const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + autoBudget();
       return withTimeout(budgetMs, async (signal) => {
         const report = await runCheckOnce(ctx, signal, event.signal);
-        if (report === undefined) return undefined;
-        ctx.ui.notify(report.text, report.passed ? "info" : "warning");
-        return report.retrying ? { continue: true, additionalContext: report.text } : undefined;
+        if (report !== undefined) ctx.ui.notify(report.text, report.passed ? "info" : "warning");
+        if (report?.retrying) return { continue: true, additionalContext: report.text };
+        const auto = await runAuto(ctx, report?.text ?? null, signal);
+        if (auto.text !== null) ctx.ui.notify(auto.text, "info");
+        return auto.continueRun && auto.text !== null ? { continue: true, additionalContext: auto.text } : undefined;
       }, () => {
         if (hasCheck()) notifyError(ctx, SETTLE_FALLBACK);
         return undefined;
@@ -253,6 +324,104 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     });
 
   const hasCheck = (): boolean => repo !== null && (project?.check ?? null) !== null;
+
+  /**
+   * 角色子进程的实际超时（毫秒）：`[timeouts]` 里配的优先，否则用内置默认。
+   * 外层预算由它推出，所以用户调大角色超时时，外层不会先把它掐掉。
+   */
+  const roleMs = (role: "review" | "over_review" | "historian" | "planner"): number => {
+    const seconds = project?.timeouts[role];
+    return seconds === undefined ? roleTimeoutMs(role) : seconds * 1000;
+  };
+
+  // PAUSE 的外层预算：planner 的超时加一点余量。测试可用 pauseMs 压低它。
+  const pauseBudget = (): number => timeouts?.pauseMs ?? roleMs("planner") + 15_000;
+
+  // 自动运行的外层预算：review 与 over_review 并行（取较长者），再加串行的史官，再加余量。
+  const autoRunMs = (): number => {
+    const auto = project?.auto;
+    if (auto === undefined) return 0;
+    const reviewPart = auto.review ? Math.max(roleMs("review"), roleMs("over_review")) : 0;
+    const chroniclePart = auto.chronicle ? roleMs("historian") : 0;
+    return timeouts?.autoMs ?? reviewPart + chroniclePart + 15_000;
+  };
+
+  const autoBudget = (): number => {
+    const auto = project?.auto;
+    return auto !== undefined && (auto.review || auto.chronicle) ? autoRunMs() : 0;
+  };
+
+  /**
+   * 结算时的强制审查与汇报，只在 `[auto]` 打开时有动作。
+   * review 与 over_review 并行，各自只读；它们只报告，不决定检查是否通过。发现了问题就把原文交回主模型，
+   * 并最多续跑一轮（每个用户回合一次），续跑后的结算只汇报不再审查——否则两边会互相追着跑。
+   * 史官走和 `cw_chronicle` 同一条队列。任何一步失败都只是不产出文字，绝不影响检查结论。
+   *
+   * Forced review and chronicle at settle. Findings go back to the main model with at most one forced
+   * follow-up per user turn; a failure here only yields no text and never touches the check verdict.
+   */
+  async function runAuto(
+    ctx: ExtensionContext, checkLine: string | null, signal: AbortSignal,
+  ): Promise<{ text: string | null; continueRun: boolean }> {
+    // 审查和汇报只是附加：它们坏了或拖得太久，都不能把已经得到的检查结论变成「未能完成」。
+    // 所以它持有自己的预算和取消，且比外层预算（检查预算 + autoMs）短，一定先到点。
+    const own = new AbortController();
+    const forward = () => own.abort();
+    if (signal.aborted) own.abort();
+    else signal.addEventListener("abort", forward, { once: true });
+    const timer = setTimeout(() => own.abort(), Math.max(0, autoRunMs() - 1_000));
+    try {
+      return await runAutoUnsafe(ctx, checkLine, own.signal);
+    } catch {
+      return { text: null, continueRun: false };
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", forward);
+    }
+  }
+
+  async function runAutoUnsafe(
+    ctx: ExtensionContext, checkLine: string | null, signal: AbortSignal,
+  ): Promise<{ text: string | null; continueRun: boolean }> {
+    const root = repo;
+    const config = project;
+    if (root === null || config === null || (!config.auto.review && !config.auto.chronicle)) {
+      return { text: null, continueRun: false };
+    }
+    const diff = await workingDiff(root);
+    const changed = diff !== null && diff.trim() !== "";
+    const plan = { review: config.auto.review && changed, chronicle: config.auto.chronicle && changed };
+    if (!plan.review && !plan.chronicle) return { text: null, continueRun: false };
+    const lines: string[] = [];
+    let continueRun = false;
+    const registration = { getProject: () => project, getRepo: () => repo, cliPath: roleCli };
+
+    if (plan.review) {
+      const message = reviewMessage({ request: turnRequest, diff: diff! });
+      const [correct, over] = await Promise.all([
+        runAndMeter(ctx, root, "review", "cw_review", config.models.review!, message, signal, registration),
+        runAndMeter(ctx, root, "over_review", "cw_over_review", config.models.over_review!, message, signal, registration),
+      ]);
+      const findings = [correct, over]
+        .map((run) => run.answer?.trim() ?? "")
+        .filter((answer) => answer !== "" && answer !== "none" && !answer.startsWith("ASK:"));
+      if (findings.length > 0) {
+        // 额度只决定要不要再续跑一轮；续跑后的最终 diff 照样审查，发现记为事实，不再打断。
+        const again = !findingsUsed;
+        lines.push(again
+          ? `[counterweight] 自动审查有发现，处理或说明为什么不处理：\n\n${findings.join("\n\n")}`
+          : `[counterweight] 自动审查（续跑之后）仍有发现，不再续跑：\n\n${findings.join("\n\n")}`);
+        findingsUsed = true;
+        continueRun = again;
+      }
+    }
+
+    if (plan.chronicle && !continueRun && lines.length === 0 && config.models.historian !== null) {
+      const report = chronicleReport(turnRequest, changedFiles(diff!), checkLine);
+      await queueChronicle(() => chronicle(ctx, root, config.models.historian!, report, signal, registration));
+    }
+    return { text: lines.length === 0 ? null : lines.join("\n\n"), continueRun };
+  }
 
   /**
    * 执行一次结算检查：配置了结束检查就运行，不看工作树有没有变化。
@@ -354,6 +523,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   registerTools(pi, {
     getProject: () => project,
     getRepo: () => repo,
+    cliPath: roleCli,
   });
 
   // RPC 客户端（如 Paseo）要等命令处理函数返回才收到 prompt 的响应，并按 60 秒判超时；

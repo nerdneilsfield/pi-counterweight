@@ -17,7 +17,17 @@ const ROLE_QUESTIONS: Array<[keyof RoleModels, string]> = [
   ["over_review", "over_review（查多做）用哪个模型"],
   ["research", "research（深入研究）用哪个模型"],
   ["historian", "historian（赛博史官，写 .cw/HISTORY.md）用哪个模型"],
+  ["planner", "planner（首次改源码前出一次修复计划，无工具；要比主模型更强才有用）用哪个模型"],
 ];
+
+// 强制启用：每项都要求对应的模型已配置，所以只在模型到位后才问。
+const AUTO_QUESTIONS: Array<["review" | "chronicle" | "pause", string, (models: Record<string, string>) => boolean]> = [
+  ["review", "每次正常结束时自动跑 review 与 over_review？（默认由模型自己想起来调用）", (m) => m.review !== undefined && m.over_review !== undefined],
+  ["chronicle", "每次正常结束时自动汇报给史官？", (m) => m.historian !== undefined],
+  ["pause", "每个回合第一次改源码前自动让 planner 出计划（PAUSE，只在 SWE-bench 上测过，先小范围试）？", (m) => m.planner !== undefined],
+];
+const YES = "是";
+const NO = "否";
 
 const SKIP = "（不配置）";
 const KEEP = "（保持现状）";
@@ -45,6 +55,15 @@ export async function runSetup(ctx: ExtensionCommandContext, repo: string): Prom
 
   // 标题里带说明：TUI 的 input 不显示 placeholder；RPC 客户端可能不允许提交空值，所以 = 也表示保持。
   // Hints live in the title: the TUI input ignores the placeholder, and an RPC client may refuse an empty submit, so = also means keep.
+  const auto: Record<string, boolean> = {};
+  for (const [key, question, ready] of AUTO_QUESTIONS) {
+    if (!ready(models)) continue;
+    const current = existing?.auto[key] ?? false;
+    const picked = await ctx.ui.select(`${question}（现为${current ? YES : NO}）`, [current ? YES : NO, current ? NO : YES]);
+    if (picked === undefined) return false;
+    auto[key] = picked === YES;
+  }
+
   const checkLine = await ctx.ui.input(
     `结束检查命令（每轮结束跑一次，退出码非 0 算失败）\n${existing?.check ? `现为 ${existing.check.cmd.join(" ")}；= 保持，- 清除` : "例如 npm test；- 表示不设"}`,
     "npm test",
@@ -71,8 +90,12 @@ export async function runSetup(ctx: ExtensionCommandContext, repo: string): Prom
     doc.protect = { paths: paths.split(",").map((item) => item.trim()).filter((item) => item !== "") };
   }
   if (Object.keys(models).length > 0) doc.models = models;
-  // /cw-setup 不问 router，重写时原样带上，不能丢。
+  // 只写成 true 的项；全 false 时不写这一节，行为和没有它一样。
+  const enabled = Object.fromEntries(Object.entries(auto).filter(([, on]) => on));
+  if (Object.keys(enabled).length > 0) doc.auto = enabled;
+  // /cw-setup 不问 router 和 timeouts，重写时原样带上，不能丢。
   if (existing?.router) doc.router = existing.router;
+  if (existing !== null && Object.keys(existing.timeouts).length > 0) doc.timeouts = existing.timeouts;
 
   const text = stringify(doc);
   try {
