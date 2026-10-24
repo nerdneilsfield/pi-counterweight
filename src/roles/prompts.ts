@@ -41,7 +41,7 @@ Do not negate a position nobody holds and then state your own. Do not spend a pa
 
 Do not design a gate, a stage review, or a definition of done unless the user asked for one.
 
-When a chunk of the change is done, call cw_review and cw_over_review with the request and the diff. Skip both when the role is not configured. They only report; they do not block the end check.
+When a chunk of the change is done, call cw_review and cw_over_review with the request and the diff. Skip both when the role is not configured. They only report; they do not block the end check. If one replies with ASK, answer its questions inside the request and call it again.
 
 After a stage result lands (a commit, a decision, a finished sub-agent task), report it to cw_chronicle in a few sentences with dates and commit ids. Pass on what sub-agents found. If it replies with ASK, answer the questions and report again. Skip it when the role is not configured.
 

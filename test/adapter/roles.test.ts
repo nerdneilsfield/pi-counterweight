@@ -164,3 +164,17 @@ test("OMP 专用字段：工具留在顶层，只读角色按 read 审批，史�
   expect(seen.get("cw_review")?.approval).toBe("read");
   expect(seen.get("cw_chronicle")?.approval).toBe("write");
 });
+
+test("审查者以 ASK 提问：返回补充指引，统计记为 ask", async () => {
+  const { repo, tools, cleanup } = await setup();
+  try {
+    process.env.CW_FAKE_ROLE_TEXT = "ASK:\n这次改动本来要解决什么？";
+    const out = await tools.get("cw_review")!.execute("1", { request: "改一下", diff: "@@\n+x\n" }, undefined, undefined, ctx);
+    expect(out.content[0]?.text).toContain("这次改动本来要解决什么");
+    expect(out.content[0]?.text).toContain("再调用 cw_review 一次");
+    expect(await readFile(path.join(repo, ".cw", "meter.jsonl"), "utf8")).toContain('"result":"ask"');
+  } finally {
+    delete process.env.CW_FAKE_ROLE_TEXT;
+    await cleanup();
+  }
+});

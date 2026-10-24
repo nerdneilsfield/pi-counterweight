@@ -41,14 +41,14 @@ const ROLES: Array<{
     name: "review",
     tool: "cw_review",
     label: "正确性审查",
-    description: "把这次的要求和 diff 交给只读审查。它只报行为错误和被削弱的真实边界，不报缺测试、不提重构、不改文件。",
+    description: "把这次的要求和 diff 交给只读审查。它只报行为错误和被削弱的真实边界，不报缺测试、不提重构、不改文件。信息不够时返回 ASK 开头的问题，补充到 request 后重新调用。",
     input: "review",
   },
   {
     name: "over_review",
     tool: "cw_over_review",
     label: "过度工程审查",
-    description: "把这次的要求和 diff 交给只读审查。它只报没资格留下的抽象、兜底、多余测试和防御性分支，不评对错、不改文件。",
+    description: "把这次的要求和 diff 交给只读审查。它只报没资格留下的抽象、兜底、多余测试和防御性分支，不评对错、不改文件。信息不够时返回 ASK 开头的问题，补充到 request 后重新调用。",
     input: "review",
   },
   {
@@ -128,7 +128,10 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
             return text(`[counterweight] ${role.tool}（预判放行：${router.model} 判有问题的概率 ${verdict.p} ≤ ${router.skip_below}，未起审查模型）：\nnone`);
           }
         }
-        return text((await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration)).text);
+        const run = await runAndMeter(ctx, repo, role.name, role.tool, model, message, signal, registration);
+        // 审查者问问题时，补充信息写进 request 再调一次；子进程是一次性的，不会记得上次。
+        const asked = role.input === "review" && run.answer?.trim().startsWith("ASK:");
+        return text(asked ? `${run.text}\n审查者需要补充信息：回答上面的问题，把答案写进 request，再调用 ${role.tool} 一次。` : run.text);
       },
     });
   }

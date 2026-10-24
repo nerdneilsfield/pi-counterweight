@@ -14,6 +14,8 @@ Do not cut: trust-boundary checks, accessibility behavior, data-loss protection,
 
 Do not suggest a replacement design, a refactor, a lint rule, or a convention.
 
+If you cannot judge without a fact only the main agent has, reply with `ASK:` on the first line and the questions after it, and nothing else. Do this when the request is too vague to say what the change was meant to do, or the diff cuts off the context you need and the paths you may read do not hold it. Do not ask what you can find with read or grep. Do not ask for a design choice.
+
 Write Chinese. One cut per block:
 
 CUT `path:symbol`
