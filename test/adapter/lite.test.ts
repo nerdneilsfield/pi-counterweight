@@ -478,6 +478,32 @@ test("OMP 的 session_stop：失败续跑一次、再失败如实结束、通过
   }
 });
 
+// Pi 1.2 起 before_agent_start 也发给自定义回合（pi.sendMessage 的 triggerTurn）。
+// 那种回合不是新的用户回合，不能归还额度；只有 messageType 为 user 时才归还。
+// Since pi 1.2, before_agent_start also fires for custom runs. Such a run is not a new
+// user turn, so it must not hand the allowances back; only a user run does.
+test("before_agent_start：自定义回合不归还额度，用户回合才归还", async () => {
+  const repo = await repoWith(CHECK_TOML);
+  try {
+    const fake = fakePi(repo);
+    await start(fake);
+
+    // 第一次失败：额度被消耗。
+    expect((await settle(fake))!.continue).toBe(true);
+    expect(lastText((await settle(fake))!)).toContain("不再自动重试");
+
+    // 自定义回合：额度不归还，仍然如实结束。
+    await fake.handlers.get("before_agent_start")!({ messageType: "custom", systemPromptOptions: { sections: {} } }, fake.ctx);
+    expect(lastText((await settle(fake))!)).toContain("不再自动重试");
+
+    // 用户回合：额度归还，重新反馈一次。
+    await fake.handlers.get("before_agent_start")!({ messageType: "user", prompt: "再试一次", systemPromptOptions: { sections: {} } }, fake.ctx);
+    expect((await settle(fake))!.continue).toBe(true);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+}, 30_000);
+
 // 两种宿主的系统提示入口不同：pi 写 sections，OMP 返回追加后的 systemPrompt 数组。
 // The two hosts take the prompt differently: pi writes sections, OMP returns the extended array.
 test("before_agent_start：pi 写 sections，OMP 返回替换数组", async () => {

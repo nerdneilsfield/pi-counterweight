@@ -266,13 +266,18 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
   // 新的用户回合重置一次反馈额度，并写入 counterweight 段。
   // 结算触发的续跑不发这个事件，所以失败链的额度不会被续跑重置，这段也不会叠第二次。
+  // Pi 1.2 起这个事件也发给 `pi.sendMessage(..., { triggerTurn: true })` 起的自定义回合，
+  // 那种回合不是新的用户回合，所以额度只在 `messageType` 是 "user"（或宿主没给这个字段）时重置。
   // Pi 每个回合重建 options，直接赋值不会覆盖 appendSystemPrompt。
   // OMP 没有 systemPromptOptions，事件给的是 `systemPrompt: string[]`，返回新数组替换；
   // OMP 可能对同一次提交重放整条链，每次都从事件给的基线追加，所以不会叠加。
   pi.on("before_agent_start", (event) => {
-    repairUsed = false;
-    pauseUsed = false;
-    findingsUsed = false;
+    const messageType = (event as { messageType?: unknown }).messageType;
+    if (messageType === undefined || messageType === "user") {
+      repairUsed = false;
+      pauseUsed = false;
+      findingsUsed = false;
+    }
     const prompt = (event as { prompt?: unknown }).prompt;
     if (typeof prompt === "string") turnRequest = prompt;
     const section = sessionSection(project?.auto ?? { review: false, chronicle: false });
