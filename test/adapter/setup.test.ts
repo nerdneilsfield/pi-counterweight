@@ -74,3 +74,28 @@ model = "nimble"
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+test("模型超过 10 个时走 ctx.ui.custom；custom 返回 undefined（RPC）就退回 select", async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), "cw-setup-long-"));
+  try {
+    const available = Array.from({ length: 11 }, (_, i) => ({ provider: "g", id: `m${i}` }));
+    let customCalls = 0;
+    const selectSizes: number[] = [];
+    const ctx = {
+      modelRegistry: { getAvailable: () => available },
+      ui: {
+        custom: async () => { customCalls += 1; return undefined; },
+        select: async (_title: string, options: string[]) => { selectSizes.push(options.length); return options[0]; },
+        input: async () => "=",
+        confirm: async () => true,
+        notify: () => undefined,
+      },
+    } as unknown as ExtensionCommandContext;
+    expect(await runSetup(ctx, repo)).toBe(true);
+    expect(customCalls).toBe(6);
+    // 六个角色各退回一次 select，选项是“不配置”加 11 个模型。
+    expect(selectSizes.slice(0, 6)).toEqual([12, 12, 12, 12, 12, 12]);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});

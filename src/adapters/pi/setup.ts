@@ -32,6 +32,79 @@ const NO = "否";
 const SKIP = "（不配置）";
 const KEEP = "（保持现状）";
 
+const LONG_LIST = 10;
+const VISIBLE_ROWS = 12;
+
+/**
+ * pi 自带的 select 不开窗，模型多时列表溢出终端。超过 LONG_LIST 项就用 pi-tui 的 SelectList（带窗口）加一行子串筛选。
+ * `ctx.ui.custom` 在 RPC 模式下返回 undefined（取消用 null 区分），pi-tui 加载失败或 custom 抛错时同样退回 select。
+ * KEEP / SKIP 是置顶项，筛选时始终保留。
+ *
+ * pi's select renders every option with no window, so a long model list overflows the terminal.
+ * Above LONG_LIST options, use pi-tui's SelectList (windowed) with a substring filter line.
+ * `ctx.ui.custom` returns undefined in RPC mode (cancel is null, so the two differ); a pi-tui load
+ * failure or a throw from custom also falls back to select. KEEP / SKIP are pinned and survive any filter.
+ */
+async function pickModel(ctx: ExtensionCommandContext, title: string, options: string[], modelCount: number): Promise<string | undefined> {
+  if (modelCount > LONG_LIST) {
+    try {
+      const tui = await import("@earendil-works/pi-tui");
+      const pinned: string[] = options.filter((option) => option === KEEP || option === SKIP);
+      const result = await ctx.ui.custom<string | null>((handle, theme, _keybindings, done) => {
+        const listTheme = {
+          selectedPrefix: (text: string) => theme.fg("accent", text),
+          selectedText: (text: string) => theme.fg("accent", text),
+          description: (text: string) => theme.fg("muted", text),
+          scrollInfo: (text: string) => theme.fg("dim", text),
+          noMatch: (text: string) => theme.fg("warning", text),
+        };
+        let filter = "";
+        // SelectList.setFilter 只匹配前缀；这里要子串，所以每次筛选重建列表。
+        // setFilter is prefix-only and we want substring, so rebuild the list on each change.
+        const build = () => {
+          const needle = filter.toLowerCase();
+          const items = options
+            .filter((option) => pinned.includes(option) || option.toLowerCase().includes(needle))
+            .map((option) => ({ value: option, label: option }));
+          const list = new tui.SelectList(items, VISIBLE_ROWS, listTheme);
+          list.onSelect = (item) => done(item.value);
+          list.onCancel = () => done(null);
+          return list;
+        };
+        let list = build();
+        return {
+          render(width: number) {
+            return [
+              ...new tui.Text(theme.fg("accent", theme.bold(title)), 0, 0).render(width),
+              theme.fg("muted", `筛选: ${filter}▏`),
+              ...list.render(width),
+              theme.fg("dim", "输入筛选 • ↑↓ 移动 • Backspace 删除 • Enter 选定 • Esc 取消"),
+            ];
+          },
+          invalidate() {},
+          handleInput(data: string) {
+            if (data === "\x7f" || data === "\b") {
+              filter = filter.slice(0, -1);
+              list = build();
+            } else if (data.length > 0 && !data.startsWith("\x1b") && !/[\x00-\x1f\x7f]/.test(data)) {
+              filter += data;
+              list = build();
+            } else {
+              list.handleInput(data);
+            }
+            handle.requestRender();
+          },
+        };
+      });
+      if (result === null) return undefined;
+      if (result !== undefined) return result;
+    } catch {
+      // 落到下面的 select / fall through to select
+    }
+  }
+  return ctx.ui.select(title, options);
+}
+
 /** @returns 是否写入了文件 / whether the file was written */
 export async function runSetup(ctx: ExtensionCommandContext, repo: string): Promise<boolean> {
   let existing: ProjectConfig | null = null;
@@ -47,7 +120,7 @@ export async function runSetup(ctx: ExtensionCommandContext, repo: string): Prom
   for (const [role, question] of ROLE_QUESTIONS) {
     const current = existing?.models[role] ?? null;
     const options = [current === null ? SKIP : KEEP, ...(current === null ? [] : [SKIP]), ...available];
-    const picked = await ctx.ui.select(`${question}${current === null ? "" : `（现为 ${current}）`}`, options);
+    const picked = await pickModel(ctx, `${question}${current === null ? "" : `（现为 ${current}）`}`, options, available.length);
     if (picked === undefined) return false;
     if (picked === KEEP) models[role] = current!;
     else if (picked !== SKIP) models[role] = picked;
