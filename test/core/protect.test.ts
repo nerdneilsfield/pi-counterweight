@@ -5,7 +5,7 @@
  * `.cw/project.toml`.
  */
 import { expect, test } from "vitest";
-import { CONFIG_FILE, isProtected } from "../../src/core/protect.ts";
+import { CONFIG_FILE, GOAL_FILE, isProtected } from "../../src/core/protect.ts";
 
 // 匹配规则：路径等于模式或落在模式目录之下；`.cw/project.toml` 无论配置如何都受保护。
 // Matching: a path equals a pattern or lives under it; `.cw/project.toml` is always protected.
@@ -18,5 +18,6 @@ test("词法匹配：精确、目录前缀与默认配置文件", () => {
   expect(isProtected("vitest.config.ts", patterns)).toBe(true);
   expect(isProtected("vitest.config.ts.bak", patterns)).toBe(false);
   expect(isProtected(CONFIG_FILE, [])).toBe(true);
+  expect(isProtected(GOAL_FILE, [])).toBe(true);
   expect(isProtected("other.txt", [])).toBe(false);
 });

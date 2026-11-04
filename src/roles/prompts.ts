@@ -32,6 +32,21 @@ const FORCED_REVIEW = `Counterweight runs cw_review and cw_over_review itself wh
 
 const FORCED_CHRONICLE = `Counterweight reports each finished turn to the historian itself. Call cw_chronicle only for a stage result it cannot see, such as a decision or a sub-agent finding.`;
 
+/**
+ * `.cw/goal.md` 的字符上限。它进的是每个回合的系统提示，超长就截断，避免一份写跑的文件占满上下文。
+ */
+const GOAL_CAP = 4_000;
+
+/**
+ * 把用户写的目标附在会话提示末尾。文件不存在时原样返回。
+ * 这是约束而不是新任务：只限制"做什么"，不要求模型去扩展它。
+ */
+export function withGoal(section: string, goal: string | null): string {
+  if (goal === null || goal.trim() === "") return section;
+  const body = goal.length > GOAL_CAP ? `${goal.slice(0, GOAL_CAP)}\n…（超出 ${GOAL_CAP} 字符，已截断）` : goal;
+  return `${section}\n\nThe user wrote this goal. Stay inside it. Do not widen it, and do not edit .cw/goal.md.\n\n${body}`;
+}
+
 export function sessionSection(auto: { review: boolean; chronicle: boolean }): string {
   return `You are a sharp INTJ engineer. You know software, research, and how systems actually fail. Talk like someone worth arguing with: adult, precise, interested. Not support, not a manual, not a teacher, not a parent, not an acceptance board.
 

@@ -19,6 +19,7 @@ import type {
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { changedFiles, chronicleReport, renderActions, workingDiff, type ActionRecord } from "../../core/auto.js";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
@@ -27,8 +28,8 @@ import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
 import { isSourceEdit, pauseReason, plannerMessage, renderTranscript, type TranscriptMessage } from "../../core/pause.js";
-import { isProtected } from "../../core/protect.js";
-import { sessionSection } from "../../roles/prompts.js";
+import { isProtected, GOAL_FILE } from "../../core/protect.js";
+import { sessionSection, withGoal } from "../../roles/prompts.js";
 import { roleTimeoutMs } from "../../roles/run.js";
 import { runSetup } from "./setup.js";
 import { chronicle, queueChronicle, registerTools, reviewMessage, runAndMeter } from "./tools.js";
@@ -294,7 +295,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // Pi 每个回合重建 options，直接赋值不会覆盖 appendSystemPrompt。
   // OMP 没有 systemPromptOptions，事件给的是 `systemPrompt: string[]`，返回新数组替换；
   // OMP 可能对同一次提交重放整条链，每次都从事件给的基线追加，所以不会叠加。
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", async (event) => {
     const messageType = (event as { messageType?: unknown }).messageType;
     if (messageType === undefined || messageType === "user") {
       repairUsed = false;
@@ -304,7 +305,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     }
     const prompt = (event as { prompt?: unknown }).prompt;
     if (typeof prompt === "string") turnRequest = prompt;
-    const section = sessionSection(project?.auto ?? { review: false, chronicle: false });
+    const section = withGoal(
+      sessionSection(project?.auto ?? { review: false, chronicle: false }),
+      await readGoal(repo),
+    );
     const options = (event as { systemPromptOptions?: { sections: Record<string, string> } }).systemPromptOptions;
     if (options !== undefined) {
       options.sections.counterweight = section;
@@ -624,6 +628,18 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
  */
 function protectedPatterns(project: ProjectConfig | null): string[] {
   return project?.protect.paths ?? [];
+}
+
+/**
+ * 读取 `.cw/goal.md`。没有这个文件、或读失败时返回 null：目标是可选的，缺了就只是不注入。
+ */
+async function readGoal(repo: string | null): Promise<string | null> {
+  if (repo === null) return null;
+  try {
+    return await readFile(path.join(repo, GOAL_FILE), "utf8");
+  } catch {
+    return null;
+  }
 }
 
 /**

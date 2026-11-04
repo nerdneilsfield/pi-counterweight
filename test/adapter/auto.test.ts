@@ -317,6 +317,23 @@ test("提示按 [auto] 裁剪：强制启用的角色不再叫主模型自己调
   expect(tellsToReportChronicle(half)).toBe(true);
 });
 
+test("目标：.cw/goal.md 注入系统提示；没有这个文件时不注入；模型不能改它", async () => {
+  const s = await setup(MODELS);
+  cleanup.push(s.repo);
+  const options = { sections: {} as Record<string, string> };
+  await newTurn(s);
+  await s.handlers.get("before_agent_start")!({ prompt: "x", systemPromptOptions: options }, s.ctx);
+  expect(options.sections.counterweight).not.toContain("goal.md");
+
+  await mkdir(path.join(s.repo, ".cw"), { recursive: true });
+  await writeFile(path.join(s.repo, ".cw", "goal.md"), "只改绑定的释放顺序");
+  await s.handlers.get("before_agent_start")!({ prompt: "x", systemPromptOptions: options }, s.ctx);
+  expect(options.sections.counterweight).toContain("只改绑定的释放顺序");
+
+  const blocked = await edit(s, ".cw/goal.md");
+  expect(blocked!.block).toBe(true);
+});
+
 test("[timeouts] 到达角色子进程：配 300 秒的 review 挂住时，在真实等待到点后被终止并记 timed_out", async () => {
   // 配置值是合法的 300 秒；realWaitMs 只把真实等待压到 1 秒，让测试能在秒级结束。
   const s = await setup(`${MODELS}\n[timeouts]\nreview = 300\nover_review = 300\n\n[auto]\nreview = true\n`, undefined, 1_000);

@@ -19,6 +19,11 @@ import path from "node:path";
 export const CONFIG_FILE = ".cw/project.toml";
 
 /**
+ * 用户写的目标。模型不能改它：改了之后，注入进系统提示的约束就由模型自己定义了。
+ */
+export const GOAL_FILE = ".cw/goal.md";
+
+/**
  * 判断一个仓库内相对路径是否属于受保护集合：等于某条路径，或位于某条目录前缀之下。
  *
  * Whether a repo-relative path is protected: it equals a pattern or lives
@@ -30,6 +35,6 @@ export const CONFIG_FILE = ".cw/project.toml";
  */
 export function isProtected(relative: string, patterns: readonly string[]): boolean {
   const normalized = relative.split(path.sep).join("/");
-  if (normalized === CONFIG_FILE) return true;
+  if (normalized === CONFIG_FILE || normalized === GOAL_FILE) return true;
   return patterns.some((pattern) => normalized === pattern || normalized.startsWith(`${pattern}/`));
 }
