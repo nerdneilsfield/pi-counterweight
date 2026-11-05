@@ -221,7 +221,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   }
 
   // ---- session_start: repo root, then the optional config ----
-  pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) =>
+  pi.on("session_start", (event: SessionStartEvent, ctx: ExtensionContext) =>
     withTimeout(limits.sessionStartMs, async () => {
       // 同一个实例若在 shutdown 之后又开了新会话，不能带着已经中止的信号。
       if (lifetime.signal.aborted) lifetime = new AbortController();
@@ -236,6 +236,9 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
             ? `；受保护路径 ${project.protect.paths.length} 条`
             : "";
           ctx.ui.notify(`Counterweight: 结束检查已启用（${check.cmd.join(" ")}）${guard}`, "info");
+        } else if (event.reason === "startup" || event.reason === "new") {
+          // 只在会话真正开始时提示；reload、resume、fork 是同一个会话。
+          ctx.ui.notify(`Counterweight: 结束检查没有配置（${project === null ? "没有 .cw/project.toml" : ".cw/project.toml 里没有 [check]"}），回合结束时不会跑检查。运行 /cw-setup 配置，或在 .cw/project.toml 写 [check] cmd = ["..."]。`, "info");
         }
       } catch (error) {
         // An unreadable or invalid config never half-arms the harness: report

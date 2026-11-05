@@ -543,3 +543,31 @@ test("goal.md：没有配置、配置非法、符号链接都拒绝；project.to
     }
   }
 });
+
+// 缺 [check] 的提示：只在会话真正开始（startup、new）时出现；reload、resume 不出，有 [check] 不出。
+test("缺 [check] 提示：startup 和 new 出现，reload、resume 和有 [check] 时不出现", async () => {
+  const bare = await repoWith(null);
+  const noCheck = await repoWith("version = 1\n");
+  const withCheck = await repoWith(CHECK_TOML);
+  try {
+    const hint = (fake: Fake) => fake.notifications.filter((line) => line.includes("结束检查没有配置"));
+    for (const reason of ["startup", "new"]) {
+      const fake = fakePi(bare);
+      await fake.handlers.get("session_start")!({ reason }, fake.ctx);
+      expect(hint(fake)).toHaveLength(1);
+    }
+    const partial = fakePi(noCheck);
+    await partial.handlers.get("session_start")!({ reason: "startup" }, partial.ctx);
+    expect(hint(partial)[0]).toContain("没有 [check]");
+    for (const reason of ["reload", "resume", "fork"]) {
+      const fake = fakePi(bare);
+      await fake.handlers.get("session_start")!({ reason }, fake.ctx);
+      expect(hint(fake)).toHaveLength(0);
+    }
+    const armed = fakePi(withCheck);
+    await armed.handlers.get("session_start")!({ reason: "startup" }, armed.ctx);
+    expect(hint(armed)).toHaveLength(0);
+  } finally {
+    await Promise.all([bare, noCheck, withCheck].map((dir) => rm(dir, { recursive: true, force: true })));
+  }
+});

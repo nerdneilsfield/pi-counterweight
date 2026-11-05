@@ -36,7 +36,7 @@ test("真实锁定 Pi 通过 RPC 加载扩展并执行 cw-version，无模型请
       child.once("close", () => reject(new Error(`Pi exited: ${stderr}`)));
       lines.on("line", (line) => {
         const message = JSON.parse(line);
-        if (message.type === "extension_ui_request" && message.method === "notify") done(message.message);
+        if (message.type === "extension_ui_request" && message.method === "notify" && message.message.startsWith("Counterweight: pi")) done(message.message);
         if (message.type === "response" && message.success === false) reject(new Error(line));
       });
       child.stdin.write(`${JSON.stringify({ id: "version", type: "prompt", message: "/cw-version" })}\n`);
