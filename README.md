@@ -162,7 +162,7 @@ paths = ["tests"]
 
 这里的 `tests` 是相对于项目根目录的路径，换成你项目实际使用的目录。保护只拦截 Pi 的 `edit` / `write` 文件修改工具：**bash 仍可修改这些文件，扩展不会阻止或事后报告这类修改。** 它适合减少误改，不是文件系统沙箱。
 
-在该项目目录用 `pi --extension "$CW_EXTENSION"` 启动即可。修改配置后，退出并重新启动 Pi，让新配置生效。建议在项目的 `.gitignore` 中添加一行 `.cw/`，避免把本地用量记录一起提交；配置是否需要共享，可以按项目习惯单独安排。
+在该项目目录用 `pi --extension "$CW_EXTENSION"` 启动即可。修改配置后，退出并重新启动 Pi，让新配置生效。建议在项目的 `.gitignore` 中写下面三行，让本地用量记录不进 git，同时保留共享的经验笔记：`/.cw/*`、`!/.cw/PRACTICES.md`、`!/.cw/BUGS.md`；配置是否需要共享，可以按项目习惯单独安排。
 
 要暂停自动检查，删除配置中的 `[check]` 小节及其字段，再重启 Pi。要同时停用检查和保护，可以将 `project.toml` 改名后重启；只要扩展仍被加载，用量仍会记录。上面的 `--extension` 只对本次启动有效，下次直接运行 `pi` 就不会通过这个参数加载扩展。
 
@@ -219,6 +219,9 @@ paths = ["tests"]
 - 报告写着未通过且不再自动重试，说明那次修复没有解决问题。你可以发新请求，也可以自己修。新请求会重新获得一次修复机会。
 - 审查发现是报告，不是裁决。模型要么处理，要么说明为什么不处理，发现也不会改变检查结果。
 - `.cw/meter.jsonl` 记录用量、检查、角色调用和 PAUSE 决定。`.cw/HISTORY.md` 是史官写的项目历史。
+- 会话真正开始时（`startup` 和 `new`，不含 reload、resume、fork），如果没有 `.cw/project.toml` 或没有 `[check]`，会通知一行：回合结束时不会跑检查。
+- `.cw/pending.md` 里有以 `- YYYY-MM-DD |` 开头的条目时，回合结束行末尾附 `待批 N 条`；没有检查结果时单独一行。
+- 自动审查的角色没跑完时，结算消息里有一行 `[counterweight] 自动审查未完成：<角色> <原因>`，不改变检查结果，也不续跑。
 
 ## 设计思想
 
@@ -262,7 +265,7 @@ pi install git:github.com/nerdneilsfield/pi-counterweight
 
 ## 配置参考
 
-在仓库根创建 `.cw/project.toml`（`.cw/` 建议加入该项目的 `.gitignore`）。在子目录里启动 pi 时，扩展用 git 工作树根定位这份配置、结束检查的工作目录和 `.cw/meter.jsonl`；不是 git 仓库时用启动目录。每个小节都是可选的；未知字段会报错。配置缺失或非法时，扩展不检查、不拦截，只在非法时提示错误。assistant 用量仍会写入 `.cw/meter.jsonl`。没有配置时，系统提示里的 counterweight 段仍会写入。
+在仓库根创建 `.cw/project.toml`（`.gitignore` 建议写 `/.cw/*`、`!/.cw/PRACTICES.md`、`!/.cw/BUGS.md`）。在子目录里启动 pi 时，扩展用 git 工作树根定位这份配置、结束检查的工作目录和 `.cw/meter.jsonl`；不是 git 仓库时用启动目录。每个小节都是可选的；未知字段会报错。配置缺失或非法时，扩展不检查、不拦截，只在非法时提示错误。assistant 用量仍会写入 `.cw/meter.jsonl`。没有配置时，系统提示里的 counterweight 段仍会写入。
 
 从旧配置升级时，把 `[explorer] model` 改成 `[models] explorer`，删掉 `[observe]`，然后重启。留下旧字段会让整份配置加载失败，这一会话的检查和保护都不生效。
 
@@ -319,6 +322,15 @@ audit_rate = 0.1            # 缺省 0.1：放行的里面随机抽这个比例�
 - 仓库外的路径在已配置时一律拒绝。没有配置或配置非法时不拒绝。
 - bash 和其他不经过 `edit`/`write` 的写入不拦截，结算时也不另作报告。
 - 受保护路径在加载期校验：拒绝空路径、通配符、绝对路径、`..` 与 `.cw` 下的路径。
+
+### 高危命令和写入范围
+
+- 有没有配置都一样，`bash` 工具拒绝最危险的几类命令：`rm` 带递归和强制，目标是 `/`、`/*`、`~` 或 `$HOME`；强制推送（`--force`、`-f` 或带 `+` 的 refspec）到 `main` 或 `master`（`--force-with-lease` 放行）；`mkfs`；`dd` 的 `of=/dev/...`（`/dev/null` 除外）。命令按未加引号的 `;`、`&&`、`||`、`|` 和换行切开，逐段判断，引号里的文本只是参数。`bash -c`、命令替换和变量拼接不检查，这只防手滑，不是安全边界。
+- `.cw/scope.txt` 存在且有内容时，`edit`/`write` 只能写其中前缀之下的路径。每行一个仓库相对路径前缀，空行和 `#` 开头的行忽略；`src` 管 `src` 和 `src/a.ts`，不管 `srcx`。`.cw/` 下不受限制，文件本身始终受保护。没有 `project.toml` 时也生效，会跟随符号链接，不管 bash。
+
+### 角色步数上限
+
+角色最多 30 步（`research` 80，`planner` 1）。pi 轮询角色子进程的 `--mode json` 输出文件，数 assistant 的 `message_end`，超过上限就中止子进程，返回 `已达 <n> 步上限，已终止，拆小输入后重试`，计量事件记 `outcome: "budget"`，不重试。最后一条回答若已经完整，照常采用。审查角色还被告知只读 diff 涉及的文件和直接调用方。
 
 ### 计量
 
@@ -438,6 +450,11 @@ omo install git:github.com/nerdneilsfield/pi-counterweight          # OMO（npm 
 - **真实模型未在本仓库测试中执行。** `npm test` 不需要模型凭据。
 - **严格流程在 tag 里。** `v1-strict` 保留了契约/先红/证据/门禁的完整实现，需要时 `git switch --detach v1-strict` 查看或移植。
 
+## 记录给评测和汇总用
+
+- `inject` 事件：每个会话第一次注入时写 `{"host":"pi","version","goal","check"}` 到 `.cw/meter.jsonl`，评测读它判断是否真的注入了。
+- chronicle 事件：`~/.agents/chronicle/` 存在时，回合结束（不是修复续跑）写 `events/<machine>/<id>.json` 和 `evidence/<machine>/<id>.json`，布局见 steward 的 chronicle-layout。目录不会被创建。`outcome`：检查通过 `ok`，失败 `failed`，取消 `cancelled`，没有检查 `unknown`；证据是检查报告或说明原因的 `gap`。`project` 只从 `projects.yaml` 里 `/绝对路径: id` 形式的行读取，读不到写 `null`。写入失败不影响本轮。
+
 ## 开发与验证
 
 以下命令用于修改 Counterweight 本身，普通使用者不必在每次启动前执行：
@@ -448,6 +465,8 @@ npm run typecheck
 npm run build
 npm run test:serial
 ```
+
+`src/core/` 下的 `budget.ts`、`danger.ts`、`scope.ts`、`chronicle-event.ts` 和 `pending.ts` 与 codex-counterweight 里的同名文件逐字节相同；在那个仓库里运行 `npm run check:sync` 比较。
 
 在 macOS 上运行较长测试时，可以用 `caffeinate -i npm run test:serial` 防止空闲睡眠暂停测试进程。项目曾遇到整机睡眠导致计时器和测试一起暂停的情况。
 
