@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { expect, it } from "vitest";
 import { dangerousCommand } from "../../src/core/danger.ts";
 
@@ -83,4 +84,35 @@ it("names what it refused", () => {
   expect(dangerousCommand("rm -rf $HOME")).toContain("递归强制删除 $HOME");
   expect(dangerousCommand("git push -f origin HEAD:master")).toContain("强制推送 master");
   expect(dangerousCommand("dd if=a of=/dev/sdb")).toContain("/dev/sdb");
+});
+
+it.each([
+  "sleep 1 & rm -rf /",
+  "(rm -rf /)",
+  "{ rm -rf ~; }",
+  "if true; then rm -rf /; fi",
+  "for i in 1; do rm -rf ~; done",
+  "! rm -rf /",
+  "rm -rf /.",
+  "rm -rf //",
+])("denies %s in shell syntax a model writes", (command) => {
+  expect(dangerousCommand(command)).not.toBeNull();
+});
+
+it("denies the home directory by its absolute path", () => {
+  expect(dangerousCommand(`rm -rf ${homedir()}`)).not.toBeNull();
+  expect(dangerousCommand(`rm -rf ${homedir()}/`)).not.toBeNull();
+  expect(dangerousCommand(`rm -rf ${homedir()}/project`)).toBeNull();
+});
+
+it("uses the current branch when a force push names none", () => {
+  for (const command of ["git push -f", "git push --force", "git push --force origin HEAD", "git push -f origin"]) {
+    expect(dangerousCommand(command, "main")).not.toBeNull();
+    expect(dangerousCommand(command, "feature")).toBeNull();
+    expect(dangerousCommand(command, null)).toBeNull();
+  }
+});
+
+it.each(["dd if=a of=/dev/stdout", "npm test &> out.log", "cmd > /dev/null 2>&1 &", "rm -rf ./build"])("allows %s", (command) => {
+  expect(dangerousCommand(command)).toBeNull();
 });

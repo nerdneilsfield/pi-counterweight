@@ -31,7 +31,7 @@ import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
 import { isSourceEdit, pauseReason, plannerMessage, renderTranscript, type TranscriptMessage } from "../../core/pause.js";
-import { dangerousCommand } from "../../core/danger.js";
+import { dangerousCommandIn } from "../../core/danger.js";
 import { isProtected, GOAL_FILE } from "../../core/protect.js";
 import { inScope, readScope, SCOPE_FILE, scopeReason } from "../../core/scope.js";
 import { sessionSection, withGoal } from "../../roles/prompts.js";
@@ -271,7 +271,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     // 高危命令不用配置、不用仓库根也拒绝。
     if (event.toolName === "bash" || event.toolName === "powershell") {
       const command = (event.input as Record<string, unknown>).command;
-      const danger = typeof command === "string" ? dangerousCommand(command) : null;
+      const danger = typeof command === "string" ? await dangerousCommandIn(ctx.cwd, command) : null;
       if (danger !== null) return { block: true, reason: danger };
     }
     const protectedResult = await withTimeout(limits.toolCallMs, async (signal) => {
