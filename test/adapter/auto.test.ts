@@ -200,6 +200,45 @@ test("自动审查：两边都说 none 或 ASK 就不打扰主模型；没有改
   expect((await s.calls()).length).toBe(2);
 });
 
+test("自动审查：没改文件但跑了命令，命令也送审；只读工具不送", async () => {
+  const s = await setup(`${MODELS}\n[auto]\nreview = true\n`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_TEXT_REVIEW = "none";
+  process.env.CW_FAKE_TEXT_OVER_REVIEW = "none";
+  await newTurn(s);
+
+  const call = (toolName: string, input: Record<string, unknown>) =>
+    s.handlers.get("tool_call")!({ toolName, input, toolCallId: "t" }, s.ctx);
+
+  // 只读工具不构成审查理由：一个只读回合结束后不该起审查模型。
+  await call("read", { path: "tracked.txt" });
+  await call("grep", { pattern: "base" });
+  expect(await settle(s)).toBeUndefined();
+  expect((await s.calls()).length).toBe(0);
+
+  // 跑了命令但没改文件，diff 是空的。命令只进 over_review，review 不该为此启动。
+  await call("bash", { command: "python sweep.py --all" });
+  await call("bash", { command: "" });
+  expect(await settle(s)).toBeUndefined();
+  const calls = await s.calls();
+  expect(calls.map((entry) => entry.role)).toEqual(["over_review"]);
+  expect(calls[0]!.message).toContain("python sweep.py --all");
+  expect(calls[0]!.message).toContain("共 1 条");
+});
+
+test("自动审查：只有命令、没有 diff 时，发现记入结果但不续跑", async () => {
+  const s = await setup(`${MODELS}\n[auto]\nreview = true\n`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_TEXT_OVER_REVIEW = "CUT `sweep`\n删：重跑\n留：无\n因为：请求没要求";
+  await newTurn(s);
+  await s.handlers.get("tool_call")!({ toolName: "bash", input: { command: "python sweep.py" }, toolCallId: "t" }, s.ctx);
+
+  const result = await settle(s);
+  expect(result?.continue).toBeUndefined();
+  expect(result!.entries.at(-1)!.content).toContain("不再续跑");
+  expect(result!.entries.at(-1)!.content).toContain("CUT `sweep`");
+});
+
 test("自动汇报：有改动才汇报，带请求与文件，写入 HISTORY.md", async () => {
   const s = await setup(`${MODELS}\n[auto]\nchronicle = true\n`);
   cleanup.push(s.repo);
@@ -276,6 +315,23 @@ test("提示按 [auto] 裁剪：强制启用的角色不再叫主模型自己调
   const half = await sections(`${MODELS}\n[auto]\nreview = true\n`);
   expect(tellsToCallReview(half)).toBe(false);
   expect(tellsToReportChronicle(half)).toBe(true);
+});
+
+test("目标：.cw/goal.md 注入系统提示；没有这个文件时不注入；模型不能改它", async () => {
+  const s = await setup(MODELS);
+  cleanup.push(s.repo);
+  const options = { sections: {} as Record<string, string> };
+  await newTurn(s);
+  await s.handlers.get("before_agent_start")!({ prompt: "x", systemPromptOptions: options }, s.ctx);
+  expect(options.sections.counterweight).not.toContain("goal.md");
+
+  await mkdir(path.join(s.repo, ".cw"), { recursive: true });
+  await writeFile(path.join(s.repo, ".cw", "goal.md"), "只改绑定的释放顺序");
+  await s.handlers.get("before_agent_start")!({ prompt: "x", systemPromptOptions: options }, s.ctx);
+  expect(options.sections.counterweight).toContain("只改绑定的释放顺序");
+
+  const blocked = await edit(s, ".cw/goal.md");
+  expect(blocked!.block).toBe(true);
 });
 
 test("[timeouts] 到达角色子进程：配 300 秒的 review 挂住时，在真实等待到点后被终止并记 timed_out", async () => {

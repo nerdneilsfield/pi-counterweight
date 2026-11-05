@@ -10,6 +10,47 @@ import { git } from "./gitstate.js";
 export const DIFF_CAP = 80_000;
 
 /**
+ * 一条非只读动作：会改工作树或会花时间的工具调用。只读的 read、grep、find、ls 不在这里。
+ * `detail` 是 edit/write 的路径或 bash 的命令字符串。
+ */
+export interface ActionRecord {
+  tool: string;
+  detail: string;
+}
+
+/** 附进审查输入的动作条数上限。写入在 diff 里已经可见，先被挤掉；命令保留到最后。 */
+const ACTION_CAP = 40;
+/** 单条命令字符串的字符上限。超长时整条不进审查输入，避免截断后审的是另一条命令。 */
+const ACTION_DETAIL_CAP = 2_000;
+
+/**
+ * 把本回合的非只读动作收成一段文本，附在 diff 后面交给审查者。
+ * 空数组返回空串。diff 只反映改了什么文件，跑了什么命令它看不见，所以命令要单独附上。
+ * 这些是工具调用，不是执行结果：调用被拦下或失败时，结果不在这里。
+ */
+export function renderActions(actions: readonly ActionRecord[]): string {
+  if (actions.length === 0) return "";
+  // 按发生顺序保留。写入已经体现在 diff 里，名额不够时先舍写入；命令超长时整条不列，
+  // 不截成另一条看起来不同的命令。
+  const shown: string[] = [];
+  let omitted = 0;
+  for (const action of actions) {
+    const isWrite = action.tool !== "bash" && action.tool !== "powershell";
+    if (isWrite && actions.length - omitted > ACTION_CAP) {
+      omitted += 1;
+      continue;
+    }
+    if (shown.length >= ACTION_CAP || action.detail.length > ACTION_DETAIL_CAP) {
+      omitted += 1;
+      continue;
+    }
+    shown.push(`${shown.length + 1}. ${action.tool} ${action.detail}`);
+  }
+  const rest = omitted > 0 ? `\n（另有 ${omitted} 条未列出）` : "";
+  return `\n本回合的工具调用（不是执行结果，共 ${actions.length} 条）：\n${shown.join("\n")}${rest}\n`;
+}
+
+/**
  * 工作树相对 HEAD 的改动，含未跟踪文件。不在 git 仓库里、或没有任何提交时返回 null。
  * 用 `git add -N` 不合适（会改索引），所以未跟踪文件单独列名字，不展开内容。
  */

@@ -171,8 +171,8 @@ export function registerTools(pi: ExtensionAPI, registration: ToolRegistration):
   }
 }
 
-export function reviewMessage(params: { request: string; diff: string }): string {
-  return `要求：\n${params.request}\n\ndiff：\n${params.diff}\n`;
+export function reviewMessage(params: { request: string; diff: string; actions?: string }): string {
+  return `要求：\n${params.request}\n\ndiff：\n${params.diff}\n${params.actions ?? ""}`;
 }
 
 export async function runAndMeter(

@@ -19,16 +19,17 @@ import type {
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { changedFiles, chronicleReport, workingDiff } from "../../core/auto.js";
+import { changedFiles, chronicleReport, renderActions, workingDiff, type ActionRecord } from "../../core/auto.js";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
 import { loadProjectConfig, type ProjectConfig } from "../../core/config.js";
 import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
 import { isSourceEdit, pauseReason, plannerMessage, renderTranscript, type TranscriptMessage } from "../../core/pause.js";
-import { isProtected } from "../../core/protect.js";
-import { sessionSection } from "../../roles/prompts.js";
+import { isProtected, GOAL_FILE } from "../../core/protect.js";
+import { sessionSection, withGoal } from "../../roles/prompts.js";
 import { roleTimeoutMs } from "../../roles/run.js";
 import { runSetup } from "./setup.js";
 import { chronicle, queueChronicle, registerTools, reviewMessage, runAndMeter } from "./tools.js";
@@ -170,6 +171,9 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   let pauseUsed = false;
   // 本回合用户的原话，自动汇报要用。结算触发的续跑不会覆盖它。
   let turnRequest = "";
+  // 本回合的非只读动作（bash、edit、write）。diff 看不见跑过的命令，审查时要单独附上。
+  // 和修复额度一样，只有新的用户回合才清空，结算触发的续跑接着累计。
+  let turnActions: ActionRecord[] = [];
   // 自动审查的发现最多让主模型续跑一轮；和修复额度、PAUSE 额度一样，只有 before_agent_start 才重置。
   let findingsUsed = false;
 
@@ -231,8 +235,28 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     });
     // 受保护的先拦；没被拦的写入才轮到 PAUSE。
     if (protectedResult !== undefined) return protectedResult;
-    return await pauseBeforeFirstEdit(event, ctx);
+    const pauseResult = await pauseBeforeFirstEdit(event, ctx);
+    // 被拦下的调用没有发生，不记入本回合动作。
+    if (pauseResult === undefined) noteAction(event);
+    return pauseResult;
   });
+
+  /**
+   * 记下本回合一次非只读动作。只读工具不记，它们不改变范围。
+   * 记的是调用本身，不看它后来成功没有：被拒绝或失败的命令同样说明模型想做什么。
+   */
+  function noteAction(event: ToolCallEvent): void {
+    const input = event.input as Record<string, unknown>;
+    if (event.toolName === "bash" || event.toolName === "powershell") {
+      const command = input.command;
+      if (typeof command === "string" && command !== "") turnActions.push({ tool: event.toolName, detail: command });
+      return;
+    }
+    if (event.toolName === "edit" || event.toolName === "write") {
+      const target = input.path;
+      if (typeof target === "string" && target !== "") turnActions.push({ tool: event.toolName, detail: target });
+    }
+  }
 
   /**
    * PAUSE：本回合第一次对源码的 edit/write，拦下它，让 planner 读完调查写一份计划。
@@ -271,16 +295,20 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // Pi 每个回合重建 options，直接赋值不会覆盖 appendSystemPrompt。
   // OMP 没有 systemPromptOptions，事件给的是 `systemPrompt: string[]`，返回新数组替换；
   // OMP 可能对同一次提交重放整条链，每次都从事件给的基线追加，所以不会叠加。
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", async (event) => {
     const messageType = (event as { messageType?: unknown }).messageType;
     if (messageType === undefined || messageType === "user") {
       repairUsed = false;
       pauseUsed = false;
       findingsUsed = false;
+      turnActions = [];
     }
     const prompt = (event as { prompt?: unknown }).prompt;
     if (typeof prompt === "string") turnRequest = prompt;
-    const section = sessionSection(project?.auto ?? { review: false, chronicle: false });
+    const section = withGoal(
+      sessionSection(project?.auto ?? { review: false, chronicle: false }),
+      await readGoal(repo),
+    );
     const options = (event as { systemPromptOptions?: { sections: Record<string, string> } }).systemPromptOptions;
     if (options !== undefined) {
       options.sections.counterweight = section;
@@ -396,27 +424,37 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     }
     const diff = await workingDiff(root);
     const changed = diff !== null && diff.trim() !== "";
-    const plan = { review: config.auto.review && changed, chronicle: config.auto.chronicle && changed };
-    if (!plan.review && !plan.chronicle) return { text: null, continueRun: false };
+    // 跑了命令但没改文件时 diff 是空的。命令只交给 over_review，review 仍按 diff 判断对错。
+    const actions = renderActions(turnActions);
+    const plan = {
+      review: config.auto.review && changed,
+      overReview: config.auto.review && (changed || actions !== ""),
+      chronicle: config.auto.chronicle && changed,
+    };
+    if (!plan.review && !plan.overReview && !plan.chronicle) return { text: null, continueRun: false };
     const lines: string[] = [];
     let continueRun = false;
     const registration = { getProject: () => project, getRepo: () => repo, cliPath: roleCli, realWaitMs };
 
-    if (plan.review) {
-      const message = reviewMessage({ request: turnRequest, diff: diff! });
-      const [correct, over] = await Promise.all([
-        runAndMeter(ctx, root, "review", "cw_review", config.models.review!, message, signal, registration),
-        runAndMeter(ctx, root, "over_review", "cw_over_review", config.models.over_review!, message, signal, registration),
-      ]);
+    if (plan.review || plan.overReview) {
+      const reviewText = plan.review
+        ? runAndMeter(ctx, root, "review", "cw_review", config.models.review!, reviewMessage({ request: turnRequest, diff: diff ?? "" }), signal, registration)
+        : Promise.resolve({ answer: null });
+      const overText = plan.overReview
+        ? runAndMeter(ctx, root, "over_review", "cw_over_review", config.models.over_review!, reviewMessage({ request: turnRequest, diff: diff ?? "", actions }), signal, registration)
+        : Promise.resolve({ answer: null });
+      const [correct, over] = await Promise.all([reviewText, overText]);
       const findings = [correct, over]
         .map((run) => run.answer?.trim() ?? "")
         .filter((answer) => answer !== "" && answer !== "none" && !answer.startsWith("ASK:"));
       if (findings.length > 0) {
+        // 没有 diff 时发现只针对已经跑完的命令，再续跑一轮无文件可改，只会把同一批调用重审一遍。
+        const actionable = changed;
         // 额度只决定要不要再续跑一轮；续跑后的最终 diff 照样审查，发现记为事实，不再打断。
-        const again = !findingsUsed;
+        const again = actionable && !findingsUsed;
         lines.push(again
           ? `[counterweight] 自动审查有发现，处理或说明为什么不处理：\n\n${findings.join("\n\n")}`
-          : `[counterweight] 自动审查（续跑之后）仍有发现，不再续跑：\n\n${findings.join("\n\n")}`);
+          : `[counterweight] 自动审查有发现，不再续跑：\n\n${findings.join("\n\n")}`);
         findingsUsed = true;
         continueRun = again;
       }
@@ -590,6 +628,18 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
  */
 function protectedPatterns(project: ProjectConfig | null): string[] {
   return project?.protect.paths ?? [];
+}
+
+/**
+ * 读取 `.cw/goal.md`。没有这个文件、或读失败时返回 null：目标是可选的，缺了就只是不注入。
+ */
+async function readGoal(repo: string | null): Promise<string | null> {
+  if (repo === null) return null;
+  try {
+    return await readFile(path.join(repo, GOAL_FILE), "utf8");
+  } catch {
+    return null;
+  }
 }
 
 /**
