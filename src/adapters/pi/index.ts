@@ -33,6 +33,7 @@ import { dangerousCommand } from "../../core/danger.js";
 import { isProtected, GOAL_FILE } from "../../core/protect.js";
 import { inScope, readScope, SCOPE_FILE, scopeReason } from "../../core/scope.js";
 import { sessionSection, withGoal } from "../../roles/prompts.js";
+import pkg from "../../../package.json" with { type: "json" };
 import { roleTimeoutMs } from "../../roles/run.js";
 import { runSetup } from "./setup.js";
 import { chronicle, queueChronicle, registerTools, reviewMessage, runAndMeter, type ToolRegistration } from "./tools.js";
@@ -347,7 +348,8 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // Pi 每个回合重建 options，直接赋值不会覆盖 appendSystemPrompt。
   // OMP 没有 systemPromptOptions，事件给的是 `systemPrompt: string[]`，返回新数组替换；
   // OMP 可能对同一次提交重放整条链，每次都从事件给的基线追加，所以不会叠加。
-  pi.on("before_agent_start", async (event) => {
+  const injected = new Set<string>();
+  pi.on("before_agent_start", async (event, ctx) => {
     const messageType = (event as { messageType?: unknown }).messageType;
     if (messageType === undefined || messageType === "user") {
       repairUsed = false;
@@ -363,10 +365,16 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       && project !== null && (project.auto.review || project.auto.chronicle)) {
       turnBase = await snapshotTree(repo);
     }
-    const section = withGoal(
-      sessionSection(project?.auto ?? { review: false, chronicle: false }),
-      await readGoal(repo),
-    );
+    const goal = await readGoal(repo);
+    const section = withGoal(sessionSection(project?.auto ?? { review: false, chronicle: false }), goal);
+    // 每个会话第一次注入时记一条，评测读它判断是否真的注入了。
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (repo !== null && !injected.has(sessionId)) {
+      injected.add(sessionId);
+      await recordEvent(repo, sessionId, "inject", {
+        host: "pi", version: pkg.version, goal: goal !== null && goal.trim() !== "", check: project?.check != null,
+      });
+    }
     const options = (event as { systemPromptOptions?: { sections: Record<string, string> } }).systemPromptOptions;
     if (options !== undefined) {
       options.sections.counterweight = section;

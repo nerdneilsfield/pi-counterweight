@@ -613,3 +613,25 @@ test("scope.txt：范围外写入被拒，.cw/ 下放行，本身受保护，符
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+// inject 事件：每个会话第一次注入时记一条，带宿主、版本、是否有目标和是否有 [check]；评测靠它判断是否真的注入。
+test("inject 事件：每个会话只记一次，goal 和 check 如实", async () => {
+  const pkg = JSON.parse(await readFile(path.resolve("package.json"), "utf8")) as { version: string };
+  const repo = await repoWith(CHECK_TOML, { ".cw/goal.md": "只改 a\n" });
+  const bare = await repoWith(null);
+  try {
+    for (const [dir, expected] of [[repo, { goal: true, check: true }], [bare, { goal: false, check: false }]] as const) {
+      const fake = fakePi(dir);
+      await start(fake);
+      const run = () => fake.handlers.get("before_agent_start")!({ prompt: "x", systemPromptOptions: { sections: {} } }, fake.ctx);
+      await run();
+      await run();
+      const lines = (await readFile(path.join(dir, ".cw", "meter.jsonl"), "utf8")).split("\n").filter((line) => line !== "")
+        .map((line) => JSON.parse(line)).filter((line) => line.event === "inject");
+      expect(lines).toHaveLength(1);
+      expect(lines[0].detail).toEqual({ host: "pi", version: pkg.version, ...expected });
+    }
+  } finally {
+    await Promise.all([repo, bare].map((dir) => rm(dir, { recursive: true, force: true })));
+  }
+});
