@@ -1,6 +1,6 @@
 // 伪 pi CLI。角色运行器这样调用：
 //   node fake-pi.mjs --mode json ... -- @/path/message.md
-// CW_FAKE_ARGV_FILE 落盘 argv。CW_FAKE_ROLE 选行为，默认 answer。
+// CW_FAKE_ARGV_FILE 落盘 argv。CW_FAKE_ROLE 选行为，默认 answer；steps 模式发 CW_FAKE_STEPS 条消息后挂起。
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 
 const argvFile = process.env.CW_FAKE_ARGV_FILE;
@@ -28,7 +28,14 @@ const assistant = {
 const delay = Number(process.env.CW_FAKE_DELAY_MS ?? 0);
 if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 
-if (mode === "crash") {
+if (mode === "steps") {
+  // CW_FAKE_STEPS 条要继续调用工具的 assistant 消息，然后挂起。
+  const toolTurn = { ...assistant, content: [{ type: "toolCall", id: "c", name: "read", arguments: {} }], stopReason: "toolUse" };
+  for (let i = 0; i < Number(process.env.CW_FAKE_STEPS ?? 0); i++) {
+    process.stdout.write(`${JSON.stringify({ type: "message_end", message: toolTurn })}\n`);
+  }
+  setInterval(() => undefined, 1000);
+} else if (mode === "crash") {
   process.stderr.write("loading config\nfatal: model g/gone not found\n");
   process.exit(3);
 } else if (mode === "hang") {

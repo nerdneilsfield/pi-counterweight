@@ -9,6 +9,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { budgetMessage, stepLimit, watchSteps } from "../core/budget.js";
 import { runProcess } from "../core/process.js";
 import { rolePromptPath, type RoleName } from "./prompts.js";
 
@@ -52,6 +53,8 @@ export interface RoleRun {
   usage: UsageSample[];
   timedOut: boolean;
   cancelled: boolean;
+  /** 步数超过 `stepLimit` 被终止；此时 `error` 是 `budgetMessage`。 */
+  budget?: boolean;
 }
 
 export interface RoleRequest {
@@ -146,15 +149,33 @@ export async function runRole(request: RoleRequest): Promise<RoleRun> {
     const messagePath = path.join(scratch, "message.md");
     await writeFile(messagePath, request.message);
     const argv = roleArgv(found.host, request.role, request.model, messagePath);
-    const outcome = await runProcess({
-      cwd: request.workRoot,
-      cmd: [process.execPath, found.cli, ...argv],
-      env: { ...process.env },
-      timeoutMs: request.timeoutMs ?? roleTimeoutMs(request.role),
-      stdoutPath: path.join(scratch, "stdout.jsonl"),
-      stderrPath: path.join(scratch, "stderr.log"),
-      signal: request.signal,
+    // 超过步数上限时中止进程；中止信号同时听调用方的 signal。
+    const limit = stepLimit(request.role);
+    const own = new AbortController();
+    const forward = () => own.abort();
+    if (request.signal?.aborted) forward();
+    else request.signal?.addEventListener("abort", forward, { once: true });
+    let overBudget = false;
+    const stdoutPath = path.join(scratch, "stdout.jsonl");
+    const stopWatch = watchSteps({
+      file: stdoutPath, limit, count: countAssistantEnds, signal: own.signal,
+      onExceed: () => { overBudget = true; own.abort(); },
     });
+    let outcome;
+    try {
+      outcome = await runProcess({
+        cwd: request.workRoot,
+        cmd: [process.execPath, found.cli, ...argv],
+        env: { ...process.env },
+        timeoutMs: request.timeoutMs ?? roleTimeoutMs(request.role),
+        stdoutPath,
+        stderrPath: path.join(scratch, "stderr.log"),
+        signal: own.signal,
+      });
+    } finally {
+      stopWatch();
+      request.signal?.removeEventListener("abort", forward);
+    }
     try {
       let stdout = "";
       try {
@@ -165,6 +186,9 @@ export async function runRole(request: RoleRequest): Promise<RoleRun> {
       const events = parseEvents(stdout);
       const failure = (reason: string): RoleRun =>
         ({ answer: null, error: reason, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled });
+      if (overBudget && !(events.finalAssistant?.stopReason === "stop" && events.finalAssistant.text.trim() !== "")) {
+        return { ...failure(budgetMessage(limit)), budget: true, cancelled: false };
+      }
       if (outcome.cancelled) return failure("已被取消");
       if (outcome.timedOut) return failure("超时，子进程组已终止");
       if (outcome.runnerError !== null) return failure(`无法启动 ${found.host}：${outcome.runnerError}`);
@@ -186,6 +210,21 @@ export async function runRole(request: RoleRequest): Promise<RoleRun> {
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+}
+
+/** assistant 的 `message_end` 数，即模型请求数。 */
+export function countAssistantEnds(stdout: string): number {
+  let count = 0;
+  for (const line of stdout.split("\n")) {
+    if (!line.includes('"message_end"')) continue;
+    try {
+      const event = JSON.parse(line) as { type?: unknown; message?: { role?: unknown } };
+      if (event.type === "message_end" && event.message?.role === "assistant") count += 1;
+    } catch {
+      // A torn last line while the file is still being written.
+    }
+  }
+  return count;
 }
 
 interface ParsedEvents {

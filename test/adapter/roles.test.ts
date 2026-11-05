@@ -251,3 +251,41 @@ test("runRole：没有回答时，错误里带退出码和 stderr 的最后一�
     delete process.env.CW_FAKE_ROLE;
   }
 });
+
+// 步数预算：assistant message_end 超过上限才终止。30 条放行（挂起后按超时结束），31 条终止；research 80，planner 1。
+test("runRole 步数预算：超过上限终止，恰好等于上限不终止，research 和 planner 各有上限", async () => {
+  process.env.CW_FAKE_ROLE = "steps";
+  const run = async (role: "review" | "research" | "planner", steps: number) => {
+    process.env.CW_FAKE_STEPS = String(steps);
+    return await runRole({ role, workRoot: process.cwd(), model: "g/m", message: "m", cliPath: fakeCli, timeoutMs: 2_500 });
+  };
+  try {
+    expect(await run("review", 31)).toMatchObject({
+      answer: null, error: "已达 30 步上限，已终止，拆小输入后重试", budget: true, timedOut: false, cancelled: false,
+    });
+    const atLimit = await run("review", 30);
+    expect(atLimit.budget).toBeUndefined();
+    expect(atLimit.timedOut).toBe(true);
+    expect((await run("research", 31)).timedOut).toBe(true);
+    expect((await run("research", 81)).budget).toBe(true);
+    expect((await run("planner", 2)).error).toBe("已达 1 步上限，已终止，拆小输入后重试");
+  } finally {
+    delete process.env.CW_FAKE_ROLE;
+    delete process.env.CW_FAKE_STEPS;
+  }
+}, 40_000);
+
+test("角色工具把超限记成 outcome budget，并把原因交给调用方", async () => {
+  const { repo, tools, cleanup } = await setup();
+  process.env.CW_FAKE_ROLE = "steps";
+  process.env.CW_FAKE_STEPS = "31";
+  try {
+    const result = await tools.get("cw_explore")!.execute("1", { question: "q" }, undefined, undefined, ctx);
+    expect(result.content[0]?.text).toContain("已达 30 步上限，已终止，拆小输入后重试");
+    const events = (await readFile(path.join(repo, ".cw", "meter.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.find((line) => line.event === "explorer").detail).toMatchObject({ outcome: "budget" });
+  } finally {
+    delete process.env.CW_FAKE_STEPS;
+    await cleanup();
+  }
+}, 20_000);

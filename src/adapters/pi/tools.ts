@@ -220,7 +220,7 @@ export async function runAndMeter(
   const meterNote = meterError === null ? "" : `；用量未能写入计量（${meterError}）`;
   if (run.error !== null) {
     await recordEvent(repo, session, role, {
-      outcome: "failed", error: run.error, tokens: spent, ms: Date.now() - started,
+      outcome: run.budget === true ? "budget" : "failed", error: run.error, tokens: spent, ms: Date.now() - started,
       timed_out: run.timedOut, cancelled: run.cancelled,
     });
     return { answer: null, text: `[counterweight] ${tool} 未返回结果（${run.error}）；本次消耗 ${spent} token${meterNote}。${run.timedOut ? timeoutAdvice(tool, timeoutMs) : ""}` };
