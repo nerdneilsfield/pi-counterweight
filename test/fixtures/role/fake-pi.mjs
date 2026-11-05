@@ -28,7 +28,10 @@ const assistant = {
 const delay = Number(process.env.CW_FAKE_DELAY_MS ?? 0);
 if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 
-if (mode === "hang") {
+if (mode === "crash") {
+  process.stderr.write("loading config\nfatal: model g/gone not found\n");
+  process.exit(3);
+} else if (mode === "hang") {
   process.stdout.write(`${JSON.stringify({ type: "message_end", message: assistant })}\n`);
   setInterval(() => undefined, 1000);
 } else if (mode === "empty") {

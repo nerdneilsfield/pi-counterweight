@@ -70,36 +70,38 @@ export interface RoleRequest {
 export type Host = "pi" | "omp";
 
 /**
- * 找宿主的 CLI。先从本模块向上找 pi 的 CLI；找不到就看当前进程入口是不是 pi、OMP 或 OMO 底层的 senpi。
+ * 找宿主的 CLI。先看当前进程入口是不是 pi、OMP 或 OMO 底层的 senpi：正在跑的宿主就是要用的那个。
+ * 入口不是它们时，再从本模块向上找 node_modules 里的 pi CLI。
  * OMP 是 bun 上的 pi 分叉，入口是 `@oh-my-pi/pi-coding-agent/dist/cli.js`；编译成单文件的 OMP 没有这个入口，找不到。
  *
- * Find the host CLI: first pi's CLI above this module, then the running process entry,
- * which may be pi or OMP (a pi fork on bun, entry `@oh-my-pi/pi-coding-agent/dist/cli.js`).
- * A single-file compiled OMP has no such entry and is not found.
+ * Find the host CLI: first the running process entry, which may be pi, OMP (a pi fork on bun,
+ * entry `@oh-my-pi/pi-coding-agent/dist/cli.js`) or senpi, so the host that is running wins;
+ * then pi's CLI in a node_modules above this module. A single-file compiled OMP has no such entry
+ * and is not found.
  */
 export function findHostCli(from: string = path.dirname(fileURLToPath(import.meta.url))): { cli: string; host: Host } | null {
+  const entry = process.argv[1];
+  if (entry !== undefined) {
+    try {
+      const resolved = realpathSync(entry);
+      const pi = path.join("@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+      const omp = path.join("@oh-my-pi", "pi-coding-agent", "dist", "cli.js");
+      // OMO 启动的是 senpi，一个 pi 的分叉，参数表和 pi 一致（已用 senpi 的 CLI 核对）。
+      const senpi = path.join("@code-yeongyu", "senpi", "dist", "bundle", "cli.js");
+      if (resolved.endsWith(path.sep + pi) || resolved.endsWith(path.sep + senpi)) return { cli: resolved, host: "pi" };
+      if (resolved.endsWith(path.sep + omp)) return { cli: resolved, host: "omp" };
+    } catch {
+      // The entry does not resolve: fall through to the search.
+    }
+  }
   let dir = from;
   for (;;) {
     const candidate = path.join(
       dir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
     if (existsSync(candidate)) return { cli: candidate, host: "pi" };
     const parent = path.dirname(dir);
-    if (parent === dir) break;
+    if (parent === dir) return null;
     dir = parent;
-  }
-  const entry = process.argv[1];
-  if (entry === undefined) return null;
-  try {
-    const resolved = realpathSync(entry);
-    const pi = path.join("@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
-    const omp = path.join("@oh-my-pi", "pi-coding-agent", "dist", "cli.js");
-    // OMO 启动的是 senpi，一个 pi 的分叉，参数表和 pi 一致（已用 senpi 的 CLI 核对）。
-    const senpi = path.join("@code-yeongyu", "senpi", "dist", "bundle", "cli.js");
-    if (resolved.endsWith(path.sep + pi) || resolved.endsWith(path.sep + senpi)) return { cli: resolved, host: "pi" };
-    if (resolved.endsWith(path.sep + omp)) return { cli: resolved, host: "omp" };
-    return null;
-  } catch {
-    return null;
   }
 }
 
@@ -165,11 +167,18 @@ export async function runRole(request: RoleRequest): Promise<RoleRun> {
         ({ answer: null, error: reason, usage: events.usage, timedOut: outcome.timedOut, cancelled: outcome.cancelled });
       if (outcome.cancelled) return failure("已被取消");
       if (outcome.timedOut) return failure("超时，子进程组已终止");
-      if (events.finalAssistant === null) return failure("没有最终回答");
+      if (outcome.runnerError !== null) return failure(`无法启动 ${found.host}：${outcome.runnerError}`);
+      // 没有回答时，退出码和 stderr 的最后一行是仅有的线索；scratch 目录在这之后才删。
+      const noAnswer = async (reason: string): Promise<RoleRun> => {
+        const stderr = await readFile(path.join(scratch, "stderr.log"), "utf8").catch(() => "");
+        const detail = stderr.trim().split("\n").pop()?.slice(0, 300) ?? "";
+        return failure(`${reason}（退出码 ${outcome.exitCode}${detail === "" ? "" : `：${detail}`}）`);
+      };
+      if (events.finalAssistant === null) return await noAnswer("没有最终回答");
       if (events.finalAssistant.stopReason !== "stop") {
-        return failure(`未正常结束（stop reason: ${events.finalAssistant.stopReason}）`);
+        return await noAnswer(`未正常结束（stop reason: ${events.finalAssistant.stopReason}）`);
       }
-      if (events.finalAssistant.text.trim() === "") return failure("返回空回答");
+      if (events.finalAssistant.text.trim() === "") return await noAnswer("返回空回答");
       return { answer: events.finalAssistant.text, error: null, usage: events.usage, timedOut: false, cancelled: false };
     } finally {
       outcome.dispose();

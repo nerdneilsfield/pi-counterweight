@@ -9,7 +9,7 @@ import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-codi
 import { loadProjectConfig, type ProjectConfig } from "../../src/core/config.ts";
 import { registerTools } from "../../src/adapters/pi/tools.ts";
 import { rolePromptPath } from "../../src/roles/prompts.ts";
-import { roleArgv } from "../../src/roles/run.ts";
+import { findHostCli, roleArgv, runRole } from "../../src/roles/run.ts";
 
 const fakeCli = path.join(import.meta.dirname, "../fixtures/role/fake-pi.mjs");
 
@@ -214,3 +214,40 @@ test("timeout_s：声明范围 300–1800；超时后按翻倍给下一档，用
     await cleanup();
   }
 }, 30_000);
+
+test("findHostCli：正在跑的宿主（process.argv[1]）优先于 node_modules 里的 pi", async () => {
+  const dir = await realpath(await mkdtemp(path.join(tmpdir(), "cw-host-")));
+  const original = process.argv[1];
+  try {
+    const entry = path.join(dir, "node_modules", "@oh-my-pi", "pi-coding-agent", "dist", "cli.js");
+    await mkdir(path.dirname(entry), { recursive: true });
+    await writeFile(entry, "");
+    // node_modules 里另有一个 pi，按旧顺序会先选它。
+    const pi = path.join(dir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+    await mkdir(path.dirname(pi), { recursive: true });
+    await writeFile(pi, "");
+    process.argv[1] = entry;
+    expect(findHostCli(dir)).toEqual({ cli: entry, host: "omp" });
+    // 入口不是已知宿主时，才去找 node_modules。
+    process.argv[1] = path.join(dir, "other.js");
+    await writeFile(process.argv[1], "");
+    expect(findHostCli(dir)).toEqual({ cli: pi, host: "pi" });
+  } finally {
+    process.argv[1] = original!;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runRole：没有回答时，错误里带退出码和 stderr 的最后一行", async () => {
+  process.env.CW_FAKE_ROLE = "crash";
+  try {
+    const run = await runRole({ role: "review", workRoot: process.cwd(), model: "g/gone", message: "m", cliPath: fakeCli, timeoutMs: 10_000 });
+    expect(run.answer).toBeNull();
+    expect(run.error).toContain("没有最终回答");
+    expect(run.error).toContain("退出码 3");
+    expect(run.error).toContain("fatal: model g/gone not found");
+    expect(run.error).not.toContain("loading config");
+  } finally {
+    delete process.env.CW_FAKE_ROLE;
+  }
+});
