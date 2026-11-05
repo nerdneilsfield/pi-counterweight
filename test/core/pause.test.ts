@@ -1,12 +1,7 @@
 /**
- * PAUSE 与强制启用的纯逻辑：什么算“改源码”、transcript 怎么渲染与截断、diff 怎么取、结算要做什么。
+ * PAUSE 与强制启用的纯逻辑：什么算“改源码”、transcript 怎么渲染与截断、结算要做什么（diff 的基线见 baseline.test.ts）。
  */
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { expect, test } from "vitest";
-import { changedFiles, workingDiff } from "../../src/core/auto.ts";
 import { isSourceEdit, renderTranscript } from "../../src/core/pause.ts";
 
 test(".cw、tmp 和仓库外不算改源码，其余都算", () => {
@@ -45,39 +40,6 @@ test("transcript 超预算时从最早处丢，并注明丢了几段", () => {
   expect(text).toContain("更早的");
   expect(text).toContain("第9条");
   expect(text).not.toContain("第0条");
-});
-
-function git(cwd: string, ...args: string[]): void {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
-  if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
-}
-
-test("workingDiff：已跟踪的改动给 diff，未跟踪只列名字，.cw 不算，非 git 为 null", async () => {
-  const repo = await realpath(await mkdtemp(path.join(tmpdir(), "cw-auto-")));
-  const plain = await realpath(await mkdtemp(path.join(tmpdir(), "cw-plain-")));
-  try {
-    git(repo, "init");
-    await writeFile(path.join(repo, "a.txt"), "one\n");
-    git(repo, "add", "a.txt");
-    git(repo, "-c", "user.email=a@b.c", "-c", "user.name=cw", "commit", "-m", "base");
-    expect(await workingDiff(repo)).toBe("");
-
-    await writeFile(path.join(repo, "a.txt"), "two\n");
-    await writeFile(path.join(repo, "new.txt"), "n\n");
-    await mkdir(path.join(repo, ".cw"), { recursive: true });
-    await writeFile(path.join(repo, ".cw", "meter.jsonl"), "{}\n");
-    const diff = (await workingDiff(repo))!;
-    expect(diff).toContain("-one");
-    expect(diff).toContain("+two");
-    expect(diff).toContain("# new.txt");
-    expect(diff).not.toContain("meter.jsonl");
-    expect(changedFiles(diff).sort()).toEqual(["a.txt", "new.txt"]);
-
-    expect(await workingDiff(plain)).toBeNull();
-  } finally {
-    await rm(repo, { recursive: true, force: true });
-    await rm(plain, { recursive: true, force: true });
-  }
 });
 
 test("超时档位：夹进 [300, 1800]，下一档翻倍并封顶，用满上限返回 null", async () => {

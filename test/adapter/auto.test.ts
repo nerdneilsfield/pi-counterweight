@@ -165,10 +165,11 @@ test("PAUSE：受保护路径先拦，不浪费 planner；没开 pause 时完全
 test("自动审查：发现交回主模型并续跑一次；续跑后的结算照样审查，但不再续跑", async () => {
   const s = await setup(`${MODELS}\n[auto]\nreview = true\n`);
   cleanup.push(s.repo);
-  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   process.env.CW_FAKE_TEXT_REVIEW = "WRONG `a.ts:f`\n期望：x\n实际：y";
   process.env.CW_FAKE_TEXT_OVER_REVIEW = "none";
+  // 基线在回合开始时取，所以回合里的改动要在 newTurn 之后做。
   await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
 
   const first = await settle(s);
   expect(first!.continue).toBe(true);
@@ -256,7 +257,7 @@ test("自动汇报：有改动才汇报，带请求与文件，写入 HISTORY.md
   expect(await readFile(path.join(s.repo, ".cw", "HISTORY.md"), "utf8")).toBe("# 史\n\n新华社电\n");
 });
 
-test("审查有发现的那一轮不汇报；它的失败不影响结束检查的结论", async () => {
+test("审查有发现且要续跑的那次结算不汇报，最后一次结算汇报，发现只是显示也一样；审查失败不影响检查结论", async () => {
   const s = await setup(`${MODELS}
 [check]
 cmd = ["/bin/sh", "-c", "true"]
@@ -267,13 +268,21 @@ review = true
 chronicle = true
 `);
   cleanup.push(s.repo);
-  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   process.env.CW_FAKE_TEXT_REVIEW = "WRONG `a:f`\n期望：x\n实际：y";
+  process.env.CW_FAKE_TEXT_HISTORIAN = "# 史\n\n记了一笔";
   await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   const result = await settle(s);
   expect(result!.entries.map((entry) => entry.content).join("\n")).toContain("结束检查");
   expect(result!.continue).toBe(true);
   expect((await s.calls()).some((call) => call.role === "historian")).toBe(false);
+
+  // 续跑之后的结算：审查仍有发现，只显示，但这是最后一次结算，史官照样记这一轮。
+  const last = await settle(s);
+  expect(last!.continue).toBeUndefined();
+  expect(last!.entries.at(-1)!.content).toContain("不再续跑");
+  expect((await s.calls()).filter((call) => call.role === "historian")).toHaveLength(1);
+  expect(await readFile(path.join(s.repo, ".cw", "HISTORY.md"), "utf8")).toBe("# 史\n\n记了一笔\n");
 
   process.env.CW_FAKE_ROLE = "empty";
   const s2 = await setup(`${MODELS}
@@ -285,8 +294,8 @@ timeout_s = 5
 review = true
 `);
   cleanup.push(s2.repo);
-  await writeFile(path.join(s2.repo, "tracked.txt"), "changed\n");
   await newTurn(s2);
+  await writeFile(path.join(s2.repo, "tracked.txt"), "changed\n");
   const passed = await settle(s2);
   expect(passed!.entries.map((entry) => entry.content).join("\n")).toContain("结束检查");
   expect(passed!.continue).toBeUndefined();
@@ -338,9 +347,9 @@ test("[timeouts] 到达角色子进程：配 300 秒的 review 挂住时，在�
   // 配置值是合法的 300 秒；realWaitMs 只把真实等待压到 1 秒，让测试能在秒级结束。
   const s = await setup(`${MODELS}\n[timeouts]\nreview = 300\nover_review = 300\n\n[auto]\nreview = true\n`, undefined, 1_000);
   cleanup.push(s.repo);
-  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   process.env.CW_FAKE_ROLE = "hang";
   await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   const started = Date.now();
   const result = await settle(s);
   expect(Date.now() - started).toBeLessThan(15_000);
@@ -372,12 +381,141 @@ over_review = 1800
 review = true
 `, { checkMarginMs: 0 });
   cleanup.push(s.repo);
-  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   process.env.CW_FAKE_DELAY_MS = "2000";
   process.env.CW_FAKE_TEXT_REVIEW = "WRONG `a:f`\n期望：x\n实际：y";
   process.env.CW_FAKE_TEXT_OVER_REVIEW = "none";
   await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
   const result = await settle(s);
   expect(result?.continue).toBe(true);
   expect(result!.entries.at(-1)!.content).toContain("WRONG `a:f`");
+}, 30_000);
+
+// ---- 取消与 shutdown：后台的审查、汇报和 PAUSE 的 planner 都听得到中止 ----
+
+// 只认以假 CLI 的 node 或 sh 开头的进程行，免得把查询它的命令行自己算进去。
+const psOutput = (): Promise<string> => new Promise((resolve) => {
+  const child = spawn("ps", ["-eo", "args"]);
+  let out = "";
+  child.stdout.on("data", (chunk) => { out += chunk; });
+  child.once("close", () => resolve(out.split("\n")
+    .filter((line) => line.startsWith(`${process.execPath} `) || line.startsWith("/bin/sh -c sleep"))
+    .join("\n")));
+});
+
+async function until(done: () => Promise<boolean>, ms = 10_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!(await done()) && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 25));
+}
+
+test("shutdown 中止在跑的自动审查，并等到子进程消失", async () => {
+  const s = await setup(`${MODELS}\n[auto]\nreview = true\n`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_ROLE = "hang";
+  await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
+  const pending = settle(s);
+  await until(async () => (await s.calls()).length === 2);
+  expect((await s.calls()).length).toBe(2);
+
+  const started = Date.now();
+  await s.handlers.get("session_shutdown")!({}, s.ctx);
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expect(await psOutput()).not.toContain("fixtures/role/fake-pi.mjs");
+  // 审查被中止：没有发现，也不续跑。
+  expect(await pending).toBeUndefined();
+}, 30_000);
+
+test("shutdown 中止在跑的史官", async () => {
+  const s = await setup(`${MODELS}\n[auto]\nchronicle = true\n`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_ROLE = "hang";
+  await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
+  const pending = settle(s);
+  await until(async () => (await s.calls()).length === 1);
+  await s.handlers.get("session_shutdown")!({}, s.ctx);
+  expect(await psOutput()).not.toContain("fixtures/role/fake-pi.mjs");
+  await pending;
+  await expect(readFile(path.join(s.repo, ".cw", "HISTORY.md"), "utf8")).rejects.toThrow();
+}, 30_000);
+
+const SLEEP_CHECK = `${MODELS}
+[check]
+cmd = ["/bin/sh", "-c", "sleep 43.3"]
+timeout_s = 60
+
+[auto]
+review = true
+`;
+
+test("检查被取消后不跑自动审查（pi 的 agent_before_settle）", async () => {
+  const s = await setup(SLEEP_CHECK);
+  cleanup.push(s.repo);
+  await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
+  const interrupt = new AbortController();
+  const ctx = { ...s.ctx, signal: interrupt.signal } as ExtensionContext;
+  const pending = s.handlers.get("agent_before_settle")!({ outcome: "completed", entries: [] }, ctx);
+  await until(async () => (await psOutput()).includes("sleep 43.3"));
+  interrupt.abort();
+  expect(await pending).toBeUndefined();
+  expect((await s.calls()).length).toBe(0);
+  expect(await psOutput()).not.toContain("sleep 43.3");
+}, 30_000);
+
+test("检查被取消后不跑自动审查（OMP 的 session_stop）", async () => {
+  const s = await setup(SLEEP_CHECK);
+  cleanup.push(s.repo);
+  await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
+  const interrupt = new AbortController();
+  const pending = s.handlers.get("session_stop")!({ signal: interrupt.signal }, s.ctx);
+  await until(async () => (await psOutput()).includes("sleep 43.3"));
+  interrupt.abort();
+  expect(await pending).toBeUndefined();
+  expect((await s.calls()).length).toBe(0);
+}, 30_000);
+
+test("OMP 的 session_stop：中断信号也中止在跑的自动审查", async () => {
+  const s = await setup(`${MODELS}\n[auto]\nreview = true\n`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_ROLE = "hang";
+  await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
+  const interrupt = new AbortController();
+  const pending = s.handlers.get("session_stop")!({ signal: interrupt.signal }, s.ctx);
+  await until(async () => (await s.calls()).length === 2);
+  const started = Date.now();
+  interrupt.abort();
+  expect(await pending).toBeUndefined();
+  expect(Date.now() - started).toBeLessThan(10_000);
+}, 30_000);
+
+test("PAUSE：用户中断（ctx.signal）中止 planner，这次编辑放行", async () => {
+  const s = await setup(`${MODELS}\n[auto]\npause = true\n`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_ROLE = "hang";
+  await newTurn(s);
+  const interrupt = new AbortController();
+  const ctx = { ...s.ctx, signal: interrupt.signal } as ExtensionContext;
+  const pending = s.handlers.get("tool_call")!({ toolName: "edit", input: { path: "src/a.ts" }, toolCallId: "t" }, ctx);
+  await until(async () => (await s.calls()).length === 1);
+  const started = Date.now();
+  interrupt.abort();
+  expect(await pending).toBeUndefined();
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expect(await psOutput()).not.toContain("fixtures/role/fake-pi.mjs");
+}, 30_000);
+
+test("shutdown 中止在跑的 PAUSE planner", async () => {
+  const s = await setup(`${MODELS}\n[auto]\npause = true\n`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_ROLE = "hang";
+  await newTurn(s);
+  const pending = edit(s, "src/a.ts");
+  await until(async () => (await s.calls()).length === 1);
+  await s.handlers.get("session_shutdown")!({}, s.ctx);
+  expect(await psOutput()).not.toContain("fixtures/role/fake-pi.mjs");
+  expect(await pending).toBeUndefined();
 }, 30_000);

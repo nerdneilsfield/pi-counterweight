@@ -522,3 +522,24 @@ test("before_agent_start：pi 写 sections，OMP 返回替换数组", async () =
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+// goal.md 不用配置也会被注入，所以没有配置、配置非法、经符号链接，写它都被拒绝；其余路径照旧放行。
+test("goal.md：没有配置、配置非法、符号链接都拒绝；project.toml 仍可创建", async () => {
+  for (const toml of [null, "version = 99\n"]) {
+    const repo = await repoWith(toml, { ".cw/goal.md": "目标" });
+    try {
+      await symlink(".cw/goal.md", path.join(repo, "alias.md"));
+      const fake = fakePi(repo);
+      await start(fake);
+      for (const target of [".cw/goal.md", path.join(repo, ".cw/goal.md"), "alias.md"]) {
+        const blocked = await toolCall(fake, "write", { path: target });
+        expect(blocked?.block, `${toml} ${target}`).toBe(true);
+        expect(blocked?.reason).toContain("goal.md");
+      }
+      expect(await toolCall(fake, "write", { path: "src/a.ts" })).toBeUndefined();
+      if (toml === null) expect(await toolCall(fake, "write", { path: ".cw/project.toml" })).toBeUndefined();
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  }
+});

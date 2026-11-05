@@ -4,7 +4,8 @@
  * `[check]` 在每轮正常结束时跑一次，失败把输出交回一次。`[protect]` 拦截 `edit`/`write`。
  * `[models]` 决定六个角色用哪个模型，没配的角色调用时返回不可用。
  * `[auto]` 让 review / over_review、史官、PAUSE 由扩展自己触发，而不是等模型想起来调用；默认全关。
- * 没有配置或配置非法时，不检查、不拦截。助手用量仍写入 `.cw/meter.jsonl`。
+ * 这些后台运行和结束检查一样，在 session_shutdown（含 /reload）时被中止并等到收尾。
+ * 没有配置或配置非法时，不检查、不拦截，只有 `.cw/goal.md` 照样拒写（它不用配置也会被注入）。助手用量仍写入 `.cw/meter.jsonl`。
  * 每次用户回合都往系统提示的 `counterweight` 段写一段说话和构建约束，不管有没有配置。
  */
 import type {
@@ -21,7 +22,7 @@ import type {
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { changedFiles, chronicleReport, renderActions, workingDiff, type ActionRecord } from "../../core/auto.js";
+import { changedFiles, chronicleReport, renderActions, snapshotTree, workingDiff, type ActionRecord } from "../../core/auto.js";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
 import { loadProjectConfig, type ProjectConfig } from "../../core/config.js";
 import { repoToplevel } from "../../core/gitstate.js";
@@ -174,6 +175,12 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // 本回合的非只读动作（bash、edit、write）。diff 看不见跑过的命令，审查时要单独附上。
   // 和修复额度一样，只有新的用户回合才清空，结算触发的续跑接着累计。
   let turnActions: ActionRecord[] = [];
+  // 本回合开始时的工作树快照，审查与汇报的改动从它算起。取不到（或 [auto] 没开）为 null，退回 HEAD。
+  // 和修复额度一样，只有新的用户回合才重取，续跑接着用，所以续跑后的审查看到整个回合。
+  let turnBase: string | null = null;
+  // 会话级中止信号：session_shutdown 用它中止自动审查、汇报和 PAUSE 的 planner，并等它们收尾。
+  let lifetime = new AbortController();
+  const background = new Set<Promise<unknown>>();
   // 自动审查的发现最多让主模型续跑一轮；和修复额度、PAUSE 额度一样，只有 before_agent_start 才重置。
   let findingsUsed = false;
 
@@ -185,9 +192,39 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     }
   };
 
+  /**
+   * 跑一段后台工作：它的信号同时听 `sources` 和会话级信号，并登记下来，shutdown 要等它收尾。
+   */
+  async function linked<T>(
+    sources: ReadonlyArray<AbortSignal | undefined>, run: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const forwards: Array<{ source: AbortSignal; fn: () => void }> = [];
+    for (const source of [lifetime.signal, ...sources]) {
+      if (source === undefined) continue;
+      const fn = () => controller.abort();
+      if (source.aborted) fn();
+      else {
+        source.addEventListener("abort", fn, { once: true });
+        forwards.push({ source, fn });
+      }
+    }
+    const work = run(controller.signal);
+    const settled = work.then(() => undefined, () => undefined);
+    background.add(settled);
+    try {
+      return await work;
+    } finally {
+      background.delete(settled);
+      for (const { source, fn } of forwards) source.removeEventListener("abort", fn);
+    }
+  }
+
   // ---- session_start: repo root, then the optional config ----
   pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) =>
     withTimeout(limits.sessionStartMs, async () => {
+      // 同一个实例若在 shutdown 之后又开了新会话，不能带着已经中止的信号。
+      if (lifetime.signal.aborted) lifetime = new AbortController();
       repo = await sessionRoot(ctx.cwd);
       try {
         project = await loadProjectConfig(repo);
@@ -225,9 +262,11 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
     const protectedResult = await withTimeout(limits.toolCallMs, async (signal) => {
       const root = repo;
-      if (root === null || project === null || signal.aborted) return undefined;
+      if (root === null || signal.aborted) return undefined;
       const raw = writeToolPath(event);
       if (raw === null) return undefined;
+      // 没有可用配置时只护 goal.md：它不用配置也会被注入。其余路径放行，setup 要能创建 project.toml。
+      if (project === null) return await checkGoalTarget(root, ctx.cwd, raw);
       return await checkProtectedTarget(root, ctx.cwd, protectedPatterns(project), raw);
     }, () => {
       notifyError(ctx, "Counterweight: 写入保护检查未能在时限内完成，本次调用被拒绝");
@@ -274,7 +313,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     pauseUsed = true;
     const started = Date.now();
     const session = ctx.sessionManager.getSessionId();
-    return await withTimeout(pauseBudget(), async (signal) => {
+    return await withTimeout(pauseBudget(), (outer) => linked([outer, ctx.signal], async (signal) => {
       const messages = ctx.sessionManager.buildSessionProjection().messages as unknown as TranscriptMessage[];
       const message = plannerMessage(renderTranscript(messages), relative!, event.toolName, event.input as Record<string, unknown>);
       const run = await runAndMeter(ctx, root, "planner", "cw_pause", planner, message, signal, { getProject: () => project, getRepo: () => repo, cliPath: roleCli, realWaitMs });
@@ -282,7 +321,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         outcome: run.answer === null ? "failed" : "planned", ms: Date.now() - started, tool: event.toolName,
       });
       return run.answer === null ? undefined : { block: true, reason: pauseReason(run.answer.trim()) };
-    }, async () => {
+    }), async () => {
       await recordEvent(root, session, "pause", { outcome: "timeout", ms: Date.now() - started, tool: event.toolName });
       return undefined;
     });
@@ -302,9 +341,15 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       pauseUsed = false;
       findingsUsed = false;
       turnActions = [];
+      turnBase = null;
     }
     const prompt = (event as { prompt?: unknown }).prompt;
     if (typeof prompt === "string") turnRequest = prompt;
+    // 快照放在保存请求之后：它慢，也不能让请求丢掉。
+    if ((messageType === undefined || messageType === "user") && repo !== null
+      && project !== null && (project.auto.review || project.auto.chronicle)) {
+      turnBase = await snapshotTree(repo);
+    }
     const section = withGoal(
       sessionSection(project?.auto ?? { review: false, chronicle: false }),
       await readGoal(repo),
@@ -325,6 +370,8 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     return withTimeout(budgetMs, async (signal) => {
       if (event.outcome !== "completed") return undefined;
       const report = await runCheckOnce(ctx, signal);
+      // 被取消的检查没有结论，也不该接着起审查模型。
+      if (report === "cancelled" || signal.aborted || lifetime.signal.aborted) return undefined;
       const entries = report === undefined ? [...event.entries] : [...event.entries, settleEntry(report.text)];
       if (report?.retrying) return { entries, continue: true };
       // 检查还要求修复时代码会再变，审查没有意义；定稿了才自动审查与汇报。
@@ -346,9 +393,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + autoBudget();
       return withTimeout(budgetMs, async (signal) => {
         const report = await runCheckOnce(ctx, signal, event.signal);
+        if (report === "cancelled" || signal.aborted || event.signal?.aborted || lifetime.signal.aborted) return undefined;
         if (report !== undefined) ctx.ui.notify(report.text, report.passed ? "info" : "warning");
         if (report?.retrying) return { continue: true, additionalContext: report.text };
-        const auto = await runAuto(ctx, report?.text ?? null, signal);
+        const auto = await runAuto(ctx, report?.text ?? null, signal, event.signal);
         if (auto.text !== null) ctx.ui.notify(auto.text, "info");
         return auto.continueRun && auto.text !== null ? { continue: true, additionalContext: auto.text } : undefined;
       }, () => {
@@ -388,29 +436,26 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   /**
    * 结算时的强制审查与汇报，只在 `[auto]` 打开时有动作。
    * review 与 over_review 并行，各自只读；它们只报告，不决定检查是否通过。发现了问题就把原文交回主模型，
-   * 并最多续跑一轮（每个用户回合一次），续跑后的结算只汇报不再审查——否则两边会互相追着跑。
+   * 并最多续跑一轮（每个用户回合一次）。改动按回合基线算，续跑后的结算照样审查整个回合，但发现不再打断主模型；
+   * 不续跑的结算才交给史官，发现只是显示时也一样。
    * 史官走和 `cw_chronicle` 同一条队列。任何一步失败都只是不产出文字，绝不影响检查结论。
    *
    * Forced review and chronicle at settle. Findings go back to the main model with at most one forced
    * follow-up per user turn; a failure here only yields no text and never touches the check verdict.
    */
   async function runAuto(
-    ctx: ExtensionContext, checkLine: string | null, signal: AbortSignal,
+    ctx: ExtensionContext, checkLine: string | null, signal: AbortSignal, hostSignal?: AbortSignal,
   ): Promise<{ text: string | null; continueRun: boolean }> {
     // 审查和汇报只是附加：它们坏了或拖得太久，都不能把已经得到的检查结论变成「未能完成」。
     // 所以它持有自己的预算和取消，且比外层预算（检查预算 + autoMs）短，一定先到点。
-    const own = new AbortController();
-    const forward = () => own.abort();
-    if (signal.aborted) own.abort();
-    else signal.addEventListener("abort", forward, { once: true });
-    const timer = setTimeout(() => own.abort(), Math.max(0, autoRunMs() - 1_000));
+    const budget = new AbortController();
+    const timer = setTimeout(() => budget.abort(), Math.max(0, autoRunMs() - 1_000));
     try {
-      return await runAutoUnsafe(ctx, checkLine, own.signal);
+      return await linked([signal, hostSignal, ctx.signal, budget.signal], (own) => runAutoUnsafe(ctx, checkLine, own));
     } catch {
       return { text: null, continueRun: false };
     } finally {
       clearTimeout(timer);
-      signal.removeEventListener("abort", forward);
     }
   }
 
@@ -422,7 +467,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     if (root === null || config === null || (!config.auto.review && !config.auto.chronicle)) {
       return { text: null, continueRun: false };
     }
-    const diff = await workingDiff(root);
+    const diff = await workingDiff(root, turnBase);
     const changed = diff !== null && diff.trim() !== "";
     // 跑了命令但没改文件时 diff 是空的。命令只交给 over_review，review 仍按 diff 判断对错。
     const actions = renderActions(turnActions);
@@ -460,8 +505,9 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       }
     }
 
-    if (plan.chronicle && !continueRun && lines.length === 0 && config.models.historian !== null) {
-      const report = chronicleReport(turnRequest, changedFiles(diff!), checkLine);
+    // 不续跑的结算才汇报；审查发现只是显示时也汇报。
+    if (plan.chronicle && !continueRun) {
+      const report = chronicleReport(turnRequest, await changedFiles(root, turnBase), checkLine);
       await queueChronicle(() => chronicle(ctx, root, config.models.historian!, report, signal, registration));
     }
     return { text: lines.length === 0 ? null : lines.join("\n\n"), continueRun };
@@ -470,7 +516,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   /**
    * 执行一次结算检查：配置了结束检查就运行，不看工作树有没有变化。
    * 通过就报一行事实；失败把尾部事实反馈一次并续跑；第二次失败如实报告后结束。
-   * 取消时返回 undefined：被取消的检查不对本轮下结论。
+   * 取消时返回 "cancelled"：被取消的检查不对本轮下结论，调用方也不该接着跑自动审查。没配检查返回 undefined。
    *
    * Runs the settle check whenever a check is configured, whether or not the
    * worktree changed. A pass reports one line; a failure feeds the tail facts
@@ -481,7 +527,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     ctx: ExtensionContext,
     outerSignal: AbortSignal,
     hostSignal?: AbortSignal,
-  ): Promise<{ text: string; retrying: boolean; passed: boolean } | undefined> {
+  ): Promise<{ text: string; retrying: boolean; passed: boolean } | "cancelled" | undefined> {
     const root = repo;
     const check = project?.check ?? null;
     if (root === null || check === null) return undefined;
@@ -515,7 +561,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     // A cancelled check produces no claim about the turn (the caller's signal
     // was an interrupt or the outer timeout, which reports through its own
     // fallback). A late cancel stays visible until the process group is gone.
-    if (outcome.cancelled) return undefined;
+    if (outcome.cancelled) return "cancelled";
 
     const passed = checkPassed(outcome);
     const retrying = !passed && !repairUsed;
@@ -557,10 +603,11 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       return undefined;
     }, () => undefined));
 
-  // ---- session_shutdown: idempotent termination of a running check ----
+  // ---- session_shutdown: idempotent termination of a running check, auto review, chronicle and PAUSE ----
   pi.on("session_shutdown", (_event: SessionShutdownEvent, _ctx: ExtensionContext) =>
     withTimeout(limits.shutdownWaitMs * 2, async () => {
-      await stopCheck();
+      lifetime.abort();
+      await Promise.all([stopCheck(), ...background]);
       return undefined;
     }, () => undefined));
 
@@ -666,7 +713,7 @@ async function sessionRoot(cwd: string): Promise<string> {
  * Block reason for a direct write to a protected path.
  */
 const PROTECTED_REASON = (relative: string) => `[counterweight] ${relative} 是受保护路径`
-  + "（.cw/project.toml 或项目配置 [protect].paths）；如需修改请由用户手动完成。";
+  + "（.cw/project.toml、.cw/goal.md 或项目配置 [protect].paths）；如需修改请由用户手动完成。";
 
 /**
  * 路径无法核对受保护集合（符号链接逃逸仓库或不可解析）时的拒绝理由。
@@ -717,6 +764,25 @@ async function checkProtectedTarget(
   if (isProtected(resolved, patterns)) {
     const via = resolved === lexical ? "" : `（路径 ${raw} 指向该受保护文件）`;
     return { block: true, reason: `${PROTECTED_REASON(resolved)}${via}` };
+  }
+  return undefined;
+}
+
+/**
+ * 没有可用配置时的最小保护：`raw` 本身或经符号链接解析后是 `.cw/goal.md` 就拒绝，其余一律放行。
+ * 解析不了的路径在没有配置时照旧放行。
+ */
+async function checkGoalTarget(root: string, cwd: string, raw: string): Promise<ToolCallEventResult | undefined> {
+  const lexical = toRepoRelative(root, cwd, raw);
+  if (lexical === null) return undefined;
+  if (lexical === GOAL_FILE) return { block: true, reason: PROTECTED_REASON(lexical) };
+  try {
+    const resolved = await resolveWriteTarget(root, lexical);
+    if (resolved === GOAL_FILE) {
+      return { block: true, reason: `${PROTECTED_REASON(resolved)}（路径 ${raw} 指向该受保护文件）` };
+    }
+  } catch {
+    // Unresolvable and no config: same as before, the write is not ours to judge.
   }
   return undefined;
 }

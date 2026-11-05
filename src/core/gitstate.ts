@@ -10,7 +10,8 @@ export async function repoToplevel(dir: string): Promise<string | null> {
   return result.stdout.trim();
 }
 
-export function git(repo: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+/** `env` 是附加的环境变量，例如临时索引的 `GIT_INDEX_FILE`。 */
+export function git(repo: string, args: string[], env: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {
       cwd: repo,
@@ -18,6 +19,7 @@ export function git(repo: string, args: string[]): Promise<{ code: number; stdou
         PATH: process.env.PATH,
         HOME: process.env.HOME,
         GIT_CONFIG_COUNT: "0",
+        ...env,
       },
     });
     let stdout = "";

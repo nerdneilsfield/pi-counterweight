@@ -4,6 +4,9 @@
  *
  * Forced review and chronicle at settle time. Pure logic, no pi imports.
  */
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { git } from "./gitstate.js";
 
 /** diff 的字符上限。超出就截断并注明，免得把审查者的上下文塞满。 */
@@ -51,25 +54,48 @@ export function renderActions(actions: readonly ActionRecord[]): string {
 }
 
 /**
- * 工作树相对 HEAD 的改动，含未跟踪文件。不在 git 仓库里、或没有任何提交时返回 null。
- * 用 `git add -N` 不合适（会改索引），所以未跟踪文件单独列名字，不展开内容。
+ * 当前工作树（含未跟踪文件，遵守 .gitignore）的树对象 id，作为回合的基线。
+ * 在临时索引里 `git add -A` 再 `git write-tree`，真实索引不动；临时目录用完即删。
+ * 不在 git 仓库里或任何一步失败时返回 null。
  */
-export async function workingDiff(repo: string): Promise<string | null> {
-  // 不在仓库里、或还没有提交时 git 退出码非 0：当作没有可审的 diff。
-  const run = async (args: string[]): Promise<string | null> => {
-    try {
-      const result = await git(repo, args);
-      return result.code === 0 ? result.stdout : null;
-    } catch {
-      return null;
-    }
-  };
-  const tracked = await run(["diff", "HEAD", "--no-ext-diff", "--no-color"]);
-  if (tracked === null) return null;
-  const untracked = await run(["ls-files", "--others", "--exclude-standard", "--", ":!.cw"]);
-  const names = untracked === null ? [] : untracked.split("\n").filter((line) => line !== "");
-  const tail = names.length === 0 ? "" : `\n# 未跟踪的新文件（只列名字）：\n${names.map((name) => `# ${name}`).join("\n")}\n`;
-  const body = `${tracked}${tail}`;
+export async function snapshotTree(repo: string): Promise<string | null> {
+  let dir: string | null = null;
+  try {
+    dir = await mkdtemp(path.join(tmpdir(), "cw-index-"));
+    const env = { GIT_INDEX_FILE: path.join(dir, "index") };
+    // 先载入 HEAD：已跟踪但被忽略的文件才不会丢。还没有提交时 read-tree 失败，从空索引开始。
+    await git(repo, ["read-tree", "HEAD"], env);
+    if ((await git(repo, ["add", "-A"], env)).code !== 0) return null;
+    const tree = await git(repo, ["write-tree"], env);
+    return tree.code === 0 ? tree.stdout.trim() : null;
+  } catch {
+    return null;
+  } finally {
+    if (dir !== null) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** `git diff` 的起止参数：有基线时是基线与当前快照；没有基线时是 HEAD 与当前快照，快照也失败时是 HEAD 与工作树。 */
+const diffRange = (base: string | null, end: string | null): string[] => [base ?? "HEAD", ...(end === null ? [] : [end])];
+
+/** 失败（不在仓库里、没有提交）返回 null。 */
+async function gitOut(repo: string, args: string[]): Promise<string | null> {
+  try {
+    const result = await git(repo, args);
+    return result.code === 0 ? result.stdout : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 回合基线 `base` 到现在的改动，含未跟踪文件的内容，不含 `.cw`。`base` 为 null（没取到基线）时退回 HEAD。
+ * 不在 git 仓库里、或没有任何提交又没有基线时返回 null。
+ */
+export async function workingDiff(repo: string, base: string | null): Promise<string | null> {
+  const end = await snapshotTree(repo);
+  const body = await gitOut(repo, ["diff", "--no-ext-diff", "--no-color", ...diffRange(base, end), "--", ".", ":!.cw"]);
+  if (body === null) return null;
   if (body.trim() === "") return "";
   return body.length > DIFF_CAP ? `${body.slice(0, DIFF_CAP)}\n# …（diff 超过 ${DIFF_CAP} 字符，已截断）\n` : body;
 }
@@ -81,10 +107,9 @@ export function chronicleReport(request: string, files: string[], checkLine: str
     + `${checkLine === null ? "" : `\n结束检查：${checkLine}\n`}\n时间：${new Date().toISOString()}。提交信息与日期请以仓库为准，不要编造。`;
 }
 
-/** 从 diff 里取出改动文件名。 */
-export function changedFiles(diff: string): string[] {
-  const seen = new Set<string>();
-  for (const match of diff.matchAll(/^diff --git a\/(.+?) b\/\1$/gm)) seen.add(match[1]!);
-  for (const match of diff.matchAll(/^# (?!未跟踪|…)(.+)$/gm)) seen.add(match[1]!);
-  return [...seen];
+/** 基线到现在改动的文件名，由 git 给出，所以重命名和非 ASCII 路径都对。取不到时为空数组。 */
+export async function changedFiles(repo: string, base: string | null): Promise<string[]> {
+  const end = await snapshotTree(repo);
+  const out = await gitOut(repo, ["-c", "core.quotePath=false", "diff", "--name-only", "-z", ...diffRange(base, end), "--", ".", ":!.cw"]);
+  return out === null ? [] : out.split("\0").filter((name) => name !== "");
 }
