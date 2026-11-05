@@ -29,7 +29,9 @@ import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
 import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from "../../core/paths.js";
 import { isSourceEdit, pauseReason, plannerMessage, renderTranscript, type TranscriptMessage } from "../../core/pause.js";
+import { dangerousCommand } from "../../core/danger.js";
 import { isProtected, GOAL_FILE } from "../../core/protect.js";
+import { inScope, readScope, SCOPE_FILE, scopeReason } from "../../core/scope.js";
 import { sessionSection, withGoal } from "../../roles/prompts.js";
 import { roleTimeoutMs } from "../../roles/run.js";
 import { runSetup } from "./setup.js";
@@ -263,14 +265,22 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
 
   // ---- tool_call: block direct writes to protected paths ----
   pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
+    // 高危命令不用配置、不用仓库根也拒绝。
+    if (event.toolName === "bash" || event.toolName === "powershell") {
+      const command = (event.input as Record<string, unknown>).command;
+      const danger = typeof command === "string" ? dangerousCommand(command) : null;
+      if (danger !== null) return { block: true, reason: danger };
+    }
     const protectedResult = await withTimeout(limits.toolCallMs, async (signal) => {
       const root = repo;
       if (root === null || signal.aborted) return undefined;
       const raw = writeToolPath(event);
       if (raw === null) return undefined;
-      // 没有可用配置时只护 goal.md：它不用配置也会被注入。其余路径放行，setup 要能创建 project.toml。
-      if (project === null) return await checkGoalTarget(root, ctx.cwd, raw);
-      return await checkProtectedTarget(root, ctx.cwd, protectedPatterns(project), raw);
+      // 没有可用配置时只护 goal.md 和 scope.txt：它们不用配置也生效。其余路径放行，setup 要能创建 project.toml。
+      const guarded = project === null
+        ? await checkGoalTarget(root, ctx.cwd, raw)
+        : await checkProtectedTarget(root, ctx.cwd, protectedPatterns(project), raw);
+      return guarded ?? await checkScopeTarget(root, ctx.cwd, raw);
     }, () => {
       notifyError(ctx, "Counterweight: 写入保护检查未能在时限内完成，本次调用被拒绝");
       return { block: true, reason: "[counterweight] 保护检查超时或失败，写入被拒绝" };
@@ -721,7 +731,7 @@ async function sessionRoot(cwd: string): Promise<string> {
  * Block reason for a direct write to a protected path.
  */
 const PROTECTED_REASON = (relative: string) => `[counterweight] ${relative} 是受保护路径`
-  + "（.cw/project.toml、.cw/goal.md 或项目配置 [protect].paths）；如需修改请由用户手动完成。";
+  + "（.cw/project.toml、.cw/goal.md、.cw/scope.txt 或项目配置 [protect].paths）；如需修改请由用户手动完成。";
 
 /**
  * 路径无法核对受保护集合（符号链接逃逸仓库或不可解析）时的拒绝理由。
@@ -783,14 +793,32 @@ async function checkProtectedTarget(
 async function checkGoalTarget(root: string, cwd: string, raw: string): Promise<ToolCallEventResult | undefined> {
   const lexical = toRepoRelative(root, cwd, raw);
   if (lexical === null) return undefined;
-  if (lexical === GOAL_FILE) return { block: true, reason: PROTECTED_REASON(lexical) };
+  if (lexical === GOAL_FILE || lexical === SCOPE_FILE) return { block: true, reason: PROTECTED_REASON(lexical) };
   try {
     const resolved = await resolveWriteTarget(root, lexical);
-    if (resolved === GOAL_FILE) {
+    if (resolved === GOAL_FILE || resolved === SCOPE_FILE) {
       return { block: true, reason: `${PROTECTED_REASON(resolved)}（路径 ${raw} 指向该受保护文件）` };
     }
   } catch {
     // Unresolvable and no config: same as before, the write is not ours to judge.
+  }
+  return undefined;
+}
+
+/**
+ * `.cw/scope.txt` 有内容时，范围外的写入被拒绝；没有文件或没有有效行时放行。范围生效时路径在仓库外或无法核对也拒绝。
+ */
+async function checkScopeTarget(root: string, cwd: string, raw: string): Promise<ToolCallEventResult | undefined> {
+  const prefixes = await readScope(root);
+  if (prefixes === null) return undefined;
+  const lexical = toRepoRelative(root, cwd, raw);
+  if (lexical === null) return { block: true, reason: scopeReason(raw) };
+  if (!inScope(lexical, prefixes)) return { block: true, reason: scopeReason(lexical) };
+  try {
+    const resolved = await resolveWriteTarget(root, lexical);
+    if (!inScope(resolved, prefixes)) return { block: true, reason: `${scopeReason(resolved)}（路径 ${raw} 指向它）` };
+  } catch (error) {
+    if (!isNotFound(error)) return { block: true, reason: UNVERIFIABLE_REASON(raw) };
   }
   return undefined;
 }

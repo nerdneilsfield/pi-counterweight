@@ -8,6 +8,7 @@
  * change report.
  */
 import path from "node:path";
+import { SCOPE_FILE } from "./scope.js";
 
 /**
  * harness 自己的控制面文件，无论项目配置如何都受保护；模型不能通过改它来关掉检查或保护。
@@ -23,6 +24,8 @@ export const CONFIG_FILE = ".cw/project.toml";
  */
 export const GOAL_FILE = ".cw/goal.md";
 
+// `.cw/scope.txt` 同样始终受保护：范围由用户划定（常量在 scope.ts）。
+
 /**
  * 判断一个仓库内相对路径是否属于受保护集合：等于某条路径，或位于某条目录前缀之下。
  *
@@ -35,6 +38,6 @@ export const GOAL_FILE = ".cw/goal.md";
  */
 export function isProtected(relative: string, patterns: readonly string[]): boolean {
   const normalized = relative.split(path.sep).join("/");
-  if (normalized === CONFIG_FILE || normalized === GOAL_FILE) return true;
+  if (normalized === CONFIG_FILE || normalized === GOAL_FILE || normalized === SCOPE_FILE) return true;
   return patterns.some((pattern) => normalized === pattern || normalized.startsWith(`${pattern}/`));
 }

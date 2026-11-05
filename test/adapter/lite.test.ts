@@ -571,3 +571,45 @@ test("缺 [check] 提示：startup 和 new 出现，reload、resume 和有 [chec
     await Promise.all([bare, noCheck, withCheck].map((dir) => rm(dir, { recursive: true, force: true })));
   }
 });
+
+// 高危命令不用配置就拦；常规命令和引号里的文本放行。
+test("bash 高危命令：没有配置也拒绝，常规命令和引号内文本放行", async () => {
+  const repo = await repoWith(null);
+  try {
+    const fake = fakePi(repo);
+    await start(fake);
+    const blocked = await toolCall(fake, "bash", { command: "git push --force origin main" });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).toContain("强制推送 main");
+    expect((await toolCall(fake, "bash", { command: "echo ok && mkfs /dev/null-cw-probe" }))?.block).toBe(true);
+    for (const command of ["git push origin main", "git push --force-with-lease origin main", 'git commit -m "rm -rf /"']) {
+      expect(await toolCall(fake, "bash", { command })).toBeUndefined();
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+// scope.txt：有内容时 edit/write 只能写前缀之内；.cw/ 下不限；它本身受保护；没有配置也生效；只有注释时不限制。
+test("scope.txt：范围外写入被拒，.cw/ 下放行，本身受保护，符号链接出范围被拒", async () => {
+  const repo = await repoWith(null, { ".cw/scope.txt": "# 只改应用\nsrc\n\n", "src/keep.ts": "x\n", "lib/keep.ts": "x\n" });
+  try {
+    await symlink(path.join(repo, "lib"), path.join(repo, "src", "out"));
+    const fake = fakePi(repo);
+    await start(fake);
+    expect(await toolCall(fake, "write", { path: "src/a.ts", content: "" })).toBeUndefined();
+    expect(await toolCall(fake, "edit", { path: ".cw/notes.md" })).toBeUndefined();
+    const out = await toolCall(fake, "write", { path: "srcx/a.ts", content: "" });
+    expect(out?.block).toBe(true);
+    expect(out?.reason).toContain("srcx/a.ts");
+    expect((await toolCall(fake, "edit", { path: "lib/keep.ts" }))?.block).toBe(true);
+    expect((await toolCall(fake, "write", { path: "src/out/x.ts", content: "" }))?.block).toBe(true);
+    const own = await toolCall(fake, "write", { path: ".cw/scope.txt", content: "" });
+    expect(own?.block).toBe(true);
+    expect(own?.reason).toContain("scope.txt");
+    await writeFile(path.join(repo, ".cw", "scope.txt"), "# 没有条目\n");
+    expect(await toolCall(fake, "write", { path: "lib/new.ts", content: "" })).toBeUndefined();
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
