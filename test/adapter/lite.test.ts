@@ -8,7 +8,7 @@
  * reaping.
  */
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -633,5 +633,47 @@ test("inject 事件：每个会话只记一次，goal 和 check 如实", async (
     }
   } finally {
     await Promise.all([repo, bare].map((dir) => rm(dir, { recursive: true, force: true })));
+  }
+});
+
+// chronicle 事件：目录不存在就什么也不写；存在则每个结束的回合一条，修复续跑那一轮不写。
+test("chronicle 事件：没有目录不写；通过记 ok，修复续跑不记，最终失败记 failed；没配检查记 unknown", async () => {
+  const savedHome = process.env.HOME;
+  const home = await realpath(await mkdtemp(path.join(tmpdir(), "cw-chron-home-")));
+  process.env.HOME = home;
+  const failing = await repoWith(CHECK_TOML, { "tests/a.py": "base\n" });
+  const bare = await repoWith(null);
+  const events = async (): Promise<Array<Record<string, any>>> => {
+    const root = path.join(home, ".agents", "chronicle", "events");
+    const out: Array<Record<string, any>> = [];
+    for (const machine of await readdir(root).catch(() => [] as string[])) {
+      for (const name of await readdir(path.join(root, machine))) {
+        out.push(JSON.parse(await readFile(path.join(root, machine, name), "utf8")));
+      }
+    }
+    return out;
+  };
+  try {
+    const fake = fakePi(failing);
+    await start(fake);
+    expect((await settle(fake))!.continue).toBe(true);
+    await expect(stat(path.join(home, ".agents"))).rejects.toThrow();
+
+    await mkdir(path.join(home, ".agents", "chronicle"), { recursive: true });
+    await settle(fake);
+    const [failed] = await events();
+    expect(failed).toMatchObject({ outcome: "failed", agent: "pi:s1", workspace: failing, turn: null });
+
+    await writeFile(path.join(failing, "fixed.txt"), "");
+    await fake.handlers.get("before_agent_start")!({ prompt: "x", systemPromptOptions: { sections: {} } }, fake.ctx);
+    await settle(fake);
+    const none = fakePi(bare);
+    await start(none);
+    await settle(none);
+    const all = await events();
+    expect(all.map((event) => event.outcome).sort()).toEqual(["failed", "ok", "unknown"]);
+  } finally {
+    process.env.HOME = savedHome;
+    await Promise.all([home, failing, bare].map((dir) => rm(dir, { recursive: true, force: true })));
   }
 });

@@ -24,6 +24,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { changedFiles, chronicleReport, renderActions, snapshotTree, workingDiff, type ActionRecord } from "../../core/auto.js";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
+import { writeChronicleEvent, type ChronicleInput } from "../../core/chronicle-event.js";
 import { loadProjectConfig, type ProjectConfig } from "../../core/config.js";
 import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
@@ -389,19 +390,44 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     const check = project?.check ?? null;
     const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + autoBudget();
     return withTimeout(budgetMs, async (signal) => {
-      if (event.outcome !== "completed") return undefined;
+      if (event.outcome !== "completed") {
+        await chronicleTurn(ctx, event.outcome === "aborted"
+          ? { outcome: "cancelled", evidence: { gap: "回合被中断" } }
+          : { outcome: "failed", evidence: { gap: `回合以 ${event.outcome} 结束，未运行检查` } });
+        return undefined;
+      }
       const report = await runCheckOnce(ctx, signal);
       // 被取消的检查没有结论，也不该接着起审查模型。
-      if (report === "cancelled" || signal.aborted || lifetime.signal.aborted) return undefined;
+      if (report === "cancelled" || signal.aborted || lifetime.signal.aborted) {
+        await chronicleTurn(ctx, { outcome: "cancelled", evidence: { gap: "结束检查被取消" } });
+        return undefined;
+      }
       const entries = report === undefined ? [...event.entries] : [...event.entries, settleEntry(report.text)];
       if (report?.retrying) return { entries, continue: true };
       // 检查还要求修复时代码会再变，审查没有意义；定稿了才自动审查与汇报。
       const auto = await runAuto(ctx, report?.text ?? null, signal);
+      if (!auto.continueRun) await chronicleTurn(ctx, settledOf(report));
       if (auto.text !== null) entries.push(settleEntry(auto.text));
       if (report === undefined && auto.text === null) return undefined;
       return auto.continueRun ? { entries, continue: true } : { entries };
-    }, () => event.outcome === "completed" && hasCheck() ? { entries: [...event.entries, settleEntry(SETTLE_FALLBACK)] } : undefined);
+    }, async () => {
+      if (event.outcome !== "completed") return undefined;
+      await chronicleTurn(ctx, { outcome: "unknown", evidence: { gap: SETTLE_FALLBACK } });
+      return hasCheck() ? { entries: [...event.entries, settleEntry(SETTLE_FALLBACK)] } : undefined;
+    });
   });
+
+  /** 回合真正结束时记一条 chronicle 事件；pi 没有回合 id。 */
+  const chronicleTurn = async (ctx: ExtensionContext, settled: Pick<ChronicleInput, "outcome" | "evidence">): Promise<void> => {
+    if (repo === null) return;
+    await writeChronicleEvent({ host: "pi", session: ctx.sessionManager.getSessionId(), turn: null, workspace: repo, ...settled });
+  };
+
+  /** 检查的结论：没配检查是 unknown。 */
+  const settledOf = (report: { text: string; passed: boolean } | undefined): Pick<ChronicleInput, "outcome" | "evidence"> =>
+    report === undefined
+      ? { outcome: "unknown", evidence: { gap: "没有配置结束检查" } }
+      : { outcome: report.passed ? "ok" : "failed", evidence: { text: report.text } };
 
   // OMP 在主会话即将结束时发 `session_stop`，不带 entries：报告走通知，失败反馈走 `additionalContext` 续跑。
   // pi 不发这个事件；OMP 不发 `agent_before_settle`，所以同一轮只会有一边触发。
@@ -414,10 +440,14 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + autoBudget();
       return withTimeout(budgetMs, async (signal) => {
         const report = await runCheckOnce(ctx, signal, event.signal);
-        if (report === "cancelled" || signal.aborted || event.signal?.aborted || lifetime.signal.aborted) return undefined;
+        if (report === "cancelled" || signal.aborted || event.signal?.aborted || lifetime.signal.aborted) {
+          await chronicleTurn(ctx, { outcome: "cancelled", evidence: { gap: "结束检查被取消" } });
+          return undefined;
+        }
         if (report !== undefined) ctx.ui.notify(report.text, report.passed ? "info" : "warning");
         if (report?.retrying) return { continue: true, additionalContext: report.text };
         const auto = await runAuto(ctx, report?.text ?? null, signal, event.signal);
+        if (!auto.continueRun) await chronicleTurn(ctx, settledOf(report));
         if (auto.text !== null) ctx.ui.notify(auto.text, "info");
         return auto.continueRun && auto.text !== null ? { continue: true, additionalContext: auto.text } : undefined;
       }, () => {
