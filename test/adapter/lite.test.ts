@@ -677,3 +677,27 @@ test("chronicle 事件：没有目录不写；通过记 ok，修复续跑不记�
     await Promise.all([home, failing, bare].map((dir) => rm(dir, { recursive: true, force: true })));
   }
 });
+
+// 待批条数：回合结束行后面附「待批 N 条」；没有检查结果时单独一行；修复续跑那一轮不附。
+test("待批条数：附在检查报告后，无检查时单独一行，续跑不附", async () => {
+  const pending = "- 2026-11-05 | project | AGENTS.md | 一\n  Evidence: e\n- 2026-11-06 | user | memory | 二\n";
+  const checked = await repoWith(CHECK_TOML, { ".cw/pending.md": pending, "tests/a.py": "base\n" });
+  const bare = await repoWith("version = 1\n", { ".cw/pending.md": pending });
+  try {
+    const fake = fakePi(checked);
+    await start(fake);
+    const retry = await settle(fake);
+    expect(retry!.continue).toBe(true);
+    expect(lastText(retry!)).not.toContain("待批");
+    await writeFile(path.join(checked, "fixed.txt"), "");
+    const passed = await settle(fake);
+    expect(lastText(passed!)).toMatch(/结束检查通过.*；待批 2 条$/);
+
+    const none = fakePi(bare);
+    await start(none);
+    const only = await settle(none);
+    expect(lastText(only!)).toBe("[counterweight] 待批 2 条（.cw/pending.md）");
+  } finally {
+    await Promise.all([checked, bare].map((dir) => rm(dir, { recursive: true, force: true })));
+  }
+});

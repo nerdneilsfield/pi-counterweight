@@ -25,6 +25,7 @@ import path from "node:path";
 import { changedFiles, chronicleReport, renderActions, snapshotTree, workingDiff, type ActionRecord } from "../../core/auto.js";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
 import { writeChronicleEvent, type ChronicleInput } from "../../core/chronicle-event.js";
+import { pendingCount, withPending } from "../../core/pending.js";
 import { loadProjectConfig, type ProjectConfig } from "../../core/config.js";
 import { repoToplevel } from "../../core/gitstate.js";
 import { recordEvent, recordUsage } from "../../core/meter.js";
@@ -402,13 +403,15 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         await chronicleTurn(ctx, { outcome: "cancelled", evidence: { gap: "结束检查被取消" } });
         return undefined;
       }
-      const entries = report === undefined ? [...event.entries] : [...event.entries, settleEntry(report.text)];
-      if (report?.retrying) return { entries, continue: true };
+      if (report?.retrying) return { entries: [...event.entries, settleEntry(report.text)], continue: true };
       // 检查还要求修复时代码会再变，审查没有意义；定稿了才自动审查与汇报。
       const auto = await runAuto(ctx, report?.text ?? null, signal);
       if (!auto.continueRun) await chronicleTurn(ctx, settledOf(report));
+      // 回合结束行后面附上待批条数；还要续跑时回合没有结束，不附。
+      const shown = withPending(report?.text ?? null, auto.continueRun || repo === null ? 0 : await pendingCount(repo));
+      const entries = shown === null ? [...event.entries] : [...event.entries, settleEntry(shown)];
       if (auto.text !== null) entries.push(settleEntry(auto.text));
-      if (report === undefined && auto.text === null) return undefined;
+      if (shown === null && auto.text === null) return undefined;
       return auto.continueRun ? { entries, continue: true } : { entries };
     }, async () => {
       if (event.outcome !== "completed") return undefined;
@@ -447,7 +450,12 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         if (report !== undefined) ctx.ui.notify(report.text, report.passed ? "info" : "warning");
         if (report?.retrying) return { continue: true, additionalContext: report.text };
         const auto = await runAuto(ctx, report?.text ?? null, signal, event.signal);
-        if (!auto.continueRun) await chronicleTurn(ctx, settledOf(report));
+        if (!auto.continueRun) {
+          await chronicleTurn(ctx, settledOf(report));
+          // 检查报告已经通知过了，待批条数单独一行。
+          const pending = withPending(null, repo === null ? 0 : await pendingCount(repo));
+          if (pending !== null) ctx.ui.notify(pending, "info");
+        }
         if (auto.text !== null) ctx.ui.notify(auto.text, "info");
         return auto.continueRun && auto.text !== null ? { continue: true, additionalContext: auto.text } : undefined;
       }, () => {
