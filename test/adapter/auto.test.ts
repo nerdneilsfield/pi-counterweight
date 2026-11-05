@@ -519,3 +519,32 @@ test("shutdown 中止在跑的 PAUSE planner", async () => {
   expect(await psOutput()).not.toContain("fixtures/role/fake-pi.mjs");
   expect(await pending).toBeUndefined();
 }, 30_000);
+
+test("自动审查未完成：结算消息点名失败的角色和原因，不改检查结论、不续跑；都完成时没有这一行", async () => {
+  const s = await setup(`${MODELS}
+[check]
+cmd = ["/bin/sh", "-c", "true"]
+timeout_s = 5
+
+[auto]
+review = true
+`);
+  cleanup.push(s.repo);
+  process.env.CW_FAKE_ROLE = "crash";
+  await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed\n");
+  const failed = await settle(s);
+  const text = failed!.entries.map((entry) => entry.content).join("\n");
+  expect(failed!.continue).toBeUndefined();
+  expect(text).toContain("结束检查");
+  expect(text).toContain("[counterweight] 自动审查未完成：");
+  expect(text).toContain("review 没有最终回答（退出码 3：fatal: model g/gone not found）");
+  expect(text).toContain("over_review 没有最终回答");
+
+  delete process.env.CW_FAKE_ROLE;
+  process.env.CW_FAKE_ROLE_TEXT = "none";
+  await newTurn(s);
+  await writeFile(path.join(s.repo, "tracked.txt"), "changed again\n");
+  const fine = await settle(s);
+  expect(fine!.entries.map((entry) => entry.content).join("\n")).not.toContain("自动审查未完成");
+});

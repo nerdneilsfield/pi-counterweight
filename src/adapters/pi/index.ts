@@ -33,7 +33,7 @@ import { isProtected, GOAL_FILE } from "../../core/protect.js";
 import { sessionSection, withGoal } from "../../roles/prompts.js";
 import { roleTimeoutMs } from "../../roles/run.js";
 import { runSetup } from "./setup.js";
-import { chronicle, queueChronicle, registerTools, reviewMessage, runAndMeter } from "./tools.js";
+import { chronicle, queueChronicle, registerTools, reviewMessage, runAndMeter, type ToolRegistration } from "./tools.js";
 
 /**
  * 各事件处理的时间预算（毫秒）。扩展入口允许用 `timeouts` 参数局部覆盖，未覆盖的取
@@ -482,7 +482,8 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     if (!plan.review && !plan.overReview && !plan.chronicle) return { text: null, continueRun: false };
     const lines: string[] = [];
     let continueRun = false;
-    const registration = { getProject: () => project, getRepo: () => repo, cliPath: roleCli, realWaitMs };
+    const failed: NonNullable<ToolRegistration["failed"]> = [];
+    const registration = { getProject: () => project, getRepo: () => repo, cliPath: roleCli, realWaitMs, failed };
 
     if (plan.review || plan.overReview) {
       const reviewText = plan.review
@@ -512,6 +513,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     if (plan.chronicle && !continueRun) {
       const report = chronicleReport(turnRequest, await changedFiles(root, turnBase), checkLine);
       await queueChronicle(() => chronicle(ctx, root, config.models.historian!, report, signal, registration));
+    }
+    // 角色没跑完要让用户看到，不改检查结论，也不续跑。
+    if (failed.length > 0) {
+      lines.push(`[counterweight] 自动审查未完成：${failed.map((item) => `${item.role} ${item.reason}`).join("；")}`);
     }
     return { text: lines.length === 0 ? null : lines.join("\n\n"), continueRun };
   }

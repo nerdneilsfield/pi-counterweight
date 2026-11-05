@@ -39,6 +39,8 @@ export interface ToolRegistration {
   timeoutMs?: Partial<Record<RoleName, number>>;
   /** 测试用：只压短真实等待（毫秒），申报的档位和“下一档”建议仍按调用方给的 timeout_s 算。 */
   realWaitMs?: number;
+  /** 给了就收集这次运行里失败（非取消）的角色，`[auto]` 靠它在结算时说明。 */
+  failed?: Array<{ role: RoleName; reason: string }>;
 }
 
 const ROLES: Array<{
@@ -219,6 +221,7 @@ export async function runAndMeter(
   }
   const meterNote = meterError === null ? "" : `；用量未能写入计量（${meterError}）`;
   if (run.error !== null) {
+    if (!run.cancelled) registration.failed?.push({ role, reason: run.error });
     await recordEvent(repo, session, role, {
       outcome: run.budget === true ? "budget" : "failed", error: run.error, tokens: spent, ms: Date.now() - started,
       timed_out: run.timedOut, cancelled: run.cancelled,
