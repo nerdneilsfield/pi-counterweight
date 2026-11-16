@@ -22,7 +22,7 @@ import type {
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { changedFiles, chronicleReport, renderActions, snapshotTree, workingDiff, type ActionRecord } from "../../core/auto.js";
+import { baseTrees, changedFiles, chronicleReport, renderActions, snapshotRepo, snapshotTree, workingDiff, type ActionRecord } from "../../core/auto.js";
 import { checkPassed, renderCheckReport, runEndCheck, type CheckOutcome } from "../../core/check.js";
 import { writeChronicleEvent, type ChronicleInput } from "../../core/chronicle-event.js";
 import { pendingCount, withPending } from "../../core/pending.js";
@@ -33,6 +33,7 @@ import { isNotFound, realpathOr, resolvePiToolPath, resolveWriteTarget } from ".
 import { isSourceEdit, pauseReason, plannerMessage, renderTranscript, type TranscriptMessage } from "../../core/pause.js";
 import { dangerousCommandIn } from "../../core/danger.js";
 import { isProtected, GOAL_FILE } from "../../core/protect.js";
+import { ownerOf, readRepos, REPOS_FILE } from "../../core/repos.js";
 import { inScope, readScope, SCOPE_FILE, scopeReason } from "../../core/scope.js";
 import { sessionSection, withGoal } from "../../roles/prompts.js";
 import pkg from "../../../package.json" with { type: "json" };
@@ -279,6 +280,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
       if (root === null || signal.aborted) return undefined;
       const raw = writeToolPath(event);
       if (raw === null) return undefined;
+      // 有 .cw/repos.txt 时，落在额外仓库里的路径按那个仓库自己的配置和范围判断。
+      const extras = await readRepos(root);
+      const routed = await routedTarget(root, ctx.cwd, extras, raw);
+      if (routed !== null) return await checkRoutedTarget(project, extras.includes(routed.repo), routed, raw);
       // 没有可用配置时只护 goal.md 和 scope.txt：它们不用配置也生效。其余路径放行，setup 要能创建 project.toml。
       const guarded = project === null
         ? await checkGoalTarget(root, ctx.cwd, raw)
@@ -324,14 +329,18 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     if (root === null || project === null || !project.auto.pause || planner === null || pauseUsed) return undefined;
     const raw = writeToolPath(event);
     if (raw === null) return undefined;
-    const relative = toRepoRelative(root, ctx.cwd, raw);
-    if (!isSourceEdit(relative)) return undefined;
+    const extras = await readRepos(root);
+    const routed = await routedTarget(root, ctx.cwd, extras, raw);
+    // 额外仓库里的源码编辑也算；目标带仓库目录名前缀。
+    const inRepo = routed !== null ? routed.relative : toRepoRelative(root, ctx.cwd, raw);
+    if (!isSourceEdit(inRepo)) return undefined;
+    const relative = routed !== null && extras.includes(routed.repo) ? repoLabel(routed.repo, routed.relative) : inRepo!;
     pauseUsed = true;
     const started = Date.now();
     const session = ctx.sessionManager.getSessionId();
     return await withTimeout(pauseBudget(), (outer) => linked([outer, ctx.signal], async (signal) => {
       const messages = ctx.sessionManager.buildSessionProjection().messages as unknown as TranscriptMessage[];
-      const message = plannerMessage(renderTranscript(messages), relative!, event.toolName, event.input as Record<string, unknown>);
+      const message = plannerMessage(renderTranscript(messages), relative, event.toolName, event.input as Record<string, unknown>);
       const run = await runAndMeter(ctx, root, "planner", "cw_pause", planner, message, signal, { getProject: () => project, getRepo: () => repo, cliPath: roleCli, realWaitMs });
       await recordEvent(root, session, "pause", {
         outcome: run.answer === null ? "failed" : "planned", ms: Date.now() - started, tool: event.toolName,
@@ -364,7 +373,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     if (typeof prompt === "string") turnRequest = prompt;
     // 快照放在保存请求之后：它慢，也不能让请求丢掉。
     if ((messageType === undefined || messageType === "user") && repo !== null
-      && project !== null && (project.auto.review || project.auto.chronicle)) {
+      && project !== null && (project.auto.review || project.auto.chronicle || (await readRepos(repo)).length > 0)) {
       turnBase = await snapshotTree(repo);
     }
     const goal = await readGoal(repo);
@@ -387,9 +396,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   });
 
   // ---- agent_before_settle (pi) / session_stop (OMP): run the configured end check once ----
-  pi.on("agent_before_settle", (event: AgentBeforeSettleEvent, ctx: ExtensionContext) => {
+  pi.on("agent_before_settle", async (event: AgentBeforeSettleEvent, ctx: ExtensionContext) => {
     const check = project?.check ?? null;
-    const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + autoBudget();
+    const extraMs = await extraCheckBudgetMs();
+    const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + extraMs + autoBudget();
     return withTimeout(budgetMs, async (signal) => {
       if (event.outcome !== "completed") {
         await chronicleTurn(ctx, event.outcome === "aborted"
@@ -416,7 +426,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     }, async () => {
       if (event.outcome !== "completed") return undefined;
       await chronicleTurn(ctx, { outcome: "unknown", evidence: { gap: SETTLE_FALLBACK } });
-      return hasCheck() ? { entries: [...event.entries, settleEntry(SETTLE_FALLBACK)] } : undefined;
+      return hasCheck() || extraMs > 0 ? { entries: [...event.entries, settleEntry(SETTLE_FALLBACK)] } : undefined;
     });
   });
 
@@ -427,9 +437,10 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   };
 
   /** 检查的结论：没配检查是 unknown。 */
-  const settledOf = (report: { text: string; passed: boolean } | undefined): Pick<ChronicleInput, "outcome" | "evidence"> =>
+  const settledOf = (report: { text: string; passed: boolean; gap?: boolean } | undefined): Pick<ChronicleInput, "outcome" | "evidence"> =>
     report === undefined
       ? { outcome: "unknown", evidence: { gap: "没有配置结束检查" } }
+      : report.passed && report.gap ? { outcome: "unknown", evidence: { gap: report.text } }
       : { outcome: report.passed ? "ok" : "failed", evidence: { text: report.text } };
 
   // OMP 在主会话即将结束时发 `session_stop`，不带 entries：报告走通知，失败反馈走 `additionalContext` 续跑。
@@ -438,16 +449,17 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
   // through a notification and the failure feedback through `additionalContext`. pi never sends it,
   // and OMP never sends `agent_before_settle`, so only one side fires per turn.
   (pi as unknown as { on(name: string, handler: (event: { signal?: AbortSignal }, ctx: ExtensionContext) => unknown): void })
-    .on("session_stop", (event, ctx) => {
+    .on("session_stop", async (event, ctx) => {
       const check = project?.check ?? null;
-      const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + autoBudget();
+      const extraMs = await extraCheckBudgetMs();
+      const budgetMs = (check === null ? limits.checkMarginMs : check.timeout_s * 1000 + limits.checkMarginMs) + extraMs + autoBudget();
       return withTimeout(budgetMs, async (signal) => {
         const report = await runCheckOnce(ctx, signal, event.signal);
         if (report === "cancelled" || signal.aborted || event.signal?.aborted || lifetime.signal.aborted) {
           await chronicleTurn(ctx, { outcome: "cancelled", evidence: { gap: "结束检查被取消" } });
           return undefined;
         }
-        if (report !== undefined) ctx.ui.notify(report.text, report.passed ? "info" : "warning");
+        if (report !== undefined) ctx.ui.notify(report.text, report.passed && !report.gap ? "info" : "warning");
         if (report?.retrying) return { continue: true, additionalContext: report.text };
         const auto = await runAuto(ctx, report?.text ?? null, signal, event.signal);
         if (!auto.continueRun) {
@@ -459,7 +471,7 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
         if (auto.text !== null) ctx.ui.notify(auto.text, "info");
         return auto.continueRun && auto.text !== null ? { continue: true, additionalContext: auto.text } : undefined;
       }, () => {
-        if (hasCheck()) notifyError(ctx, SETTLE_FALLBACK);
+        if (hasCheck() || extraMs > 0) notifyError(ctx, SETTLE_FALLBACK);
         return undefined;
       });
     });
@@ -591,59 +603,125 @@ export default function counterweight(pi: ExtensionAPI, timeouts?: Partial<Adapt
     ctx: ExtensionContext,
     outerSignal: AbortSignal,
     hostSignal?: AbortSignal,
-  ): Promise<{ text: string; retrying: boolean; passed: boolean } | "cancelled" | undefined> {
+  ): Promise<{ text: string; retrying: boolean; passed: boolean; gap?: boolean } | "cancelled" | undefined> {
     const root = repo;
+    if (root === null) return undefined;
     const check = project?.check ?? null;
-    if (root === null || check === null) return undefined;
+    const extra = await extraChecks(root);
+    if (check === null && extra.jobs.length === 0 && extra.gaps.length === 0) return undefined;
+    const jobs = [
+      ...(check !== null ? [{ repo: root, check, extra: false }] : []),
+      ...extra.jobs,
+    ];
+    // 有额外仓库参与时，报告每段前标仓库名。
+    const multi = extra.jobs.length > 0 || extra.gaps.length > 0;
 
     const session = ctx.sessionManager.getSessionId();
-    const controller = new AbortController();
-    const forwards: Array<{ source: AbortSignal; fn: () => void }> = [];
-    const link = (source: AbortSignal | undefined): void => {
-      if (source === undefined) return;
-      const fn = () => controller.abort();
-      if (source.aborted) fn();
-      else {
-        source.addEventListener("abort", fn, { once: true });
-        forwards.push({ source, fn });
+    const runs: Array<{ job: (typeof jobs)[number]; outcome: CheckOutcome; ms: number }> = [];
+    for (const job of jobs) {
+      const controller = new AbortController();
+      const forwards: Array<{ source: AbortSignal; fn: () => void }> = [];
+      const link = (source: AbortSignal | undefined): void => {
+        if (source === undefined) return;
+        const fn = () => controller.abort();
+        if (source.aborted) fn();
+        else {
+          source.addEventListener("abort", fn, { once: true });
+          forwards.push({ source, fn });
+        }
+      };
+      link(ctx.signal);
+      link(outerSignal);
+      link(hostSignal);
+
+      const started = Date.now();
+      let outcome: CheckOutcome;
+      try {
+        const done = runEndCheck({ repo: job.repo, check: job.check, signal: controller.signal });
+        checkRun = { controller, done: done.then(() => undefined, () => undefined) };
+        outcome = await done;
+      } finally {
+        for (const { source, fn } of forwards) source.removeEventListener("abort", fn);
+        if (checkRun !== null && checkRun.controller === controller) checkRun = null;
       }
-    };
-    link(ctx.signal);
-    link(outerSignal);
-    link(hostSignal);
-
-    const started = Date.now();
-    let outcome: CheckOutcome;
-    try {
-      const done = runEndCheck({ repo: root, check, signal: controller.signal });
-      checkRun = { controller, done: done.then(() => undefined, () => undefined) };
-      outcome = await done;
-    } finally {
-      for (const { source, fn } of forwards) source.removeEventListener("abort", fn);
-      if (checkRun !== null && checkRun.controller === controller) checkRun = null;
+      // A cancelled check produces no claim about the turn (the caller's signal
+      // was an interrupt or the outer timeout, which reports through its own
+      // fallback). A late cancel stays visible until the process group is gone.
+      if (outcome.cancelled) return "cancelled";
+      runs.push({ job, outcome, ms: Date.now() - started });
     }
-    // A cancelled check produces no claim about the turn (the caller's signal
-    // was an interrupt or the outer timeout, which reports through its own
-    // fallback). A late cancel stays visible until the process group is gone.
-    if (outcome.cancelled) return "cancelled";
 
-    const passed = checkPassed(outcome);
-    const retrying = !passed && !repairUsed;
-    const text = renderCheckReport(outcome, {
-      command: check.cmd.join(" "),
-      final: !passed && repairUsed,
-    });
+    const failedAny = runs.some((run) => !checkPassed(run.outcome));
+    // 修复额度全回合共用一次：任何一个失败且领到额度，就把所有失败报告合并续跑。
     // Consumed for the rest of this user turn. A pass does not hand the
     // allowance back; only before_agent_start does.
+    const retrying = failedAny && !repairUsed;
     if (retrying) repairUsed = true;
-    await recordEvent(root, session, "check", {
-      exit_code: outcome.exitCode,
-      timed_out: outcome.timedOut,
-      spawn_error: outcome.runnerError,
-      ms: Date.now() - started,
-      outcome: outcome.runnerError !== null ? "spawn_error" : passed ? "passed" : retrying ? "feedback" : "reported",
-    });
-    return { text, retrying, passed };
+    const reports: Array<{ passed: boolean; text: string }> = [];
+    for (const { job, outcome, ms } of runs) {
+      const passed = checkPassed(outcome);
+      const report = renderCheckReport(outcome, { command: job.check.cmd.join(" "), final: !passed && !retrying });
+      await recordEvent(root, session, "check", {
+        exit_code: outcome.exitCode,
+        timed_out: outcome.timedOut,
+        spawn_error: outcome.runnerError,
+        ms,
+        outcome: outcome.runnerError !== null ? "spawn_error" : passed ? "passed" : retrying ? "feedback" : "reported",
+        ...(job.extra ? { repo: path.basename(job.repo) } : {}),
+      });
+      reports.push({ passed, text: multi ? `[repo: ${path.basename(job.repo)}]\n${report}` : report });
+    }
+    if (retrying) {
+      return { text: reports.filter((item) => !item.passed).map((item) => item.text).join("\n\n"), retrying: true, passed: false };
+    }
+    const text = [...reports.map((item) => item.text), ...extra.gaps].join("\n\n");
+    return { text, retrying: false, passed: !failedAny, ...(extra.gaps.length > 0 ? { gap: true } : {}) };
+  }
+
+  /**
+   * 额外仓库里要跑结束检查的：相对回合基线有改动、且自己的 `project.toml` 有 `[check]`。
+   * 没有多仓库基线（没取到）时一个也没有；配置读不了的仓库记一条说明（gap），不静默跳过。
+   */
+  async function extraChecks(root: string): Promise<{ jobs: Array<{ repo: string; check: NonNullable<ProjectConfig["check"]>; extra: true }>; gaps: string[] }> {
+    const jobs: Array<{ repo: string; check: NonNullable<ProjectConfig["check"]>; extra: true }> = [];
+    const gaps: string[] = [];
+    try {
+      if (project === null) return { jobs, gaps };
+      const extras = await readRepos(root);
+      if (extras.length === 0) return { jobs, gaps };
+      const trees = baseTrees(turnBase);
+      if (trees === null) return { jobs, gaps };
+      for (const item of extras) {
+        if (trees[item] === undefined) continue;
+        const now = await snapshotRepo(item);
+        if (now === null || now === trees[item]) continue;
+        try {
+          const check = (await loadProjectConfig(item))?.check ?? null;
+          if (check !== null) jobs.push({ repo: item, check, extra: true });
+        } catch (error) {
+          gaps.push(`[counterweight] ${path.basename(item)} 的 .cw/project.toml 无法读取，没有运行它的结束检查：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    } catch {
+      // Best-effort: the main repo's check is unaffected.
+    }
+    return { jobs, gaps };
+  }
+
+  /** 结算预算里留给额外仓库检查的毫秒数：它们各自 `[check]` 超时之和。没有 repos.txt 时为 0。 */
+  async function extraCheckBudgetMs(): Promise<number> {
+    const root = repo;
+    if (root === null || project === null) return 0;
+    let total = 0;
+    try {
+      for (const item of await readRepos(root)) {
+        const check = await loadProjectConfig(item).then((config) => config?.check ?? null, () => null);
+        if (check !== null) total += check.timeout_s * 1000;
+      }
+    } catch {
+      return total;
+    }
+    return total;
   }
 
   // ---- message_end: hand assistant usage to the meter ----
@@ -777,7 +855,7 @@ async function sessionRoot(cwd: string): Promise<string> {
  * Block reason for a direct write to a protected path.
  */
 const PROTECTED_REASON = (relative: string) => `[counterweight] ${relative} 是受保护路径`
-  + "（.cw/project.toml、.cw/goal.md、.cw/scope.txt 或项目配置 [protect].paths）；如需修改请由用户手动完成。";
+  + "（.cw/project.toml、.cw/goal.md、.cw/scope.txt、.cw/repos.txt 或项目配置 [protect].paths）；如需修改请由用户手动完成。";
 
 /**
  * 路径无法核对受保护集合（符号链接逃逸仓库或不可解析）时的拒绝理由。
@@ -832,6 +910,46 @@ async function checkProtectedTarget(
   return undefined;
 }
 
+const MINIMAL: readonly string[] = [GOAL_FILE, SCOPE_FILE, REPOS_FILE];
+
+const repoLabel = (repo: string, relative: string) => `${path.basename(repo)}/${relative}`;
+
+/**
+ * 有额外仓库（`.cw/repos.txt`）时，路径该按哪个仓库判断：返回 null 表示按主仓库的老逻辑；
+ * 否则是额外仓库（或经符号链接落到主仓库的仓库外路径）的真实归属根和相对路径。
+ */
+async function routedTarget(
+  root: string, cwd: string, extras: readonly string[], raw: string,
+): Promise<{ repo: string; relative: string } | null> {
+  if (extras.length === 0) return null;
+  const owner = await ownerOf(root, extras, resolvePiToolPath(raw, cwd));
+  if (owner === null) return null;
+  if (!extras.includes(owner.repo) && toRepoRelative(root, cwd, raw) !== null) return null;
+  return owner;
+}
+
+/**
+ * 按归属仓库判断受保护路径和范围。额外仓库用它自己的 `project.toml` 的 `[protect]` 和 `scope.txt`；
+ * 主仓库没有可用配置时只做最小保护。额外仓库的配置非法时拒绝。归属已经过 realpath，不再另核符号链接。
+ */
+async function checkRoutedTarget(
+  project: ProjectConfig | null, isExtra: boolean, owner: { repo: string; relative: string }, raw: string,
+): Promise<ToolCallEventResult | undefined> {
+  const label = isExtra ? repoLabel(owner.repo, owner.relative) : owner.relative;
+  let patterns: readonly string[] | null;
+  try {
+    patterns = project === null ? null : isExtra ? ((await loadProjectConfig(owner.repo))?.protect.paths ?? []) : protectedPatterns(project);
+  } catch {
+    return { block: true, reason: UNVERIFIABLE_REASON(raw) };
+  }
+  if (patterns === null ? MINIMAL.includes(owner.relative) : isProtected(owner.relative, patterns)) {
+    return { block: true, reason: PROTECTED_REASON(label) };
+  }
+  const prefixes = await readScope(owner.repo);
+  if (prefixes !== null && !inScope(owner.relative, prefixes)) return { block: true, reason: scopeReason(label) };
+  return undefined;
+}
+
 /**
  * 没有可用配置时的最小保护：`raw` 本身或经符号链接解析后是 `.cw/goal.md` 就拒绝，其余一律放行。
  * 解析不了的路径在没有配置时照旧放行。
@@ -839,10 +957,10 @@ async function checkProtectedTarget(
 async function checkGoalTarget(root: string, cwd: string, raw: string): Promise<ToolCallEventResult | undefined> {
   const lexical = toRepoRelative(root, cwd, raw);
   if (lexical === null) return undefined;
-  if (lexical === GOAL_FILE || lexical === SCOPE_FILE) return { block: true, reason: PROTECTED_REASON(lexical) };
+  if (MINIMAL.includes(lexical)) return { block: true, reason: PROTECTED_REASON(lexical) };
   try {
     const resolved = await resolveWriteTarget(root, lexical);
-    if (resolved === GOAL_FILE || resolved === SCOPE_FILE) {
+    if (MINIMAL.includes(resolved)) {
       return { block: true, reason: `${PROTECTED_REASON(resolved)}（路径 ${raw} 指向该受保护文件）` };
     }
   } catch {
