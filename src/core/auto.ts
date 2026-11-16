@@ -8,6 +8,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { git } from "./gitstate.js";
+import { readRepos } from "./repos.js";
 
 /** diff 的字符上限。超出就截断并注明，免得把审查者的上下文塞满。 */
 export const DIFF_CAP = 80_000;
@@ -59,6 +60,33 @@ export function renderActions(actions: readonly ActionRecord[]): string {
  * 不在 git 仓库里或任何一步失败时返回 null。
  */
 export async function snapshotTree(repo: string): Promise<string | null> {
+  const extras = await readRepos(repo);
+  if (extras.length === 0) return snapshotRepo(repo);
+  // 有额外仓库（.cw/repos.txt）时基线是 JSON：每个仓库一棵树；某个仓库取不到就不记它。
+  const trees: Record<string, string> = {};
+  for (const item of [repo, ...extras]) {
+    const tree = await snapshotRepo(item);
+    if (tree !== null) trees[item] = tree;
+  }
+  return Object.keys(trees).length === 0 ? null : JSON.stringify(trees);
+}
+
+/** 多仓库基线（JSON）解析成 仓库 -> 树；单仓库基线、null 或坏数据返回 null。 */
+export function baseTrees(base: string | null): Record<string, string> | null {
+  if (base === null || !base.startsWith("{")) return null;
+  try {
+    const parsed: unknown = JSON.parse(base);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const trees: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed)) if (typeof value === "string") trees[key] = value;
+    return trees;
+  } catch {
+    return null;
+  }
+}
+
+/** 单个仓库的树快照，规则见 `snapshotTree`。 */
+export async function snapshotRepo(repo: string): Promise<string | null> {
   let dir: string | null = null;
   try {
     dir = await mkdtemp(path.join(tmpdir(), "cw-index-"));
@@ -88,13 +116,38 @@ async function gitOut(repo: string, args: string[]): Promise<string | null> {
   }
 }
 
+/** 单个仓库从 `base` 到现在的 diff 原文（不截断）；`prefix` 非空时文件名前加 `<prefix>/`。失败为 null。 */
+async function repoDiff(repo: string, base: string | null, prefix = ""): Promise<string | null> {
+  const end = await snapshotRepo(repo);
+  const names = prefix === "" ? [] : [`--src-prefix=a/${prefix}/`, `--dst-prefix=b/${prefix}/`];
+  return gitOut(repo, ["diff", "--no-ext-diff", "--no-color", ...names, ...diffRange(base, end), "--", ".", ":!.cw"]);
+}
+
+/** 多仓库基线里各仓库的目录名前缀；主仓库为空串。 */
+const prefixOf = (main: string, repo: string): string => path.resolve(repo) === path.resolve(main) ? "" : path.basename(repo);
+
 /**
  * 回合基线 `base` 到现在的改动，含未跟踪文件的内容，不含 `.cw`。`base` 为 null（没取到基线）时退回 HEAD。
  * 不在 git 仓库里、或没有任何提交又没有基线时返回 null。
+ * 多仓库基线：额外仓库的 diff 前加一行 `# repo: <目录名>`，文件名前加 `<目录名>/`。
  */
 export async function workingDiff(repo: string, base: string | null): Promise<string | null> {
-  const end = await snapshotTree(repo);
-  const body = await gitOut(repo, ["diff", "--no-ext-diff", "--no-color", ...diffRange(base, end), "--", ".", ":!.cw"]);
+  const trees = baseTrees(base);
+  let body: string | null;
+  if (trees === null) {
+    body = await repoDiff(repo, base);
+  } else {
+    const parts: string[] = [];
+    let any = false;
+    for (const [item, tree] of Object.entries(trees)) {
+      const prefix = prefixOf(repo, item);
+      const one = await repoDiff(item, tree, prefix);
+      if (one === null) continue;
+      any = true;
+      if (one.trim() !== "") parts.push(prefix === "" ? one : `# repo: ${prefix}\n${one}`);
+    }
+    body = any ? parts.join("") : null;
+  }
   if (body === null) return null;
   if (body.trim() === "") return "";
   return body.length > DIFF_CAP ? `${body.slice(0, DIFF_CAP)}\n# …（diff 超过 ${DIFF_CAP} 字符，已截断）\n` : body;
@@ -107,9 +160,16 @@ export function chronicleReport(request: string, files: string[], checkLine: str
     + `${checkLine === null ? "" : `\n结束检查：${checkLine}\n`}\n时间：${new Date().toISOString()}。提交信息与日期请以仓库为准，不要编造。`;
 }
 
-/** 基线到现在改动的文件名，由 git 给出，所以重命名和非 ASCII 路径都对。取不到时为空数组。 */
+/** 基线到现在改动的文件名，由 git 给出，所以重命名和非 ASCII 路径都对。取不到时为空数组。多仓库基线里额外仓库的文件名前加 `<目录名>/`。 */
 export async function changedFiles(repo: string, base: string | null): Promise<string[]> {
-  const end = await snapshotTree(repo);
-  const out = await gitOut(repo, ["-c", "core.quotePath=false", "diff", "--name-only", "-z", ...diffRange(base, end), "--", ".", ":!.cw"]);
-  return out === null ? [] : out.split("\0").filter((name) => name !== "");
+  const trees = baseTrees(base);
+  const one = async (item: string, tree: string | null, prefix: string): Promise<string[]> => {
+    const end = await snapshotRepo(item);
+    const out = await gitOut(item, ["-c", "core.quotePath=false", "diff", "--name-only", "-z", ...diffRange(tree, end), "--", ".", ":!.cw"]);
+    return out === null ? [] : out.split("\0").filter((name) => name !== "").map((name) => prefix === "" ? name : `${prefix}/${name}`);
+  };
+  if (trees === null) return one(repo, base, "");
+  const files: string[] = [];
+  for (const [item, tree] of Object.entries(trees)) files.push(...await one(item, tree, prefixOf(repo, item)));
+  return files;
 }
